@@ -10,7 +10,7 @@
 static int g_running = 0;
 static pthread_t g_thread;
 
-// 信号处理函数
+// Signal handler function
 void signal_handler(int sig) {
     if (sig == SIGINT) {
         printf("\nReceived interrupt signal, stopping SOCKS5 proxy...\n");
@@ -28,9 +28,9 @@ void signal_handler(int sig) {
 void get_hidden_input(const char* prompt, char* buffer, int size) {
     printf("%s", prompt);
     fflush(stdout);
-    
+
     int pos = 0;
-    
+
 #ifdef _WIN32
     while (1) {
         int ch = _getch();
@@ -54,7 +54,7 @@ void get_hidden_input(const char* prompt, char* buffer, int size) {
     newt = oldt;
     newt.c_lflag &= ~(ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    
+
     while (1) {
         int ch = getchar();
         if (ch == '\n' || ch == '\r') {
@@ -71,10 +71,10 @@ void get_hidden_input(const char* prompt, char* buffer, int size) {
             fflush(stdout);
         }
     }
-    
+
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 #endif
-    
+
     buffer[pos] = '\0';
     printf("\n");
 }
@@ -82,35 +82,35 @@ void get_hidden_input(const char* prompt, char* buffer, int size) {
 void interactive_config(Socks5ServerConfig *config) {
     static char bind_addr[256], ssh_host[256], ssh_user[256], ssh_pass[256];
     char buffer[256];
-    
+
     printf("Enter SOCKS5 bind address [default: 127.0.0.1]: ");
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = 0;
     strcpy(bind_addr, buffer[0] ? buffer : "127.0.0.1");
     config->bind_address = bind_addr;
-    
+
     printf("Enter SOCKS5 bind port [default: 1180]: ");
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = 0;
     config->bind_port = buffer[0] ? atoi(buffer) : 1180;
-    
+
     printf("Enter SSH server address: ");
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = 0;
     strcpy(ssh_host, buffer);
     config->ssh_host = ssh_host;
-    
+
     printf("Enter SSH port [default: 22]: ");
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = 0;
     config->ssh_port = buffer[0] ? atoi(buffer) : 22;
-    
+
     printf("Enter SSH username: ");
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = 0;
     strcpy(ssh_user, buffer);
     config->ssh_username = ssh_user;
-    
+
     get_hidden_input("Enter SSH password: ", ssh_pass, sizeof(ssh_pass));
     config->ssh_password = ssh_pass;
 }
@@ -189,7 +189,7 @@ int main(int argc, char *argv[]) {
             .ssh_password = ssh_pass
         };
         interactive_config(&config);
-        
+
         if (strlen(config.ssh_host) == 0) {
             fprintf(stderr, "Error: SSH server address cannot be empty\n");
             xargs_cleanup();
@@ -212,7 +212,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // 初始化服务器
+    // Initialize server
     if (socks5_server_init(&config) != 0) {
         fprintf(stderr, "SOCKS5 server initialization failed\n");
         socket_cleanup();
@@ -220,7 +220,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // 启动服务器线程
+    // Start server thread
     if (pthread_create(&g_thread, NULL, socks5_server_thread, NULL) != 0) {
         fprintf(stderr, "Cannot create server thread\n");
         socket_cleanup();
@@ -234,7 +234,7 @@ int main(int argc, char *argv[]) {
     printf("SSH tunnel: %s:%d (user: %s)\n", config.ssh_host, config.ssh_port, config.ssh_username);
     printf("Press Ctrl+C to stop proxy\n");
 
-    // 主循环等待中断信号
+    // Main loop waiting for interrupt signal
     while (g_running) {
 #ifdef _WIN32
         Sleep(1000);
@@ -243,11 +243,12 @@ int main(int argc, char *argv[]) {
 #endif
     }
 
-    // 停止服务器
+    // Stop server
     socks5_server_stop();
     pthread_join(g_thread, NULL);
 
-    // 清理资源
+    // Clean up resources
+    socks5_server_cleanup();
     xargs_cleanup();
     socket_cleanup();
 

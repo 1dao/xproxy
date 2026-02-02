@@ -61,6 +61,7 @@ typedef struct {
 int socks5_server_init(const Socks5ServerConfig* config);
 int socks5_server_run(void);
 void socks5_server_stop(void);
+void socks5_server_cleanup(void);
 int socks5_handle_client(SOCKET_T client_sock, struct sockaddr_in* client_addr);
 int socks5_handle_handshake(Socks5Client* client);
 int socks5_handle_auth(Socks5Client* client);

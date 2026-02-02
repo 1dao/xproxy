@@ -24,33 +24,43 @@ typedef struct {
     int port;
 } SSHTunnel;
 
-// 初始化SSH隧道
+// Initialize SSH tunnel
 int ssh_tunnel_init(SSHTunnel *tunnel, const char *host, int port, 
                     const char *username, const char *password);
 
-// 连接到SSH服务器
+// Connect to SSH server
 int ssh_tunnel_connect(SSHTunnel *tunnel);
 
-// 打开通道到目标主机
+// Open channel to target host
 int ssh_tunnel_open_channel(SSHTunnel *tunnel, const char *dest_host, int dest_port,
                             const char *source_host, int source_port);
 
-// 从SSH通道读取数据
+// Read data from SSH channel
 int ssh_tunnel_read(SSHTunnel *tunnel, void *buffer, size_t buffer_size);
 
-// 向SSH通道写入数据
+// Write data to SSH channel
 int ssh_tunnel_write(SSHTunnel *tunnel, const void *buffer, size_t buffer_size);
 
-// 关闭SSH隧道
+// Close SSH tunnel
 void ssh_tunnel_close(SSHTunnel *tunnel);
 
-// 清理SSH隧道资源
+// Clean up SSH tunnel resources
 void ssh_tunnel_cleanup(SSHTunnel *tunnel);
 
-// 获取SSH隧道状态
+// Get SSH tunnel state
 SSHTunnelState ssh_tunnel_get_state(SSHTunnel *tunnel);
 
-// 获取错误信息
+// Get error information
 int ssh_tunnel_get_error(SSHTunnel *tunnel, char **errmsg);
+
+// Close only SSH channel without closing session and connection
+void ssh_tunnel_close_channel_only(SSHTunnel *tunnel);
+
+// Check if SSH session is still valid
+int ssh_tunnel_is_session_valid(SSHTunnel *tunnel);
+
+// Reopen SSH channel to new target (using existing session)
+int ssh_tunnel_reopen_channel(SSHTunnel *tunnel, const char *dest_host, int dest_port,
+                              const char *source_host, int source_port);
 
 #endif // SSH_TUNNEL_H

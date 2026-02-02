@@ -81,7 +81,7 @@ int ssh_tunnel_connect(SSHTunnel *tunnel) {
         return -1;
     }
     
-    // SSH握手
+    // SSH handshake
     while ((rc = libssh2_session_handshake(tunnel->session, tunnel->sock)) == LIBSSH2_ERROR_EAGAIN) {
         fd_set read_fds, write_fds;
         FD_ZERO(&read_fds);
@@ -104,13 +104,13 @@ int ssh_tunnel_connect(SSHTunnel *tunnel) {
     
     char *userauthlist = libssh2_userauth_list(tunnel->session, tunnel->username, (unsigned int)strlen(tunnel->username));
     if (userauthlist) {
-        fprintf(stderr, "Authentication methods: %s\n", userauthlist);
+        // Authentication methods available, no debug print needed
     }
     
     int auth_success = 0;
     
     if (userauthlist && strstr(userauthlist, "keyboard-interactive")) {
-        fprintf(stderr, "Trying keyboard-interactive authentication...\n");
+        // Trying keyboard-interactive authentication
         while ((rc = libssh2_userauth_keyboard_interactive(tunnel->session, tunnel->username, NULL)) == LIBSSH2_ERROR_EAGAIN) {
             fd_set read_fds, write_fds;
             FD_ZERO(&read_fds);
@@ -126,14 +126,14 @@ int ssh_tunnel_connect(SSHTunnel *tunnel) {
         }
         if (rc == 0) {
             auth_success = 1;
-            fprintf(stderr, "Keyboard-interactive authentication succeeded\n");
+            // Keyboard-interactive authentication succeeded
         } else {
-            fprintf(stderr, "Keyboard-interactive authentication failed: %d\n", rc);
+            // Keyboard-interactive authentication failed
         }
     }
     
     if (!auth_success && userauthlist && strstr(userauthlist, "password")) {
-        fprintf(stderr, "Trying password authentication...\n");
+        // Trying password authentication
         while ((rc = libssh2_userauth_password(tunnel->session, tunnel->username, tunnel->password)) == LIBSSH2_ERROR_EAGAIN) {
             fd_set read_fds, write_fds;
             FD_ZERO(&read_fds);
@@ -149,9 +149,9 @@ int ssh_tunnel_connect(SSHTunnel *tunnel) {
         }
         if (rc == 0) {
             auth_success = 1;
-            fprintf(stderr, "Password authentication succeeded\n");
+            // Password authentication succeeded
         } else {
-            fprintf(stderr, "Password authentication failed: %d\n", rc);
+            // Password authentication failed
         }
     }
     
@@ -181,8 +181,7 @@ int ssh_tunnel_open_channel(SSHTunnel *tunnel, const char *dest_host, int dest_p
         source_port = 12345;
     }
     
-    fprintf(stderr, "Opening SSH channel to %s:%d from %s:%d...\n", 
-            dest_host, dest_port, source_host, source_port);
+    // Opening SSH channel
     
     libssh2_session_set_blocking(tunnel->session, 0);
     
@@ -195,7 +194,7 @@ int ssh_tunnel_open_channel(SSHTunnel *tunnel, const char *dest_host, int dest_p
                                                           source_host, source_port);
         
         if (tunnel->channel) {
-            fprintf(stderr, "SSH channel opened successfully to %s:%d\n", dest_host, dest_port);
+            // SSH channel opened successfully
             break;
         }
         
@@ -341,7 +340,7 @@ void ssh_tunnel_cleanup(SSHTunnel *tunnel) {
         tunnel->password = NULL;
     }
     
-    // 只有在所有隧道都已清理时才调用libssh2_exit
+    // Only call libssh2_exit when all tunnels have been cleaned up
     static int tunnel_count = 0;
     tunnel_count--;
     if (tunnel_count == 0 && libssh2_initialized) {
@@ -359,9 +358,46 @@ SSHTunnelState ssh_tunnel_get_state(SSHTunnel *tunnel) {
 }
 
 int ssh_tunnel_get_error(SSHTunnel *tunnel, char **errmsg) {
-    if (!tunnel || !tunnel->session) {
-        return -1;
-    }
-    
-    return libssh2_session_last_error(tunnel->session, errmsg, NULL, 0);
+  if (!tunnel || !tunnel->session) {
+    return -1;
+  }
+
+  return libssh2_session_last_error(tunnel->session, errmsg, NULL, 0);
+}
+
+void ssh_tunnel_close_channel_only(SSHTunnel *tunnel) {
+  if (!tunnel) {
+    return;
+  }
+
+  if (tunnel->channel) {
+    libssh2_channel_close(tunnel->channel);
+    libssh2_channel_free(tunnel->channel);
+    tunnel->channel = NULL;
+  }
+  
+  // Keep session and socket open for reuse
+  tunnel->state = SSH_TUNNEL_STATE_CONNECTED; // Still connected, just no channel
+}
+
+int ssh_tunnel_is_session_valid(SSHTunnel *tunnel) {
+  if (!tunnel || !tunnel->session || tunnel->state != SSH_TUNNEL_STATE_CONNECTED) {
+    return 0;
+  }
+  
+  // Only check the state, assume session is valid if state is CONNECTED
+  return 1;
+}
+
+int ssh_tunnel_reopen_channel(SSHTunnel *tunnel, const char *dest_host, int dest_port,
+                              const char *source_host, int source_port) {
+  if (!tunnel || tunnel->state != SSH_TUNNEL_STATE_CONNECTED || !dest_host) {
+    return -1;
+  }
+  
+  // First close any existing channel
+  ssh_tunnel_close_channel_only(tunnel);
+  
+  // Now open new channel using existing session
+  return ssh_tunnel_open_channel(tunnel, dest_host, dest_port, source_host, source_port);
 }
