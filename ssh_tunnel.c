@@ -166,7 +166,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
 
     // 设置为非阻塞模式
     libssh2_session_set_blocking(session, 0);
-
+    libssh2_keepalive_config(session, 0, 30);
     printf("SSH session established on socket (%d-%d)\n", sock, (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session)));
     return session;
 }
@@ -255,9 +255,8 @@ LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
 }
 
 void ssh_tunnel_channel_close(LIBSSH2_CHANNEL* channel) {
-    if (!channel) {
+    if (!channel)
         return;
-    }
 
     libssh2_channel_close(channel);
     libssh2_channel_free(channel);

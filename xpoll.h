@@ -25,7 +25,7 @@ typedef void (*xFileProc)(xPollState *loop, SOCKET_T fd, int mask, void *clientD
 /* API functions */
 xPollState* xpoll_create(void);
 void xpoll_free(xPollState *loop);
-xPollState* xpoll_get(void);
+xPollState* xpoll_get_default(void);
 
 int xpoll_resize(xPollState *loop, int setsize);
 
@@ -40,9 +40,6 @@ int xpoll_poll(xPollState *loop, int timeout_ms);
 int xpoll_get_fd(xPollState *loop, SOCKET_T fd);
 void xpoll_set_client_data(xPollState *loop, SOCKET_T fd, void *clientData);
 void* xpoll_get_client_data(xPollState *loop, SOCKET_T fd);
-
-/* Get thread-local default instance */
-xPollState* xpoll_get_default(void);
 
 const char* xpoll_name(void);
 

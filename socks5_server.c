@@ -19,6 +19,14 @@ typedef struct {
     LIBSSH2_SESSION *ssh_session;  // 线程级SSH session
 } ClientInfo;
 
+// 客户端链表（用于遍历所有 channel）
+typedef struct ClientNode {
+    Socks5Client *client;
+    struct ClientNode *next;
+} ClientNode;
+
+static ClientNode *g_client_list = NULL;
+
 void socks5_send_reply(Socks5Client* client, uint8_t rep) {
     uint8_t response[10] = {0};
     response[0] = 0x05;  // SOCKS version 5

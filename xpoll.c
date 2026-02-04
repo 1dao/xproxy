@@ -123,7 +123,8 @@ void xpoll_free(xPollState *loop) {
     free(loop);
 }
 
-xPollState* xpoll_get(void) {
+/* Get thread-local default instance */
+xPollState* xpoll_get_default(void) {
     return _xpoll?_xpoll:xpoll_create();
 }
 
@@ -420,11 +421,6 @@ void* xpoll_get_client_data(xPollState *loop, SOCKET_T fd) {
         return loop->events[idx].clientData;
     }
     return NULL;
-}
-
-/* Get thread-local default instance */
-xPollState* xpoll_get_default(void) {
-    return _xpoll;
 }
 
 /* Return the poll implementation name */
