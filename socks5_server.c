@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include "xpoll.h"
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
@@ -188,6 +189,184 @@ void socks5_client_free(Socks5Client* client) {
     client->state = SOCKS5_STATE_ERROR;
 }
 
+/* SSH socket 可读回调 */
+static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    Socks5Client *client = (Socks5Client*)clientData;
+
+    int n = ssh_tunnel_read(client->ssh_channel, client->read_buffer, sizeof(client->read_buffer));
+    if (n > 0) {
+        int sent = send(client->client_sock, client->read_buffer, n, 0);
+        if (sent != n) {
+            fprintf(stderr, "Failed to send %d bytes to client (sent=%d)\n", n, sent);
+            client->state = SOCKS5_STATE_ERROR;
+        }
+    } else if (n < 0) {
+        fprintf(stderr, "Failed to read from SSH channel, n=%d\n", n);
+        client->state = SOCKS5_STATE_ERROR;
+    }
+    // n == 0 表示暂时没有数据，继续等待
+}
+
+/* SSH socket 可写回调 */
+static void ssh_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    Socks5Client *client = (Socks5Client*)clientData;
+
+    if (client->write_buffer_size > 0) {
+        int remaining = client->write_buffer_size;
+        int written = ssh_tunnel_write(client->ssh_channel, client->write_buffer, remaining);
+
+        if (written < 0) {
+            fprintf(stderr, "Failed to write buffered data to SSH channel, written=%d\n", written);
+            client->state = SOCKS5_STATE_ERROR;
+            return;
+        } else if (written == 0) {
+            // 仍然无法写入，继续等待
+            fprintf(stderr, "SSH channel still not ready for write, will retry...\n");
+            return;
+        } else {
+            // 成功写入部分或全部数据
+            if (written >= remaining) {
+                // 所有数据都已写入
+                client->write_buffer_size = 0;
+                fprintf(stderr, "All buffered data (%d bytes) written to SSH channel\n", written);
+
+                // 移除 SSH socket 可写事件，只保留可读事件
+                xpoll_add_event(loop, fd, XPOLL_READABLE,
+                               ssh_read_cb, NULL, NULL, client);
+            } else {
+                memmove(client->write_buffer, client->write_buffer + written, remaining - written);
+                client->write_buffer_size = remaining - written;
+                fprintf(stderr, "Partially buffered data written: %d/%d bytes\n", written, client->write_buffer_size);
+            }
+        }
+    }
+}
+
+/* 客户端 socket 可读回调 */
+static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    Socks5Client *client = (Socks5Client*)clientData;
+
+    int n = recv(client->client_sock, client->read_buffer, sizeof(client->read_buffer), 0);
+    if (n <= 0) {
+        printf("Client disconnected\n");
+        client->state = SOCKS5_STATE_ERROR;
+        return;
+    }
+
+    if (client->ssh_channel) {
+        // 检查缓冲区是否还有未写入的数据
+        if (client->write_buffer_size > 0) {
+            // 缓冲区有未写入的数据，需要追加新数据到缓冲区
+            int buffer_space = sizeof(client->write_buffer) - client->write_buffer_size;
+            if (n > buffer_space) {
+                fprintf(stderr, "ERROR: Buffer overflow. Available: %d, needed: %d\n",
+                       buffer_space, n);
+                fprintf(stderr, "Dropping new data, waiting for buffer to clear\n");
+                return;
+            }
+
+            // 将新数据追加到缓冲区末尾
+            memcpy(client->write_buffer + client->write_buffer_size, client->read_buffer, n);
+            client->write_buffer_size += n;
+
+            fprintf(stderr, "Appended %d bytes to write buffer, total buffered: %d bytes\n",
+                   n, client->write_buffer_size);
+        } else {
+            // 缓冲区为空，尝试直接写入
+            int written = ssh_tunnel_write(client->ssh_channel, client->read_buffer, n);
+            if (written < 0) {
+                // 写入失败，尝试缓冲数据
+                client->write_error_count++;
+                fprintf(stderr, "Failed to write to SSH channel: error count=%d\n", client->write_error_count);
+
+                if (client->write_error_count >= MAX_ERROR_COUNT) {
+                    fprintf(stderr, "Max write error count exceeded, closing connection\n");
+                    client->state = SOCKS5_STATE_ERROR;
+                    return;
+                }
+
+                // 尝试缓冲数据
+                if (n <= sizeof(client->write_buffer)) {
+                    memcpy(client->write_buffer, client->read_buffer, n);
+                    client->write_buffer_size = n;
+                    fprintf(stderr, "Buffered %d bytes for retry\n", n);
+
+                    // 注册 SSH socket 可写事件，以便在可写时处理缓冲区
+                    SOCKET_T ssh_socket = ssh_tunnel_session_get_socket(client->ssh_session);
+                    if (ssh_socket != INVALID_SOCKET) {
+                        xpoll_add_event(loop, ssh_socket, XPOLL_READABLE | XPOLL_WRITABLE,
+                                       ssh_read_cb, ssh_write_cb, NULL, client);
+                    }
+                } else {
+                    fprintf(stderr, "ERROR: Data too large to buffer (%d bytes)\n", n);
+                    client->state = SOCKS5_STATE_ERROR;
+                }
+            } else if (written == 0) {
+                // SSH channel暂时无法写入，需要缓冲所有数据
+                fprintf(stderr, "SSH channel not ready for write (EAGAIN), buffering %d bytes...\n", n);
+
+                if (n > sizeof(client->write_buffer)) {
+                    fprintf(stderr, "ERROR: Buffer too small for %d bytes, dropping data\n", n);
+                    client->state = SOCKS5_STATE_ERROR;
+;
+                    return;
+                }
+
+                memcpy(client->write_buffer, client->read_buffer, n);
+                client->write_buffer_size = n;
+                fprintf(stderr, "Buffered %d bytes, will retry writing\n", n);
+
+                // 注册 SSH socket 可写事件
+                SOCKET_T ssh_socket = ssh_tunnel_session_get_socket(client->ssh_session);
+                if (ssh_socket != INVALID_SOCKET) {
+                    xpoll_add_event(loop, ssh_socket, XPOLL_READABLE | XPOLL_WRITABLE,
+                                   ssh_read_cb, ssh_write_cb, NULL, client);
+                }
+            } else {
+                // 部分或全部写入成功
+                client->write_error_count = 0;  // 重置错误计数
+                fprintf(stderr, "SSH channel wrote %d bytes\n", written);
+
+                if (written < n) {
+                    // 只写入了部分数据，需要缓冲剩余的数据
+                    int remaining = n - written;
+                    fprintf(stderr, "Partially written: %d/%d bytes, buffering remaining %d bytes...\n",
+                           written, n, remaining);
+
+                    if (remaining > sizeof(client->write_buffer)) {
+                        fprintf(stderr, "ERROR: Buffer too small for %d bytes, dropping data\n", remaining);
+                        client->state = SOCKS5_STATE_ERROR;
+                        return;
+                    }
+
+                    // 缓冲剩余的数据
+                    memcpy(client->write_buffer, client->read_buffer + written, remaining);
+                    client->write_buffer_size = remaining;
+                    fprintf(stderr, "Buffered remaining %d bytes\n", remaining);
+
+                    // 注册 SSH socket 可写事件
+                    SOCKET_T ssh_socket = ssh_tunnel_session_get_socket(client->ssh_session);
+                    if (ssh_socket != INVALID_SOCKET) {
+                        xpoll_add_event(loop, ssh_socket, XPOLL_READABLE | XPOLL_WRITABLE,
+                                       ssh_read_cb, ssh_write_cb, NULL, client);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* 错误回调 */
+static void error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    Socks5Client *client = (Socks5Client*)clientData;
+    client->state = SOCKS5_STATE_ERROR;
+}
+
+/* 客户端可写回调（当前不使用） */
+static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    // 当前实现中不需要
+}
+
 int socks5_handle_client(SOCKET_T client_sock, struct sockaddr_in* client_addr,
                          LIBSSH2_SESSION *ssh_session) {
     Socks5Client client = {0};
@@ -224,185 +403,53 @@ int socks5_handle_client(SOCKET_T client_sock, struct sockaddr_in* client_addr,
         return -1;
     }
 
-    fd_set read_fds, write_fds;
     SOCKET_T ssh_socket = ssh_tunnel_session_get_socket(ssh_session);
+    if (ssh_socket == INVALID_SOCKET) {
+        fprintf(stderr, "SSH socket is invalid\n");
+        socks5_client_free(&client);
+        return -1;
+    }
 
+    // 创建 xpoll 实例
+    xPollState *loop = xpoll_create();
+    if (!loop) {
+        fprintf(stderr, "Failed to create xpoll loop\n");
+        socks5_client_free(&client);
+        return -1;
+    }
+
+    // 注册客户端 socket 可读事件
+    if (xpoll_add_event(loop, client.client_sock, XPOLL_READABLE,
+                        client_read_cb, NULL, error_cb, &client) != 0) {
+        fprintf(stderr, "Failed to register client socket event\n");
+        xpoll_free(loop);
+        socks5_client_free(&client);
+        return -1;
+    }
+
+    // 注册 SSH socket 可读事件
+    if (xpoll_add_event(loop, ssh_socket, XPOLL_READABLE,
+                        ssh_read_cb, NULL, error_cb, &client) != 0) {
+        fprintf(stderr, "Failed to register SSH socket event\n");
+        xpoll_del_event(loop, client.client_sock, XPOLL_READABLE);
+        xpoll_free(loop);
+        socks5_client_free(&client);
+        return -1;
+    }
+
+    // 主事件循环
     while (client.state == SOCKS5_STATE_CONNECTED) {
-        FD_ZERO(&read_fds);
-        FD_ZERO(&write_fds);
-        FD_SET(client.client_sock, &read_fds);
-
-        int max_fd = client.client_sock;
-
-        // 添加SSH session的socket到监听集合
-        if (ssh_socket != INVALID_SOCKET) {
-            FD_SET(ssh_socket, &read_fds);
-            if (ssh_socket > max_fd) {
-                max_fd = ssh_socket;
-            }
-
-            // 如果有待写入的数据，也监听SSH socket的可写事件
-            if (client.write_buffer_size > 0) {
-                FD_SET(ssh_socket, &write_fds);
-            }
-        } else {
-            // 如果没有SSH socket，直接跳过处理
-            break;
-        }
-
-        struct timeval tv = {1, 0};
-        int ret = select((int)max_fd + 1, &read_fds, &write_fds, NULL, &tv);
+        int ret = xpoll_poll(loop, 1000);  // 1秒超时
         if (ret < 0) {
-            printf("Select error: %d\n", WSAGetLastError());
+            fprintf(stderr, "xpoll_poll error: %d\n", WSAGetLastError());
             break;
-        }
-
-        if (ret == 0) {
-            continue; // 超时，继续等待
-        }
-
-        // 先处理SSH socket可能的可写事件（如果有待写入的数据）
-        if (client.write_buffer_size > 0 && FD_ISSET(ssh_socket, &write_fds)) {
-            // 计算缓冲区中剩余未写入的数据
-            int remaining = client.write_buffer_size;
-            int written = ssh_tunnel_write(client.ssh_channel,client.write_buffer, remaining);
-            if (written < 0) {
-                fprintf(stderr, "Failed to write buffered data to SSH channel, written=%d\n", written);
-                break;
-            } else if (written == 0) {
-                // 仍然无法写入，继续等待
-                fprintf(stderr, "SSH channel still not ready for write, will retry...\n");
-            } else {
-                // 成功写入部分或全部数据
-                if (written >= remaining) {
-                    // 所有数据都已写入
-                    client.write_buffer_size = 0;
-                    fprintf(stderr, "All buffered data (%d bytes) written to SSH channel\n", written);
-                } else {
-                    memmove(client.write_buffer, client.write_buffer + written, remaining - written);
-                    client.write_buffer_size = remaining - written;
-                    fprintf(stderr, "Partially buffered data written: %d/%d bytes\n", written, client.write_buffer_size);
-                }
-            }
-        }
-
-        // 检查客户端是否有数据可读
-        if (FD_ISSET(client.client_sock, &read_fds)) {
-            int n = recv(client.client_sock, client.read_buffer, sizeof(client.read_buffer), 0);
-            if (n <= 0) {
-                printf("Client disconnected\n");
-                break;
-            }
-
-            if (client.ssh_channel) {
-                // 检查缓冲区是否还有未写入的数据
-                if (client.write_buffer_size > 0) {
-                    // 缓冲区有未写入的数据，需要追加新数据到缓冲区
-
-                    // 计算缓冲区中剩余空间
-                    int buffer_space = sizeof(client.write_buffer) - client.write_buffer_size;
-                    if (n > buffer_space) {
-                        fprintf(stderr, "ERROR: Buffer overflow. Available: %d, needed: %d\n",
-                               buffer_space, n);
-                        // 缓冲区空间不足，这种情况下可能需要：
-                        // 1. 增大缓冲区
-                        // 2. 丢弃新数据
-                        // 3. 等待缓冲区清空（暂不处理新数据）
-                        fprintf(stderr, "Dropping new data, waiting for buffer to clear\n");
-                        fprintf(stderr, "Dropping new data, waiting for buffer to clear\n");
-                        fprintf(stderr, "Dropping new data, waiting for buffer to clear\n");
-                        // 简单处理：丢弃新数据，等待缓冲区清空
-                    }
-
-                    // 将新数据追加到缓冲区末尾
-                    memcpy(client.write_buffer + client.write_buffer_size, client.read_buffer, n);
-                    client.write_buffer_size += n;
-
-                    fprintf(stderr, "Appended %d bytes to write buffer, total buffered: %d bytes\n",
-                           n, client.write_buffer_size);
-                    // 等待socket可写事件来处理缓冲区
-                    // 此处不能continue，因为需要处理可读事件
-                    // 如果continue，将导致socket可读事件被忽略
-                } else {
-                    // 缓冲区为空，尝试直接写入
-                    int written = ssh_tunnel_write(client.ssh_channel, client.read_buffer, n);
-                    if (written < 0) {
-                        // 写入失败，尝试缓冲数据
-                        client.write_error_count++;
-                        fprintf(stderr, "Failed to write to SSH channel: error count=%d\n", client.write_error_count);
-
-                        if (client.write_error_count >= MAX_ERROR_COUNT) {
-                            fprintf(stderr, "Max write error count exceeded, closing connection\n");
-                            break;
-                        }
-
-                        // 尝试缓冲数据
-                        if (n <= sizeof(client.write_buffer)) {
-                            memcpy(client.write_buffer, client.read_buffer, n);
-                            client.write_buffer_size = n;
-                            fprintf(stderr, "Buffered %d bytes for retry\n", n);
-                        } else {
-                            fprintf(stderr, "ERROR: Data too large to buffer (%d bytes)\n", n);
-                            break;
-                        }
-                    } else if (written == 0) {
-                        // SSH channel暂时无法写入，需要缓冲所有数据
-                        fprintf(stderr, "SSH channel not ready for write (EAGAIN), buffering %d bytes...\n", n);
-
-                        if (n > sizeof(client.write_buffer)) {
-                            fprintf(stderr, "ERROR: Buffer too small for %d bytes, dropping data\n", n);
-                            break;
-                        }
-
-                        memcpy(client.write_buffer, client.read_buffer, n);
-                        client.write_buffer_size = n;
-                        fprintf(stderr, "Buffered %d bytes, will retry writing\n", n);
-                    } else {
-                        // 部分或全部写入成功
-                        client.write_error_count = 0;  // 重置错误计数
-                        fprintf(stderr, "SSH channel wrote %d bytes\n", written);
-
-                        if (written < n) {
-                            // 只写入了部分数据，需要缓冲剩余的数据
-                            int remaining = n - written;
-                            fprintf(stderr, "Partially written: %d/%d bytes, buffering remaining %d bytes...\n",
-                                   written, n, remaining);
-
-                            if (remaining > sizeof(client.write_buffer)) {
-                                fprintf(stderr, "ERROR: Buffer too small for %d bytes, dropping data\n", remaining);
-                                break;
-                            }
-
-                            // 缓冲剩余的数据
-                            memcpy(client.write_buffer, client.read_buffer + written, remaining);
-                            client.write_buffer_size = remaining;
-                            fprintf(stderr, "Buffered remaining %d bytes\n", remaining);
-                        }
-                    }
-                }
-
-            }
-        }
-
-        // 检查SSH socket是否有数据可读
-        if (ssh_socket != INVALID_SOCKET && FD_ISSET(ssh_socket, &read_fds)) {
-            // 尝试读取尽可能多的数据
-            int n = ssh_tunnel_read(client.ssh_channel, client.read_buffer, sizeof(client.read_buffer));
-            if (n > 0) {
-                int sent = send(client.client_sock, client.read_buffer, n, 0);
-                if (sent != n) {
-                    fprintf(stderr, "Failed to send %d bytes to client (sent=%d)\n", n, sent);
-                    fprintf(stderr, "Failed to send %d bytes to client (sent=%d)\n", n, sent);
-                    fprintf(stderr, "Failed to send %d bytes to client (sent=%d)\n", n, sent);
-                    break;
-                }
-            } else if (n < 0) {
-                fprintf(stderr, "Failed to read from SSH channel, n=%d\n", n);
-                break;
-            }
-            // n == 0 表示暂时没有数据，继续循环
         }
     }
+
+    // 清理
+    xpoll_del_event(loop, client.client_sock, XPOLL_READABLE);
+    xpoll_del_event(loop, ssh_socket, XPOLL_READABLE | XPOLL_WRITABLE);
+    xpoll_free(loop);
 
     socks5_client_free(&client);
     return 0;
@@ -453,6 +500,54 @@ int socks5_server_init(const Socks5ServerConfig* config) {
     return 0;
 }
 
+/* Accept 事件回调 - 当有新连接到来时被调用 */
+static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    SOCKET_T client_sock = accept(fd, (struct sockaddr*)&client_addr, &client_len);
+    if (client_sock == INVALID_SOCKET) {
+        if (g_server_running) {
+            fprintf(stderr, "accept failed: %d\n", WSAGetLastError());
+        }
+        return;
+    }
+
+    printf("New client connection from %s:%d\n",
+           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+
+    pthread_mutex_lock(&g_conn_mutex);
+    if (g_active_connections >= MAX_CONCURRENT_CONNECTIONS) {
+        pthread_mutex_unlock(&g_conn_mutex);
+        fprintf(stderr, "Too many connections (%d), rejecting new connection\n", g_active_connections);
+        CLOSE_SOCKET(client_sock);
+        return;
+    }
+    pthread_mutex_unlock(&g_conn_mutex);
+
+    ClientInfo* client_info = (ClientInfo*)malloc(sizeof(ClientInfo));
+    if (!client_info) {
+        perror("malloc failed");
+        CLOSE_SOCKET(client_sock);
+        return;
+    }
+    client_info->sock = client_sock;
+    memcpy(&client_info->addr, &client_addr, sizeof(client_addr));
+    client_info->ssh_session = NULL;  // 将在线程中创建
+
+    // 创建线程处理客户连接
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, NULL, socks5_client_thread, (void*)client_info) != 0) {
+        perror("pthread_create failed");
+        free(client_info);
+        CLOSE_SOCKET(client_sock);
+        return;
+    }
+
+    // 分离线程，让它自行清理
+    pthread_detach(thread_id);
+}
+
 int socks5_server_run(void) {
     SOCKET_T listen_sock;
     struct sockaddr_in server_addr;
@@ -497,52 +592,40 @@ int socks5_server_run(void) {
 
     g_server_running = 1;
 
-    while (g_server_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-
-        SOCKET_T client_sock = accept(listen_sock, (struct sockaddr*)&client_addr, &client_len);
-        if (client_sock == INVALID_SOCKET) {
-            if (g_server_running) perror("accept failed");
-            continue;
-        }
-
-        printf("New client connection from %s:%d\n",
-               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        pthread_mutex_lock(&g_conn_mutex);
-        if (g_active_connections >= MAX_CONCURRENT_CONNECTIONS) {
-            pthread_mutex_unlock(&g_conn_mutex);
-            fprintf(stderr, "Too many connections (%d), rejecting new connection\n", g_active_connections);
-            CLOSE_SOCKET(client_sock);
-            continue;
-        }
-        pthread_mutex_unlock(&g_conn_mutex);
-
-        ClientInfo* client_info = (ClientInfo*)malloc(sizeof(ClientInfo));
-        if (!client_info) {
-            perror("malloc failed");
-            CLOSE_SOCKET(client_sock);
-            continue;
-        }
-        client_info->sock = client_sock;
-        memcpy(&client_info->addr, &client_addr, sizeof(client_addr));
-        client_info->ssh_session = NULL;  // 将在线程中创建
-
-        // 创建线程处理客户连接
-        pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, socks5_client_thread, (void*)client_info) != 0) {
-            perror("pthread_create failed");
-            free(client_info);
-            CLOSE_SOCKET(client_sock);
-            continue;
-        }
-
-        // 分离线程，让它自行清理
-        pthread_detach(thread_id);
+    // 创建 xpoll 实例
+    xPollState* xpoll = xpoll_create();
+    if (!xpoll) {
+        fprintf(stderr, "Failed to create xpoll loop\n");
+        CLOSE_SOCKET(listen_sock);
+        return -1;
     }
 
+    // 注册监听 socket 的可读事件
+    if (xpoll_add_event(xpoll, listen_sock, XPOLL_READABLE,
+                        (xFileProc)accept_cb, NULL, NULL, NULL) != 0) {
+        fprintf(stderr, "Failed to register listen socket event\n");
+        xpoll_free(xpoll);
+        CLOSE_SOCKET(listen_sock);
+        return -1;
+    }
+
+    printf("Using %s for I/O multiplexing\n", xpoll_name());
+
+    // 主事件循环
+    while (g_server_running) {
+        int ret = xpoll_poll(xpoll, 1000);  // 1秒超时
+        if (ret < 0) {
+            fprintf(stderr, "xpoll_poll error: %d\n", WSAGetLastError());
+            break;
+        }
+    }
+
+    // 清理
+    xpoll_del_event(xpoll, listen_sock, XPOLL_READABLE);
+    xpoll_free(xpoll);
+    xpoll = NULL;
     CLOSE_SOCKET(listen_sock);
+
     return 0;
 }
 

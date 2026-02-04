@@ -4,7 +4,7 @@
 
 # Project configuration
 TARGET = socks5server
-SRCS = main_socks5.c socks5_server.c ssh_tunnel.c xargs.c
+SRCS = xpoll.c main_socks5.c socks5_server.c ssh_tunnel.c xargs.c
 HEADERS = socket_util.h socks5_server.h ssh_tunnel.h xargs.h
 
 # mbedtls source files
@@ -153,3 +153,4 @@ help:
 main_socks5.o: socket_util.h socks5_server.h
 socks5_server.o: socket_util.h socks5_server.h
 ssh_tunnel.o: socket_util.h ssh_tunnel.h
+xpoll.o: socket_util.h xpoll.h
