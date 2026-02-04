@@ -1,9 +1,9 @@
-#ifndef SOCKS5_SERVER_H
-#define SOCKS5_SERVER_H
+#ifndef SOCKS5_SERVER_V1_H
+#define SOCKS5_SERVER_V1_H
 
 #include "socket_util.h"
 #include <stdint.h>
-#include "ssh_tunnel.h"
+#include <libssh2.h>
 
 #define SOCKS5_AUTH_NONE 0x00
 #define SOCKS5_AUTH_GSSAPI 0x01
@@ -28,15 +28,6 @@
 #define SOCKS5_REP_COMMAND_NOT_SUPPORTED 0x07
 #define SOCKS5_REP_ADDRESS_NOT_SUPPORTED 0x08
 
-typedef struct {
-    const char* ssh_host;
-    uint16_t ssh_port;
-    const char* ssh_username;
-    const char* ssh_password;
-    const char* bind_address;
-    uint16_t bind_port;
-} Socks5ServerConfig;
-
 typedef enum {
     SOCKS5_STATE_INIT,
     SOCKS5_STATE_AUTH,
@@ -47,27 +38,34 @@ typedef enum {
 
 typedef struct {
     SOCKET_T client_sock;
-    SOCKET_T remote_sock;
     Socks5ClientState state;
     uint8_t auth_method;
     char target_host[256];
     uint16_t target_port;
     uint8_t cmd;
-    SSHTunnel *ssh_tunnel;
+    LIBSSH2_SESSION *ssh_session;  // 线程级SSH session
+    LIBSSH2_CHANNEL *ssh_channel;  // 当前连接的SSH channel
     char client_host[256];
     uint16_t client_port;
+
+    // IO buffers and state
+    char read_buffer[8192];
+    char write_buffer[8192];
+    int write_buffer_size;
+    int write_error_count;
 } Socks5Client;
+
+typedef struct {
+    const char* ssh_host;
+    uint16_t ssh_port;
+    const char* ssh_username;
+    const char* ssh_password;
+    const char* bind_address;
+    uint16_t bind_port;
+} Socks5ServerConfig;
 
 int socks5_server_init(const Socks5ServerConfig* config);
 int socks5_server_run(void);
 void socks5_server_stop(void);
-void socks5_server_cleanup(void);
-int socks5_handle_client(SOCKET_T client_sock, struct sockaddr_in* client_addr);
-int socks5_handle_handshake(Socks5Client* client);
-int socks5_handle_auth(Socks5Client* client);
-int socks5_handle_request(Socks5Client* client);
-int socks5_establish_ssh_tunnel(Socks5Client* client, const Socks5ServerConfig* config);
-void socks5_send_reply(Socks5Client* client, uint8_t rep);
-void socks5_client_free(Socks5Client* client);
 
-#endif
+#endif // SOCKS5_SERVER_V1_H

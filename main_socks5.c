@@ -138,7 +138,6 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    console_set_consolas_font();
     signal(SIGINT, signal_handler);
 
     static char bind_addr[256], ssh_host[256], ssh_user[256], ssh_pass[256];
@@ -248,7 +247,6 @@ int main(int argc, char *argv[]) {
     pthread_join(g_thread, NULL);
 
     // Clean up resources
-    socks5_server_cleanup();
     xargs_cleanup();
     socket_cleanup();
 

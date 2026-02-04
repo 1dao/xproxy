@@ -15,389 +15,312 @@
 
 static int libssh2_initialized = 0;
 
-int ssh_tunnel_init(SSHTunnel *tunnel, const char *host, int port, 
-                    const char *username, const char *password) {
-    if (!tunnel || !host || !username || !password) {
-        return -1;
+LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
+                                         const char *username, const char *password) {
+    if (!host || !username || !password) {
+        printf("ssh_tunnel_session_open: Invalid arguments\n");
+        return NULL;
     }
-    
-    memset(tunnel, 0, sizeof(SSHTunnel));
-    
-    tunnel->host = strdup(host);
-    tunnel->port = port;
-    tunnel->username = strdup(username);
-    tunnel->password = strdup(password);
-    tunnel->state = SSH_TUNNEL_STATE_DISCONNECTED;
-    tunnel->sock = INVALID_SOCKET;
-    
-    return 0;
-}
 
-int ssh_tunnel_connect(SSHTunnel *tunnel) {
-    if (!tunnel || tunnel->state != SSH_TUNNEL_STATE_DISCONNECTED) {
-        return -1;
-    }
-    
     struct sockaddr_in sin;
     int rc;
-    
-    tunnel->sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (tunnel->sock == INVALID_SOCKET) {
+    SOCKET_T sock;
+    // 创建socket
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
         perror("socket");
-        tunnel->state = SSH_TUNNEL_STATE_ERROR;
-        return -1;
+        return NULL;
     }
-    
+
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(tunnel->port);
-    if (inet_pton(AF_INET, tunnel->host, &sin.sin_addr) <= 0) {
-        fprintf(stderr, "Invalid address\n");
-        tunnel->state = SSH_TUNNEL_STATE_ERROR;
-        return -1;
+    sin.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &sin.sin_addr) <= 0) {
+        fprintf(stderr, "Invalid address: %s\n", host);
+        CLOSE_SOCKET(sock);
+        return NULL;
     }
-    
-    tunnel->state = SSH_TUNNEL_STATE_CONNECTING;
-    
-    if (connect(tunnel->sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-        perror("connect");
-        tunnel->state = SSH_TUNNEL_STATE_ERROR;
-        return -1;
+
+    // 连接到SSH服务器
+    if (connect(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        // perror("connect");
+        // CLOSE_SOCKET(sock);
+        fprintf(stderr, "Connect failed: host=%s,port=%d, user=%s, password=%s\n", host, port, username, password);
+
+        #ifdef _WIN32
+                int error_code = WSAGetLastError();
+                char error_msg[256];
+                FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                              NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                              error_msg, sizeof(error_msg), NULL);
+                fprintf(stderr, "connect failed: %s\n", error_msg);
+        #else
+                perror("connect");
+        #endif
+                CLOSE_SOCKET(sock);
+                fprintf(stderr, "Connect failed: host=%s,port=%d, user=%s, password=%s\n", host, port, username, password);
+        return NULL;
     }
-    
+
+    // 初始化libssh2
     if (!libssh2_initialized) {
         rc = libssh2_init(0);
         if (rc != 0) {
             fprintf(stderr, "libssh2_init failed: %d\n", rc);
-            tunnel->state = SSH_TUNNEL_STATE_ERROR;
-            return -1;
+            return NULL;
         }
         libssh2_initialized = 1;
     }
-    
-    tunnel->session = libssh2_session_init();
-    if (!tunnel->session) {
+
+    // 创建SSH session
+    LIBSSH2_SESSION *session = libssh2_session_init_ex(NULL, NULL, NULL, (void*)(intptr_t)sock);
+    if (!session) {
         fprintf(stderr, "Could not initialize SSH session\n");
-        tunnel->state = SSH_TUNNEL_STATE_ERROR;
-        return -1;
+        CLOSE_SOCKET(sock);
+        return NULL;
     }
-    
-    // SSH handshake
-    while ((rc = libssh2_session_handshake(tunnel->session, tunnel->sock)) == LIBSSH2_ERROR_EAGAIN) {
+
+    // SSH握手
+    while ((rc = libssh2_session_handshake(session, sock)) == LIBSSH2_ERROR_EAGAIN) {
         fd_set read_fds, write_fds;
         FD_ZERO(&read_fds);
         FD_ZERO(&write_fds);
-        int dir = libssh2_session_block_directions(tunnel->session);
+        int dir = libssh2_session_block_directions(session);
         if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-            FD_SET(tunnel->sock, &read_fds);
+            FD_SET(sock, &read_fds);
         }
         if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-            FD_SET(tunnel->sock, &write_fds);
+            FD_SET(sock, &write_fds);
         }
-        select((int)tunnel->sock + 1, &read_fds, &write_fds, NULL, NULL);
+        select((int)sock + 1, &read_fds, &write_fds, NULL, NULL);
     }
-    
+
     if (rc) {
         fprintf(stderr, "Error when starting up SSH session: %d\n", rc);
-        tunnel->state = SSH_TUNNEL_STATE_ERROR;
-        return -1;
+        libssh2_session_free(session);
+        CLOSE_SOCKET(sock);
+        return NULL;
     }
-    
-    char *userauthlist = libssh2_userauth_list(tunnel->session, tunnel->username, (unsigned int)strlen(tunnel->username));
+
+    // 获取支持的认证方法
+    char *userauthlist = libssh2_userauth_list(session, username, (unsigned int)strlen(username));
     if (userauthlist) {
-        // Authentication methods available, no debug print needed
+        fprintf(stderr, "Authentication methods: %s\n", userauthlist);
     }
-    
+
     int auth_success = 0;
-    
+
+    // 尝试keyboard-interactive认证
     if (userauthlist && strstr(userauthlist, "keyboard-interactive")) {
-        // Trying keyboard-interactive authentication
-        while ((rc = libssh2_userauth_keyboard_interactive(tunnel->session, tunnel->username, NULL)) == LIBSSH2_ERROR_EAGAIN) {
+        fprintf(stderr, "Trying keyboard-interactive authentication...\n");
+        while ((rc = libssh2_userauth_keyboard_interactive(session, username, NULL)) == LIBSSH2_ERROR_EAGAIN) {
             fd_set read_fds, write_fds;
             FD_ZERO(&read_fds);
             FD_ZERO(&write_fds);
-            int dir = libssh2_session_block_directions(tunnel->session);
+            int dir = libssh2_session_block_directions(session);
             if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-                FD_SET(tunnel->sock, &read_fds);
+                FD_SET(sock, &read_fds);
             }
             if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-                FD_SET(tunnel->sock, &write_fds);
+                FD_SET(sock, &write_fds);
             }
-            select((int)tunnel->sock + 1, &read_fds, &write_fds, NULL, NULL);
+            select((int)sock + 1, &read_fds, &write_fds, NULL, NULL);
         }
         if (rc == 0) {
             auth_success = 1;
-            // Keyboard-interactive authentication succeeded
+            fprintf(stderr, "Keyboard-interactive authentication succeeded\n");
         } else {
-            // Keyboard-interactive authentication failed
+            fprintf(stderr, "Keyboard-interactive authentication failed: %d\n", rc);
         }
     }
-    
+
+    // 尝试密码认证
     if (!auth_success && userauthlist && strstr(userauthlist, "password")) {
-        // Trying password authentication
-        while ((rc = libssh2_userauth_password(tunnel->session, tunnel->username, tunnel->password)) == LIBSSH2_ERROR_EAGAIN) {
+        fprintf(stderr, "Trying password authentication...\n");
+        while ((rc = libssh2_userauth_password(session, username, password)) == LIBSSH2_ERROR_EAGAIN) {
             fd_set read_fds, write_fds;
             FD_ZERO(&read_fds);
             FD_ZERO(&write_fds);
-            int dir = libssh2_session_block_directions(tunnel->session);
+            int dir = libssh2_session_block_directions(session);
             if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-                FD_SET(tunnel->sock, &read_fds);
+                FD_SET(sock, &read_fds);
             }
             if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-                FD_SET(tunnel->sock, &write_fds);
+                FD_SET(sock, &write_fds);
             }
-            select((int)tunnel->sock + 1, &read_fds, &write_fds, NULL, NULL);
+            select((int)sock + 1, &read_fds, &write_fds, NULL, NULL);
         }
         if (rc == 0) {
             auth_success = 1;
-            // Password authentication succeeded
+            fprintf(stderr, "Password authentication succeeded\n");
         } else {
-            // Password authentication failed
+            fprintf(stderr, "Password authentication failed: %d\n", rc);
         }
     }
-    
+
     if (!auth_success) {
         fprintf(stderr, "All authentication methods failed\n");
-        tunnel->state = SSH_TUNNEL_STATE_ERROR;
-        return -1;
+        libssh2_session_free(session);
+        CLOSE_SOCKET(sock);
+        return NULL;
     }
-    
-    libssh2_session_set_blocking(tunnel->session, 1);
-    
-    tunnel->state = SSH_TUNNEL_STATE_CONNECTED;
-    return 0;
+
+    // 设置为非阻塞模式
+    libssh2_session_set_blocking(session, 0);
+
+    printf("SSH session established on socket (%d-%d)\n", sock, (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session)));
+    return session;
 }
 
-int ssh_tunnel_open_channel(SSHTunnel *tunnel, const char *dest_host, int dest_port,
-                            const char *source_host, int source_port) {
-    if (!tunnel || tunnel->state != SSH_TUNNEL_STATE_CONNECTED || !dest_host) {
-        return -1;
+void ssh_tunnel_session_close(LIBSSH2_SESSION* session) {
+    if (!session) {
+        return;
     }
-    
-    int rc;
-    if (!source_host) {
+
+    // 获取socket文件描述符
+    SOCKET_T sock = (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
+
+    if (session) {
+        libssh2_session_disconnect(session, "Normal Shutdown");
+        libssh2_session_free(session);
+    }
+
+    if (sock != INVALID_SOCKET) {
+        CLOSE_SOCKET(sock);
+    }
+}
+
+LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
+                                         const char *dest_host, int dest_port,
+                                         const char *source_host, int source_port) {
+    if (!session || !dest_host)
+        return NULL;
+    if (!source_host)
         source_host = "127.0.0.1";
-    }
-    if (source_port == 0) {
+    if (source_port == 0)
         source_port = 12345;
-    }
-    
-    // Opening SSH channel
-    
-    libssh2_session_set_blocking(tunnel->session, 0);
-    
+
+    int rc;
     int retry_count = 0;
-    int max_retries = 50;
-    
+    int max_retries = 100;
+    SOCKET_T sock = (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
+    LIBSSH2_CHANNEL *channel = NULL;
     while (retry_count < max_retries) {
-        tunnel->channel = libssh2_channel_direct_tcpip_ex(tunnel->session, 
-                                                          dest_host, dest_port,
-                                                          source_host, source_port);
-        
-        if (tunnel->channel) {
-            // SSH channel opened successfully
+        channel = libssh2_channel_direct_tcpip_ex(session,
+                            dest_host, dest_port,
+                            source_host, source_port);
+        if (channel)
             break;
-        }
-        
-        rc = libssh2_session_last_error(tunnel->session, NULL, NULL, 0);
-        
+
+        rc = libssh2_session_last_error(session, NULL, NULL, 0);
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             retry_count++;
             if (retry_count >= max_retries) {
                 fprintf(stderr, "Timeout opening SSH channel after %d retries\n", max_retries);
                 break;
             }
-            
+
             fd_set read_fds, write_fds;
             struct timeval timeout;
             FD_ZERO(&read_fds);
             FD_ZERO(&write_fds);
-            int dir = libssh2_session_block_directions(tunnel->session);
-            if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-                FD_SET(tunnel->sock, &read_fds);
-            }
-            if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-                FD_SET(tunnel->sock, &write_fds);
-            }
-            
+            int dir = libssh2_session_block_directions(session);
+            if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
+                FD_SET(sock, &read_fds);
+            if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
+                FD_SET(sock, &write_fds);
+
             timeout.tv_sec = 0;
             timeout.tv_usec = 100000;
-            
-            select((int)tunnel->sock + 1, &read_fds, &write_fds, NULL, &timeout);
+            select((int)sock + 1, &read_fds, &write_fds, NULL, &timeout);
         } else {
             char *error_msg = NULL;
-            libssh2_session_last_error(tunnel->session, &error_msg, NULL, 0);
-            fprintf(stderr, "Failed to open direct-tcpip channel to %s:%d. Error %d: %s\n", 
+            libssh2_session_last_error(session, &error_msg, NULL, 0);
+            fprintf(stderr, "Failed to open direct-tcpip channel to %s:%d. Error %d: %s\n",
                     dest_host, dest_port, rc, error_msg ? error_msg : "Unknown error");
-            libssh2_session_set_blocking(tunnel->session, 1);
+            libssh2_session_set_blocking(session, 1);
+            return NULL;
+        }
+    }
+
+    if (channel) {
+        fprintf(stderr, "SSH channel opened successfully to %s:%d\n", dest_host, dest_port);
+    } else {
+        char *error_msg = NULL;
+        int rc = libssh2_session_last_error(session, &error_msg, NULL, 0);
+        fprintf(stderr, "Failed to open direct-tcpip channel to %s:%d. Error %d: %s\n",
+                dest_host, dest_port, rc, error_msg ? error_msg : "Unknown error");
+    }
+
+    return channel;
+}
+
+void ssh_tunnel_channel_close(LIBSSH2_CHANNEL* channel) {
+    if (!channel) {
+        return;
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+}
+
+int ssh_tunnel_read(LIBSSH2_CHANNEL *channel, void *buffer, size_t buffer_size) {
+    if (!channel || !buffer || buffer_size == 0) {
+        return -1;
+    }
+
+    int total_read = 0;
+
+    while (total_read < buffer_size) {
+        int rc = libssh2_channel_read(channel,
+                                      (char*)buffer + total_read,
+                                      buffer_size - total_read);
+
+        if (rc > 0) {
+            // 成功读取数据
+            total_read += rc;
+        } else if (rc == LIBSSH2_ERROR_EAGAIN) {
+            // 暂时没有更多数据
+            if (total_read == 0) {
+                return 0;  // 没有读取到任何数据
+            }
+            break;  // 返回已读取的数据
+        } else if (rc == 0) {
+            // EOF - 连接关闭
+            if (total_read == 0) {
+                return -1;  // 没有数据时遇到EOF
+            }
+            break;  // 返回已读取的数据
+        } else {
+            // 其他错误
             return -1;
         }
     }
-    
-    if (!tunnel->channel) {
-        fprintf(stderr, "Could not open direct-tcpip channel to %s:%d\n", dest_host, dest_port);
-        libssh2_session_set_blocking(tunnel->session, 1);
-        return -1;
-    }
-    
-    libssh2_session_set_blocking(tunnel->session, 1);
-    return 0;
+
+    return total_read;
 }
 
-int ssh_tunnel_read(SSHTunnel *tunnel, void *buffer, size_t buffer_size) {
-    if (!tunnel || !tunnel->channel || !buffer || buffer_size == 0) {
+int ssh_tunnel_write(LIBSSH2_CHANNEL *channel, const void *buffer, size_t buffer_size) {
+    if (!channel || !buffer || buffer_size == 0) {
         return -1;
     }
-    
-    int rc;
-    while ((rc = libssh2_channel_read(tunnel->channel, buffer, buffer_size)) == LIBSSH2_ERROR_EAGAIN) {
-        fd_set read_fds, write_fds;
-        FD_ZERO(&read_fds);
-        FD_ZERO(&write_fds);
-        int dir = libssh2_session_block_directions(tunnel->session);
-        if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-            FD_SET(tunnel->sock, &read_fds);
-        }
-        if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-            FD_SET(tunnel->sock, &write_fds);
-        }
-        select((int)tunnel->sock + 1, &read_fds, &write_fds, NULL, NULL);
-    }
-    
+
+    int rc = libssh2_channel_write(channel, buffer, buffer_size);
+    if (rc < 0)
+        return rc == LIBSSH2_ERROR_EAGAIN?0:rc;
     return rc;
 }
 
-int ssh_tunnel_write(SSHTunnel *tunnel, const void *buffer, size_t buffer_size) {
-    if (!tunnel || !tunnel->channel || !buffer || buffer_size == 0) {
+SOCKET_T ssh_tunnel_session_get_socket(LIBSSH2_SESSION* session) {
+    if (!session) {
+        return INVALID_SOCKET;
+    }
+    return (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
+}
+
+int ssh_tunnel_get_error(LIBSSH2_SESSION* session, char **errmsg) {
+    if (!session) {
         return -1;
     }
-    
-    int rc;
-    while ((rc = libssh2_channel_write(tunnel->channel, buffer, buffer_size)) == LIBSSH2_ERROR_EAGAIN) {
-        fd_set read_fds, write_fds;
-        FD_ZERO(&read_fds);
-        FD_ZERO(&write_fds);
-        int dir = libssh2_session_block_directions(tunnel->session);
-        if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-            FD_SET(tunnel->sock, &read_fds);
-        }
-        if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-            FD_SET(tunnel->sock, &write_fds);
-        }
-        select((int)tunnel->sock + 1, &read_fds, &write_fds, NULL, NULL);
-    }
-    
-    return rc;
-}
 
-void ssh_tunnel_close(SSHTunnel *tunnel) {
-    if (!tunnel) {
-        return;
-    }
-    
-    if (tunnel->channel) {
-        libssh2_channel_close(tunnel->channel);
-        libssh2_channel_free(tunnel->channel);
-        tunnel->channel = NULL;
-    }
-    
-    if (tunnel->session) {
-        libssh2_session_disconnect(tunnel->session, "Normal Shutdown");
-        libssh2_session_free(tunnel->session);
-        tunnel->session = NULL;
-    }
-    
-    if (tunnel->sock != INVALID_SOCKET) {
-#ifdef _WIN32
-        closesocket(tunnel->sock);
-#else
-        close(tunnel->sock);
-#endif
-        tunnel->sock = INVALID_SOCKET;
-    }
-    
-    tunnel->state = SSH_TUNNEL_STATE_DISCONNECTED;
-}
-
-void ssh_tunnel_cleanup(SSHTunnel *tunnel) {
-    if (!tunnel) {
-        return;
-    }
-    
-    ssh_tunnel_close(tunnel);
-    
-    if (tunnel->host) {
-        free(tunnel->host);
-        tunnel->host = NULL;
-    }
-    
-    if (tunnel->username) {
-        free(tunnel->username);
-        tunnel->username = NULL;
-    }
-    
-    if (tunnel->password) {
-        free(tunnel->password);
-        tunnel->password = NULL;
-    }
-    
-    // Only call libssh2_exit when all tunnels have been cleaned up
-    static int tunnel_count = 0;
-    tunnel_count--;
-    if (tunnel_count == 0 && libssh2_initialized) {
-        libssh2_exit();
-        libssh2_initialized = 0;
-    }
-}
-
-SSHTunnelState ssh_tunnel_get_state(SSHTunnel *tunnel) {
-    if (!tunnel) {
-        return SSH_TUNNEL_STATE_ERROR;
-    }
-    
-    return tunnel->state;
-}
-
-int ssh_tunnel_get_error(SSHTunnel *tunnel, char **errmsg) {
-  if (!tunnel || !tunnel->session) {
-    return -1;
-  }
-
-  return libssh2_session_last_error(tunnel->session, errmsg, NULL, 0);
-}
-
-void ssh_tunnel_close_channel_only(SSHTunnel *tunnel) {
-  if (!tunnel) {
-    return;
-  }
-
-  if (tunnel->channel) {
-    libssh2_channel_close(tunnel->channel);
-    libssh2_channel_free(tunnel->channel);
-    tunnel->channel = NULL;
-  }
-  
-  // Keep session and socket open for reuse
-  tunnel->state = SSH_TUNNEL_STATE_CONNECTED; // Still connected, just no channel
-}
-
-int ssh_tunnel_is_session_valid(SSHTunnel *tunnel) {
-  if (!tunnel || !tunnel->session || tunnel->state != SSH_TUNNEL_STATE_CONNECTED) {
-    return 0;
-  }
-  
-  // Only check the state, assume session is valid if state is CONNECTED
-  return 1;
-}
-
-int ssh_tunnel_reopen_channel(SSHTunnel *tunnel, const char *dest_host, int dest_port,
-                              const char *source_host, int source_port) {
-  if (!tunnel || tunnel->state != SSH_TUNNEL_STATE_CONNECTED || !dest_host) {
-    return -1;
-  }
-  
-  // First close any existing channel
-  ssh_tunnel_close_channel_only(tunnel);
-  
-  // Now open new channel using existing session
-  return ssh_tunnel_open_channel(tunnel, dest_host, dest_port, source_host, source_port);
+    return libssh2_session_last_error(session, errmsg, NULL, 0);
 }
