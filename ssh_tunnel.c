@@ -25,7 +25,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
     struct sockaddr_in sin;
     int rc;
     SOCKET_T sock;
-    // 创建socket
+    // Create socket
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         perror("socket");
@@ -40,7 +40,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         return NULL;
     }
 
-    // 连接到SSH服务器
+    // Connect to SSH server
     if (connect(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
         // perror("connect");
         // CLOSE_SOCKET(sock);
@@ -61,7 +61,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         return NULL;
     }
 
-    // 初始化libssh2
+    // Initialize libssh2
     if (!libssh2_initialized) {
         rc = libssh2_init(0);
         if (rc != 0) {
@@ -71,7 +71,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         libssh2_initialized = 1;
     }
 
-    // 创建SSH session
+    // Create SSH session
     LIBSSH2_SESSION *session = libssh2_session_init_ex(NULL, NULL, NULL, (void*)(intptr_t)sock);
     if (!session) {
         fprintf(stderr, "Could not initialize SSH session\n");
@@ -79,7 +79,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         return NULL;
     }
 
-    // SSH握手
+    // SSH handshake
     while ((rc = libssh2_session_handshake(session, sock)) == LIBSSH2_ERROR_EAGAIN) {
         fd_set read_fds, write_fds;
         FD_ZERO(&read_fds);
@@ -101,7 +101,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         return NULL;
     }
 
-    // 获取支持的认证方法
+    // Get supported authentication methods
     char *userauthlist = libssh2_userauth_list(session, username, (unsigned int)strlen(username));
     if (userauthlist) {
         fprintf(stderr, "Authentication methods: %s\n", userauthlist);
@@ -109,7 +109,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
 
     int auth_success = 0;
 
-    // 尝试keyboard-interactive认证
+    // Try keyboard-interactive authentication
     if (userauthlist && strstr(userauthlist, "keyboard-interactive")) {
         fprintf(stderr, "Trying keyboard-interactive authentication...\n");
         while ((rc = libssh2_userauth_keyboard_interactive(session, username, NULL)) == LIBSSH2_ERROR_EAGAIN) {
@@ -133,7 +133,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         }
     }
 
-    // 尝试密码认证
+    // Try password authentication
     if (!auth_success && userauthlist && strstr(userauthlist, "password")) {
         fprintf(stderr, "Trying password authentication...\n");
         while ((rc = libssh2_userauth_password(session, username, password)) == LIBSSH2_ERROR_EAGAIN) {
@@ -164,7 +164,7 @@ LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
         return NULL;
     }
 
-    // 设置为非阻塞模式
+    // Set to non-blocking mode
     libssh2_session_set_blocking(session, 0);
     libssh2_keepalive_config(session, 0, 30);
     printf("SSH session established on socket (%d-%d)\n", sock, (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session)));
@@ -201,7 +201,7 @@ LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
 
     int rc;
     int retry_count = 0;
-    int max_retries = 100;
+    int max_retries = 1;
     SOCKET_T sock = (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
     LIBSSH2_CHANNEL *channel = NULL;
     while (retry_count < max_retries) {
@@ -237,7 +237,7 @@ LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
             libssh2_session_last_error(session, &error_msg, NULL, 0);
             fprintf(stderr, "Failed to open direct-tcpip channel to %s:%d. Error %d: %s\n",
                     dest_host, dest_port, rc, error_msg ? error_msg : "Unknown error");
-            libssh2_session_set_blocking(session, 1);
+            //libssh2_session_set_blocking(session, 1);
             return NULL;
         }
     }

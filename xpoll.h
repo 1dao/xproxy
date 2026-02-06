@@ -15,6 +15,7 @@
 #define XPOLL_WRITABLE  2
 #define XPOLL_ERROR     4
 #define XPOLL_CLOSE     8
+#define XPOLL_ALL       (XPOLL_READABLE | XPOLL_WRITABLE | XPOLL_ERROR | XPOLL_CLOSE)
 
 /* Forward declaration - opaque structure */
 typedef struct xPollState xPollState;

@@ -1,7 +1,8 @@
-#ifndef SOCKS5_SERVER_V1_H
-#define SOCKS5_SERVER_V1_H
+#ifndef SOCKS5_SERVER_H
+#define SOCKS5_SERVER_H
 
 #include "socket_util.h"
+#include "xpoll.h"
 #include <stdint.h>
 #include <libssh2.h>
 
@@ -32,28 +33,10 @@ typedef enum {
     SOCKS5_STATE_INIT,
     SOCKS5_STATE_AUTH,
     SOCKS5_STATE_REQUEST,
+    SOCKS5_STATE_OPENING,
     SOCKS5_STATE_CONNECTED,
     SOCKS5_STATE_ERROR
 } Socks5ClientState;
-
-typedef struct {
-    SOCKET_T client_sock;
-    Socks5ClientState state;
-    uint8_t auth_method;
-    char target_host[256];
-    uint16_t target_port;
-    uint8_t cmd;
-    LIBSSH2_SESSION *ssh_session;  // 线程级SSH session
-    LIBSSH2_CHANNEL *ssh_channel;  // 当前连接的SSH channel
-    char client_host[256];
-    uint16_t client_port;
-
-    // IO buffers and state
-    char read_buffer[8192];
-    char write_buffer[8192];
-    int write_buffer_size;
-    int write_error_count;
-} Socks5Client;
 
 typedef struct {
     const char* ssh_host;
@@ -64,8 +47,22 @@ typedef struct {
     uint16_t bind_port;
 } Socks5ServerConfig;
 
+/* Initialize server configuration */
 int socks5_server_init(const Socks5ServerConfig* config);
-int socks5_server_run(void);
+
+/* Set xpoll instance (single-threaded mode) */
+void socks5_server_set_xpoll(xPollState *loop);
+
+/* Set shared SSH session (single-threaded mode) */
+void socks5_server_set_shared_session(LIBSSH2_SESSION *session);
+
+/* Get accept callback function */
+xFileProc socks5_server_get_accept_cb(void);
+
+/* Keepalive for SSH session */
+void socks5_server_update();
+
+/* Stop server */
 void socks5_server_stop(void);
 
-#endif // SOCKS5_SERVER_V1_H
+#endif // SOCKS5_SERVER_H

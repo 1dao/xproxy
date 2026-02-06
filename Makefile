@@ -4,14 +4,14 @@
 
 # Project configuration
 TARGET = socks5server
-SRCS = xpoll.c main_socks5.c socks5_server.c ssh_tunnel.c xargs.c
+SRCS = main_socks5.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c
 HEADERS = socket_util.h socks5_server.h ssh_tunnel.h xargs.h
 
 # mbedtls source files
 MBEDTLS_DIR = mbedtls
 MBEDTLS_INC = -I$(MBEDTLS_DIR)/include
 MBEDTLS_SRCS = $(wildcard $(MBEDTLS_DIR)/library/*.c)
-MBEDTLS_OBJS = $(MBEDTLS_SRCS:.c=.o)
+MBEDTLS_OBJS = $(addprefix $(BUILD_DIR)/mbedtls/library/, $(notdir $(MBEDTLS_SRCS:.c=.o)))
 
 # libssh2 source files (with mbedtls backend)
 LIBSSH2_DIR = libssh2
@@ -43,7 +43,7 @@ LIBSSH2_SRCS = $(LIBSSH2_DIR)/src/agent.c \
                $(LIBSSH2_DIR)/src/userauth.c \
                $(LIBSSH2_DIR)/src/userauth_kbd_packet.c \
                $(LIBSSH2_DIR)/src/version.c
-LIBSSH2_OBJS = $(LIBSSH2_SRCS:.c=.o)
+LIBSSH2_OBJS = $(addprefix $(BUILD_DIR)/libssh2/src/, $(notdir $(LIBSSH2_SRCS:.c=.o)))
 
 # Environment detection
 MINGW64 = $(shell uname -s 2>/dev/null | grep -c MINGW64)
@@ -83,32 +83,32 @@ OBJ_FILES = $(addprefix $(BUILD_DIR)/, $(SRCS:.c=$(OBJ_EXT)))
 # Default target
 all: $(TARGET)$(TARGET_EXT)
 
-# Create build directory
+# Create build directory and subdirectories
 $(BUILD_DIR):
 	$(MKDIR) $(BUILD_DIR)
+	$(MKDIR) $(BUILD_DIR)/mbedtls/library
+	$(MKDIR) $(BUILD_DIR)/libssh2/src
 
 # Compile mbedtls source files
-$(MBEDTLS_DIR)/library/%.o: $(MBEDTLS_DIR)/library/%.c
+$(BUILD_DIR)/mbedtls/library/%.o: $(MBEDTLS_DIR)/library/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Compile libssh2 source files
-$(LIBSSH2_DIR)/src/%.o: $(LIBSSH2_DIR)/src/%.c
+$(BUILD_DIR)/libssh2/src/%.o: $(LIBSSH2_DIR)/src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Compile project source files
 $(BUILD_DIR)/%$(OBJ_EXT): %.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Link final target with static libraries
+# Link final target with static static libraries
 $(TARGET)$(TARGET_EXT): $(OBJ_FILES) $(MBEDTLS_OBJS) $(LIBSSH2_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(RM) -r $(BUILD_DIR)
 
 # Clean build artifacts
 clean:
 	$(RM) $(TARGET)$(TARGET_EXT)
-	$(RM) $(OBJ_FILES)
-	$(RM) $(MBEDTLS_OBJS)
-	$(RM) $(LIBSSH2_OBJS)
 	$(RM) -r $(BUILD_DIR)
 
 # Install target (optional)
@@ -128,8 +128,15 @@ else
 endif
 
 # Debug build
-debug: CFLAGS += -DDEBUG -g
-debug: all
+debug:
+	$(MAKE) CFLAGS="-std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 \
+		-Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces -Wno-pointer-sign \
+		-ffunction-sections -fdata-sections \
+		-Imbedtls/include -Ilibssh2/include \
+		-DLIBSSH2_MBEDTLS -DLIBSSH2_STATIC \
+		-DDEBUG -g -O0" \
+	LDFLAGS="-Wl,--gc-sections -lunwind" \
+	clean all
 
 # Release build with maximum optimization
 release: CFLAGS += -O3 -DNDEBUG
@@ -150,7 +157,7 @@ help:
 .PHONY: all clean install uninstall debug release help
 
 # Dependencies
-main_socks5.o: socket_util.h socks5_server.h
+main_socks5.o: socket_util.h socks5_server.h xargs.h xpoll.h
 socks5_server.o: socket_util.h socks5_server.h
 ssh_tunnel.o: socket_util.h ssh_tunnel.h
 xpoll.o: socket_util.h xpoll.h

@@ -56,12 +56,22 @@ static inline void winsock_cleanup(void) {
     WSACleanup();
 }
 
+static inline int socket_set_nonblocking(SOCKET_T sock) {
+    unsigned long mode = 1;  // Non-blocking mode
+    return ioctlsocket(sock, FIONBIO, &mode);
+}
+
 #define socket_init() winsock_init()
 #define socket_cleanup() winsock_cleanup()
 #else
+#include <unistd.h>
 #define socket_init() 0
 #define socket_cleanup() do {} while(0)
-#include <unistd.h>
+static inline int socket_set_nonblocking(SOCKET_T sock) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+}
 #endif
 
 #ifndef max
