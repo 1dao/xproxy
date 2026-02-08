@@ -374,7 +374,7 @@ int xpoll_poll(xPollState *loop, int timeout_ms) {
 
         /* Invoke error callback */
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && efileProc) {
-            fprintf(stderr, "xpoll to close fd=%d, idx=%d, i=%d\n", fd, idx, i);
+            fprintf(stderr, "xpoll to close fd=%d, idx=%d, i=%d, err=%d, hub=%d, nval=%d\n", fd, idx, i, revents&XPOLL_ERROR?1:0, revents&POLLHUP?1:0, revents&POLLNVAL?1:0);
             efileProc(loop, fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
         }
 

@@ -214,24 +214,8 @@ LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
         rc = libssh2_session_last_error(session, NULL, NULL, 0);
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             retry_count++;
-            if (retry_count >= max_retries) {
-                fprintf(stderr, "Timeout opening SSH channel after %d retries\n", max_retries);
+            if (retry_count >= max_retries)
                 break;
-            }
-
-            fd_set read_fds, write_fds;
-            struct timeval timeout;
-            FD_ZERO(&read_fds);
-            FD_ZERO(&write_fds);
-            int dir = libssh2_session_block_directions(session);
-            if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
-                FD_SET(sock, &read_fds);
-            if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
-                FD_SET(sock, &write_fds);
-
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 100000;
-            select((int)sock + 1, &read_fds, &write_fds, NULL, &timeout);
         } else {
             char *error_msg = NULL;
             libssh2_session_last_error(session, &error_msg, NULL, 0);
@@ -242,14 +226,8 @@ LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
         }
     }
 
-    if (channel) {
+    if (channel)
         fprintf(stderr, "SSH channel opened successfully to %s:%d\n", dest_host, dest_port);
-    } else {
-        char *error_msg = NULL;
-        int rc = libssh2_session_last_error(session, &error_msg, NULL, 0);
-        fprintf(stderr, "Failed to open direct-tcpip channel to %s:%d. Error %d: %s\n",
-                dest_host, dest_port, rc, error_msg ? error_msg : "Unknown error");
-    }
 
     return channel;
 }
@@ -263,9 +241,8 @@ void ssh_tunnel_channel_close(LIBSSH2_CHANNEL* channel) {
 }
 
 int ssh_tunnel_read(LIBSSH2_CHANNEL *channel, void *buffer, size_t buffer_size) {
-    if (!channel || !buffer || buffer_size == 0) {
+    if (!channel || !buffer || buffer_size == 0)
         return -1;
-    }
 
     int total_read = 0;
 
@@ -273,24 +250,18 @@ int ssh_tunnel_read(LIBSSH2_CHANNEL *channel, void *buffer, size_t buffer_size) 
         int rc = libssh2_channel_read(channel,
                                       (char*)buffer + total_read,
                                       buffer_size - total_read);
-
         if (rc > 0) {
-            // 成功读取数据
             total_read += rc;
         } else if (rc == LIBSSH2_ERROR_EAGAIN) {
-            // 暂时没有更多数据
-            if (total_read == 0) {
-                return 0;  // 没有读取到任何数据
-            }
-            break;  // 返回已读取的数据
+            if (total_read == 0)
+                return 0;
+            break;
         } else if (rc == 0) {
-            // EOF - 连接关闭
-            if (total_read == 0) {
-                return -1;  // 没有数据时遇到EOF
-            }
-            break;  // 返回已读取的数据
+            // EOF
+            if (total_read == 0)
+                return -1;
+            break;
         } else {
-            // 其他错误
             return -1;
         }
     }

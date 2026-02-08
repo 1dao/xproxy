@@ -3,10 +3,7 @@
 #include <string.h>
 #include <signal.h>
 #include "xargs.h"
-
-#include "socket_util.h"
 #include "xpoll.h"
-#include "ssh_tunnel.h"
 #include "socks5_server.h"
 
 static int g_running = 0;
@@ -210,14 +207,6 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Initialize server
-    if (socks5_server_init(&config) != 0) {
-        fprintf(stderr, "SOCKS5 server initialization failed\n");
-        socket_cleanup();
-        xargs_cleanup();
-        return EXIT_FAILURE;
-    }
-
     // Create global xpoll instance
     xPollState *xpoll = xpoll_create();
     if (!    xpoll) {
@@ -227,90 +216,9 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Set xpoll instance to socks5_server
-    socks5_server_set_xpoll(xpoll);
-
-    // Create listening socket
-    SOCKET_T listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock == INVALID_SOCKET) {
-        perror("socket creation failed");
-        xpoll_free(xpoll);
-        socket_cleanup();
-        xargs_cleanup();
-        return EXIT_FAILURE;
-    }
-
-    // Set SO_REUSEADDR
-    int opt = 1;
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
-        perror("setsockopt failed");
-        CLOSE_SOCKET(listen_sock);
-        xpoll_free(xpoll);
-        socket_cleanup();
-        xargs_cleanup();
-        return EXIT_FAILURE;
-    }
-
-    // Bind address
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = config.bind_address ?
-        inet_addr(config.bind_address) : INADDR_ANY;
-    server_addr.sin_port = htons(config.bind_port);
-
-    if (bind(listen_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
-        CLOSE_SOCKET(listen_sock);
-        xpoll_free(xpoll);
-        socket_cleanup();
-        xargs_cleanup();
-        return EXIT_FAILURE;
-    }
-
-    // Listen
-    if (listen(listen_sock, SOMAXCONN) < 0) {
-        perror("listen failed");
-        CLOSE_SOCKET(listen_sock);
-        xpoll_free(xpoll);
-        socket_cleanup();
-        xargs_cleanup();
-        return EXIT_FAILURE;
-    }
-
-    // Create shared SSH session (shared by all clients)
-    printf("Creating shared SSH session to %s:%d...\n", config.ssh_host, config.ssh_port);
-    LIBSSH2_SESSION *shared_ssh_session = ssh_tunnel_session_open(
-        config.ssh_host,
-        config.ssh_port,
-        config.ssh_username,
-        config.ssh_password);
-
-    if (!shared_ssh_session) {
-        fprintf(stderr, "Failed to create shared SSH session\n");
-        CLOSE_SOCKET(listen_sock);
-        xpoll_free(xpoll);
-        socket_cleanup();
-        xargs_cleanup();
-        return EXIT_FAILURE;
-    }
-    printf("Shared SSH session created successfully\n");
-
-    // Set shared SSH session to socks5_server
-    socks5_server_set_shared_session(shared_ssh_session);
-
-    printf("SOCKS5 proxy is running (single-threaded event loop mode)...\n");
-    printf("Listen address: %s:%d\n", config.bind_address, config.bind_port);
-    printf("SSH tunnel: %s:%d (user: %s)\n", config.ssh_host, config.ssh_port, config.ssh_username);
-    printf("Using %s for I/O multiplexing\n", xpoll_name());
-    printf("Press Ctrl+C to stop proxy\n");
-
-    // Register readable event for listening socket
-    if (xpoll_add_event(xpoll, listen_sock, XPOLL_READABLE,
-                         socks5_server_get_accept_cb(), NULL, NULL, NULL) != 0) {
-        fprintf(stderr, "Failed to register listen socket event\n");
-        ssh_tunnel_session_close(shared_ssh_session);
-        CLOSE_SOCKET(listen_sock);
+    // Start socks5 server
+    if (socks5_server_start(&config, xpoll) != 0) {
+        fprintf(stderr, "Failed to start SOCKS5 server\n");
         xpoll_free(xpoll);
         socket_cleanup();
         xargs_cleanup();
@@ -333,13 +241,6 @@ int main(int argc, char *argv[]) {
     socks5_server_stop();
 
     printf("Cleaning up...\n");
-    xpoll_del_event(xpoll, listen_sock, XPOLL_READABLE);
-
-    // Close shared SSH session
-    printf("Closing shared SSH session...\n");
-    ssh_tunnel_session_close(shared_ssh_session);
-
-    CLOSE_SOCKET(listen_sock);
     xpoll_free(xpoll);
 
     xargs_cleanup();

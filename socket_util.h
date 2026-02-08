@@ -12,6 +12,9 @@
     #define SOCKET_T SOCKET
     #define CLOSE_SOCKET(s) closesocket(s)
     #define SOCKET_ERROR_VAL SOCKET_ERROR
+    #define SHUTDOWN_SOCKET(s, how) shutdown(s, how)
+    #define SHUTDOWN_WR SD_SEND
+    #define GET_ERRNO() WSAGetLastError()
 #else
     #include <unistd.h>
     #include <sys/socket.h>
@@ -19,6 +22,7 @@
     #include <arpa/inet.h>
     #include <sys/select.h>
     #include <sys/time.h>
+    #include <errno.h>
     #define SOCKET_T int
     #define CLOSE_SOCKET(s) close(s)
     #define SOCKET_ERROR_VAL -1
@@ -26,7 +30,12 @@
     #ifndef max
         #define max(a,b) ((a) > (b) ? (a) : (b))
     #endif
+    #define SHUTDOWN_SOCKET(s, how) shutdown(s, how)
+    #define SHUTDOWN_WR SHUT_WR
+    #define GET_ERRNO() errno
 #endif
+
+typedef long long long64;
 
 static inline SOCKET_T tcp_socket_create(void) {
     SOCKET_T sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -61,6 +70,19 @@ static inline int socket_set_nonblocking(SOCKET_T sock) {
     return ioctlsocket(sock, FIONBIO, &mode);
 }
 
+static inline BOOL socket_check_eagain() {
+    int err = GET_ERRNO();
+    return err == WSAEWOULDBLOCK || err == WSAEINTR;
+}
+static inline long64 time_get_ms() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+
+    ULARGE_INTEGER ull;
+    ull.LowPart = ft.dwLowDateTime;
+    ull.HighPart = ft.dwHighDateTime;
+    return ull.QuadPart / 10000 - 11644473600000LL;
+}
 #define socket_init() winsock_init()
 #define socket_cleanup() winsock_cleanup()
 #else
@@ -71,6 +93,15 @@ static inline int socket_set_nonblocking(SOCKET_T sock) {
     int flags = fcntl(sock, F_GETFL, 0);
     if (flags == -1) return -1;
     return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+}
+static inline BOOL socket_check_eagain() {
+    int err = GET_ERRNO();
+    return err == EWOULDBLOCK || err == EAGAIN || EINTR==err;
+}
+static inline long64 time_get_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long64)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
 }
 #endif
 

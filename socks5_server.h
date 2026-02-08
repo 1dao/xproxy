@@ -4,7 +4,6 @@
 #include "socket_util.h"
 #include "xpoll.h"
 #include <stdint.h>
-#include <libssh2.h>
 
 #define SOCKS5_AUTH_NONE 0x00
 #define SOCKS5_AUTH_GSSAPI 0x01
@@ -47,17 +46,8 @@ typedef struct {
     uint16_t bind_port;
 } Socks5ServerConfig;
 
-/* Initialize server configuration */
-int socks5_server_init(const Socks5ServerConfig* config);
-
-/* Set xpoll instance (single-threaded mode) */
-void socks5_server_set_xpoll(xPollState *loop);
-
-/* Set shared SSH session (single-threaded mode) */
-void socks5_server_set_shared_session(LIBSSH2_SESSION *session);
-
-/* Get accept callback function */
-xFileProc socks5_server_get_accept_cb(void);
+/* Start socks5v service */
+int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll);
 
 /* Keepalive for SSH session */
 void socks5_server_update();
