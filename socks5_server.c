@@ -229,6 +229,22 @@ static bool ssh_read_each_client(xhashNode *node, void*) {
         return false;
     }
 
+    if (client->read_buffer_size < 0 || client->read_buffer_size >= sizeof(client->read_buffer)) {
+        XLOG_PRINT(stderr, "Warning: Invalid read_buffer_size=%d, resetting to 0 for fd=%d\n",
+                   client->read_buffer_size, client->client_sock);
+        client->read_buffer_size = 0;
+        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+        return true;
+    }
+
+    if (client->write_buffer_size < 0 || client->write_buffer_size >= sizeof(client->write_buffer)) {
+        XLOG_PRINT(stderr, "Warning: Invalid write_buffer_size=%d, resetting to 0 for fd=%d\n",
+                   client->write_buffer_size, client->client_sock);
+        client->write_buffer_size = 0;
+        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+        return true;
+    }
+
     // Try to read this channel
     int n = libssh2_channel_read(client->ssh_channel,
                                 client->read_buffer+client->read_buffer_size,
@@ -239,8 +255,8 @@ static bool ssh_read_each_client(xhashNode *node, void*) {
         int sent = send(client->client_sock, client->read_buffer, total, 0);
         XLOG_PRINT(stderr, "channel data send %d bytes to client fd=%d (sent=%d), %s\n",
                    total, client->client_sock, sent, client->target_host);
-        if (sent != n) {
-            if (send <= 0 ){
+        if (sent != total) {
+            if (sent <= 0 ){
                 if(socket_check_eagain()) {
                     XLOG_PRINT(stderr, "client send failed %d bytes to client fd=%d (sent=%d)\n",
                            n, client->client_sock, sent);
@@ -251,14 +267,15 @@ static bool ssh_read_each_client(xhashNode *node, void*) {
                 }
                 SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
             } else {
-                XLOG_PRINT(stderr, "channel data send %d bytes to client fd=%d (sent=%d)\n",
-                       n, client->client_sock, sent);
-                XLOG_PRINT(stderr, "channel data send %d bytes to client fd=%d (sent=%d)\n",
-                       n, client->client_sock, sent);
-                XLOG_PRINT(stderr, "channel data send %d bytes to client fd=%d (sent=%d)\n",
-                       n, client->client_sock, sent);
-                memmove(client->read_buffer, client->read_buffer + sent, total - sent);
-                client->read_buffer_size = (total -sent);
+                if (sent > 0 && sent < total) {
+                    memmove(client->read_buffer, client->read_buffer + sent, total - sent);
+                    client->read_buffer_size = total - sent;
+                    XLOG_PRINT(stderr, "channel data send %d bytes to client fd=%d (sent=%d)\n",
+                           n, client->client_sock, sent);
+                } else {
+                    XLOG_PRINT(stderr, "Invalid sent value %d, resetting buffer\n", sent);
+                    client->read_buffer_size = 0;
+                }
             }
         } else {
             // Check if channel is EOF
@@ -408,8 +425,6 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
         return;
     }
 
-    char* send = NULL;
-    int send_len = 0;
     if (client->write_buffer_size > 0) {
         int buffer_space = sizeof(client->write_buffer) - client->write_buffer_size;
         if (n > buffer_space) {

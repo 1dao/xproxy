@@ -13,7 +13,7 @@ void signal_handler(int sig) {
     if (sig == SIGINT) {
         printf("\nReceived interrupt signal, stopping SOCKS5 proxy...\n");
         g_running = 0;
-    } else if (SIGSEGV) {
+    } else if (sig == SIGSEGV) {
         printf("Generating dump file...\n");
         raise(SIGABRT);
     }
