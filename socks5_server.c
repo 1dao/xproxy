@@ -392,6 +392,17 @@ static void ssh_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
         xpoll_del_event(loop, fd, XPOLL_WRITABLE);
 }
 
+static bool client_on_closed(xhashNode *node, void *ctx) {
+    Socks5Client *client = (Socks5Client*)node->value;
+    if (!client) return true;
+    if(!ctx) {
+        socks5_client_cleanup(g_xpoll, client->client_sock, client);
+    } else if(client->state==SOCKS5_STATE_ERROR) {
+        socks5_client_cleanup(g_xpoll, client->client_sock, client);
+    }
+    return true;
+}
+
 static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table)
@@ -400,8 +411,49 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
     XLOG_PRINT(stderr, "ssh_error_cb called (fd=%d)\n", fd);
     XLOG_PRINT(stderr, "ssh_error_cb called (fd=%d)\n", fd);
 
+    xhash_foreach(hash_table, client_on_closed, NULL);
     xpoll_del_event(loop, fd, XPOLL_ALL);
     ssh_tunnel_session_close(g_ssh_session);
+    g_ssh_session = NULL;
+
+    // Create shared SSH session
+    const Socks5ServerConfig* config = &g_server_config;
+    printf("ReCreating shared SSH session to %s:%d...\n", config->ssh_host, config->ssh_port);
+    LIBSSH2_SESSION *ssh_session = ssh_tunnel_session_open(
+        config->ssh_host,
+        config->ssh_port,
+        config->ssh_username,
+        config->ssh_password);
+
+    if (!ssh_session) {
+        XLOG_PRINT(stderr, "ReCreating Failed to create shared SSH session\n");
+        return;
+    }
+    printf("ReCreating Shared SSH session created successfully\n");
+
+    // Setup hash table for SSH socket
+    SOCKET_T ssh_socket = ssh_tunnel_session_get_socket(ssh_session);
+    hash_table = xhash_create(1024);
+    if (!hash_table) {
+        XLOG_PRINT(stderr, "ReCreating Failed to create hash table\n");
+        ssh_tunnel_session_close(ssh_session);
+        return;
+    }
+
+    // Register SSH socket events
+    if (xpoll_add_event(loop, ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
+                        ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
+        XLOG_PRINT(stderr, "ReCreating Failed to register SSH socket event\n");
+        xhash_destroy(hash_table, false);
+        ssh_tunnel_session_close(ssh_session);
+        return;
+    }
+
+    // Set hash table as client data for SSH socket
+    xpoll_set_client_data(loop, ssh_socket, hash_table);
+
+    // reset
+    g_ssh_session = ssh_session;
 }
 
 static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
@@ -623,17 +675,6 @@ void accept_cb_single(xPollState *loop, SOCKET_T fd, int mask, void *clientData)
     socks5_handle_client_single(client_sock, &client_addr);
 }
 
-bool client_on_closed(xhashNode *node, void *ctx) {
-    Socks5Client *client = (Socks5Client*)node->value;
-    if (!client) return true;
-    if(!ctx) {
-        socks5_client_cleanup(g_xpoll, client->client_sock, client);
-    } else if(client->state==SOCKS5_STATE_ERROR) {
-        socks5_client_cleanup(g_xpoll, client->client_sock, client);
-    }
-    return true;
-}
-
 bool socks5_channel_reopen(xhashNode *node, void* ctx) {
     Socks5Client *client = (Socks5Client*)node->value;
     if (SOCKS5_STATE_OPENING!=client->state) return true;
@@ -736,15 +777,9 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
         return -1;
     }
 
-    // Set SO_REUSEADDR
-    int opt = 1;
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
-        XLOG_PRINT(stderr, "setsockopt failed");
-        xhash_destroy(hash_table, false);
-        ssh_tunnel_session_close(ssh_session);
-        CLOSE_SOCKET(listen_sock);
-        return -1;
-    }
+    // // Set SO_REUSEADDR
+    // int opt = 1;
+    // setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     // Bind address
     struct sockaddr_in server_addr;

@@ -89,10 +89,10 @@ void interactive_config(Socks5ServerConfig *config) {
     strcpy(bind_addr, buffer[0] ? buffer : "127.0.0.1");
     config->bind_address = bind_addr;
 
-    printf("Enter SOCKS5 bind port [default: 1180]: ");
+    printf("Enter SOCKS5 bind port [default: 1080]: ");
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = 0;
-    config->bind_port = buffer[0] ? atoi(buffer) : 1180;
+    config->bind_port = buffer[0] ? atoi(buffer) : 1080;
 
     printf("Enter SSH server address: ");
     fgets(buffer, sizeof(buffer), stdin);
@@ -123,7 +123,7 @@ void show_help(const char *prog_name) {
     printf("  -u, --user SSH username\n");
     printf("  -P, --pass SSH password\n");
     printf("  -b, --bind SOCKS5 bind address (default: 127.0.0.1)\n");
-    printf("  -l, --listen SOCKS5 listen port (default: 1180)\n");
+    printf("  -l, --listen SOCKS5 listen port (default: 1080)\n");
     printf("  --help Show this help message\n");
     printf("\nIf no arguments provided, will enter interactive mode for configuration.\n");
 }
@@ -148,7 +148,8 @@ int main(int argc, char *argv[]) {
         {'u', "user", ssh_user, 0},
         {'P', "pass", ssh_pass, 0},
         {'b', "bind", "127.0.0.1", 0},
-        {'l', "listen", "1180", 0}
+        {'l', "listen", "1080", 0},
+        {'t', "http_port", "7890", 0},              // HTTP代理端口
     };
 
     xargs_init(configs, 6, argc, argv);
@@ -177,7 +178,7 @@ int main(int argc, char *argv[]) {
         printf("Entering interactive configuration mode\n\n");
         Socks5ServerConfig config = {
             .bind_address = bind_addr,
-            .bind_port = 1180,
+            .bind_port = 1080,
             .ssh_host = ssh_host,
             .ssh_port = 22,
             .ssh_username = ssh_user,
