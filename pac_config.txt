@@ -43,6 +43,9 @@ ollama.com socks5
 *.ollama.com socks5
 hubspot.com socks5
 *.hubspot.com socks5
+youtube.com socks5
+*.youtube.com socks5
+*.youtube-nocookie socks5
 lunarg.com socks5
 *.lunarg.com socks5
 withgoogle.com socks5

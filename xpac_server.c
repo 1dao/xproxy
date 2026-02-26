@@ -503,7 +503,7 @@ static char* xpac_generate_pac_content(int pac_type) {
     } else { // proxy.pac，默认HTTP代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 所有其他流量走HTTP代理\n"
-            "    return \"PROXY 127.0.0.1:%d; DIRECT\";\n",
+            "    return \"DIRECT\";\n",
             g_config.http_proxy_port);
     }
 
