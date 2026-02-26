@@ -1,9 +1,9 @@
 # PAC域名规则配置文件
 # 格式：域名模式 代理类型(http/socks5)
 # 示例：*.google.com socks5
-#        *.github.com http
+#        *.xxx.com http
 
-*.google.com http
+*.google.com socks5
 *.google-analytics.com socks5
 *.googleapis.com socks5
 *.googlecode.com socks5
