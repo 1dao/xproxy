@@ -35,7 +35,7 @@ C-based multi-protocol proxy server supporting SOCKS5, HTTPS proxy, SSH tunnelin
 | Build | `Makefile` / `build.bat` | Unix/Windows respectively |
 | SOCKS5 server | `socks5_server.c` | Main proxy logic |
 | HTTPS proxy | `https_proxy.c` | CONNECT tunnel |
-| SSH tunnel | `ssh_tunnel.c` | libssh2 integration |
+| SSH tunnel | `ssh_tunnel.c` | wolfssh integration |
 | PAC server | `xpac_server.c` | WPAD/PAC serving |
 | Event loop | `xpoll.c` | Cross-platform poll |
 | CLI args | `xargs.c` | Interactive password input |
@@ -94,6 +94,8 @@ start.bat        # Windows start proxy
 ## NOTES
 
 - Requires MSYS2/MinGW64 on Windows
-- libssh2 + mbedtls backends for wolfssl
+- wolfssh + wolfssl backends
 - SOCKS5 supports CONNECT only (no BIND/UDP)
-- PAC server listens on port 8080 by default
+- PAC server listens on port 7890 by default
+- SOCKS5 Proxy listens on port 1080 by default
+- HTTP Proxy listens on port 7890 by default
