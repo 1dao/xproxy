@@ -477,13 +477,26 @@ static char* xpac_generate_pac_content(int pac_type) {
                 port = g_config.http_proxy_port;
             }
 
+
             // 生成域名匹配条件
             // 注意：shExpMatch支持通配符模式
-            pos += snprintf(pac_content + pos, buffer_size - pos,
-                "    if (shExpMatch(host, \"%s\")) {\n"
-                "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-                "    }\n",
-                current->pattern, proxy_str, port);
+            if (strncmp(current->pattern, "*.", 2) == 0) {
+                // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
+                pos += snprintf(pac_content + pos, buffer_size - pos,
+                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "    }\n"
+                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "    }\n",
+                    current->pattern, proxy_str, port, current->pattern+2, proxy_str, port);  // 跳过 '*' 字符
+            } else {
+                pos += snprintf(pac_content + pos, buffer_size - pos,
+                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "    }\n",
+                    current->pattern, proxy_str, port);
+            }
 
             current = current->next;
         }
