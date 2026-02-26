@@ -1,163 +1,106 @@
-# Makefile for SOCKS5 Server
-# Supports MinGW64/MSYS2 and Linux/Unix environments
-# Static linking: libssh2 with mbedtls backend
+# Makefile for SOCKS5 Proxy Server using wolfSSH/wolfSSL
+# All sources compiled from source
 
-# Project configuration
-TARGET = socks5server
-SRCS = main_socks5.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c
-HEADERS = socket_util.h socks5_server.h ssh_tunnel.h xargs.h
+CC = gcc
+#CFLAGS = -Wall -g3 -O0 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
+CFLAGS = -Wall -O2 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
+CPPFLAGS = -I. -I./3rd/wolfssl -I./3rd/wolfssl/wolfssl -I./3rd/wolfssh -I./3rd/wolfssh/wolfssh -DWOLFSSL_USER_SETTINGS -DWOLFSSH_USER_SETTINGS -DWOLFSSH_FWD
 
-# mbedtls source files
-MBEDTLS_DIR = mbedtls
-MBEDTLS_INC = -I$(MBEDTLS_DIR)/include
-MBEDTLS_SRCS = $(wildcard $(MBEDTLS_DIR)/library/*.c)
-MBEDTLS_OBJS = $(addprefix $(BUILD_DIR)/mbedtls/library/, $(notdir $(MBEDTLS_SRCS:.c=.o)))
+# Windows-specific settings
+LDFLAGS = -lws2_32 -lcrypt32 -lbcrypt -ladvapi32
+EXE = xproxy.exe
 
-# libssh2 source files (with mbedtls backend)
-LIBSSH2_DIR = libssh2
-LIBSSH2_INC = -I$(LIBSSH2_DIR)/include
-LIBSSH2_SRCS = $(LIBSSH2_DIR)/src/agent.c \
-               $(LIBSSH2_DIR)/src/bcrypt_pbkdf.c \
-               $(LIBSSH2_DIR)/src/blowfish.c \
-               $(LIBSSH2_DIR)/src/chacha.c \
-               $(LIBSSH2_DIR)/src/channel.c \
-               $(LIBSSH2_DIR)/src/cipher-chachapoly.c \
-               $(LIBSSH2_DIR)/src/comp.c \
-               $(LIBSSH2_DIR)/src/crypt.c \
-               $(LIBSSH2_DIR)/src/global.c \
-               $(LIBSSH2_DIR)/src/hostkey.c \
-               $(LIBSSH2_DIR)/src/keepalive.c \
-               $(LIBSSH2_DIR)/src/kex.c \
-               $(LIBSSH2_DIR)/src/knownhost.c \
-               $(LIBSSH2_DIR)/src/mac.c \
-               $(LIBSSH2_DIR)/src/mbedtls.c \
-               $(LIBSSH2_DIR)/src/misc.c \
-               $(LIBSSH2_DIR)/src/packet.c \
-               $(LIBSSH2_DIR)/src/pem.c \
-               $(LIBSSH2_DIR)/src/poly1305.c \
-               $(LIBSSH2_DIR)/src/publickey.c \
-               $(LIBSSH2_DIR)/src/scp.c \
-               $(LIBSSH2_DIR)/src/session.c \
-               $(LIBSSH2_DIR)/src/sftp.c \
-               $(LIBSSH2_DIR)/src/transport.c \
-               $(LIBSSH2_DIR)/src/userauth.c \
-               $(LIBSSH2_DIR)/src/userauth_kbd_packet.c \
-               $(LIBSSH2_DIR)/src/version.c
-LIBSSH2_OBJS = $(addprefix $(BUILD_DIR)/libssh2/src/, $(notdir $(LIBSSH2_SRCS:.c=.o)))
+# Object directory
+OBJDIR = .objs
 
-# Environment detection
-MINGW64 = $(shell uname -s 2>/dev/null | grep -c MINGW64)
+# Application sources
+APP_SOURCES = main.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c https_proxy.c xpac_server.c
 
-ifeq ($(MINGW64),1)
-    # MinGW64 configuration
-    CC = gcc
-    CFLAGS = -O2 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 \
-            -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces -Wno-pointer-sign \
-            -s -flto -ffunction-sections -fdata-sections \
-            $(MBEDTLS_INC) $(LIBSSH2_INC) \
-            -DLIBSSH2_MBEDTLS -DLIBSSH2_STATIC
-    LDFLAGS = -Wl,--gc-sections -Wl,--strip-all
-    LIBS = -lws2_32 -lcrypt32 -lbcrypt
-    TARGET_EXT = .exe
-    RM = rm -f
-    MKDIR = mkdir -p
-    OBJ_EXT = .o
-else
-    # Linux/Unix configuration
-    CC = gcc
-    CFLAGS = -O2 -std=c11 -pthread \
-            $(MBEDTLS_INC) $(LIBSSH2_INC) \
-            -DLIBSSH2_MBEDTLS -DLIBSSH2_STATIC
-    LDFLAGS =
-    LIBS = -lpthread
-    TARGET_EXT =
-    RM = rm -f
-    MKDIR = mkdir -p
-    OBJ_EXT = .o
-endif
+# wolfCrypt sources (required for SSH crypto)
+WOLFCRYPT_SOURCES = \
+    3rd/wolfssl/wolfcrypt/src/asn.c \
+    3rd/wolfssl/wolfcrypt/src/error.c \
+    3rd/wolfssl/wolfcrypt/src/rsa.c \
+    3rd/wolfssl/wolfcrypt/src/aes.c \
+    3rd/wolfssl/wolfcrypt/src/des3.c \
+    3rd/wolfssl/wolfcrypt/src/sha.c \
+    3rd/wolfssl/wolfcrypt/src/sha256.c \
+    3rd/wolfssl/wolfcrypt/src/sha512.c \
+    3rd/wolfssl/wolfcrypt/src/md5.c \
+    3rd/wolfssl/wolfcrypt/src/hmac.c \
+    3rd/wolfssl/wolfcrypt/src/hash.c \
+    3rd/wolfssl/wolfcrypt/src/coding.c \
+    3rd/wolfssl/wolfcrypt/src/random.c \
+    3rd/wolfssl/wolfcrypt/src/memory.c \
+    3rd/wolfssl/wolfcrypt/src/ecc.c \
+    3rd/wolfssl/wolfcrypt/src/dh.c \
+    3rd/wolfssl/wolfcrypt/src/integer.c \
+    3rd/wolfssl/wolfcrypt/src/tfm.c \
+    3rd/wolfssl/wolfcrypt/src/wolfmath.c \
+    3rd/wolfssl/wolfcrypt/src/signature.c \
+    3rd/wolfssl/wolfcrypt/src/logging.c \
+    3rd/wolfssl/wolfcrypt/src/sp_int.c \
+    3rd/wolfssl/wolfcrypt/src/wc_port.c \
+    3rd/wolfssl/wolfcrypt/src/kdf.c \
+    3rd/wolfssl/wolfcrypt/src/wc_encrypt.c \
+    3rd/wolfssl/wolfcrypt/src/pwdbased.c \
+    3rd/wolfssl/wolfcrypt/src/pkcs12.c
 
-# Build directories
-BUILD_DIR = build
-OBJ_FILES = $(addprefix $(BUILD_DIR)/, $(SRCS:.c=$(OBJ_EXT)))
+# wolfSSH sources
+WOLFSSH_SOURCES = \
+    3rd/wolfssh/src/ssh.c \
+    3rd/wolfssh/src/internal.c \
+    3rd/wolfssh/src/io.c \
+    3rd/wolfssh/src/keygen.c \
+    3rd/wolfssh/src/log.c \
+    3rd/wolfssh/src/port.c \
+    3rd/wolfssh/src/certman.c \
+    3rd/wolfssh/src/agent.c
 
-# Default target
-all: $(TARGET)$(TARGET_EXT)
+# Object files (organized into subdirectories)
+APP_OBJECTS = $(addprefix $(OBJDIR)/, $(notdir $(APP_SOURCES:.c=.o)))
+WOLFCRYPT_OBJECTS = $(addprefix $(OBJDIR)/wolfssl/, $(notdir $(WOLFCRYPT_SOURCES:.c=.o)))
+WOLFSSH_OBJECTS = $(addprefix $(OBJDIR)/wolfssh/, $(notdir $(WOLFSSH_SOURCES:.c=.o)))
 
-# Create build directory and subdirectories
-$(BUILD_DIR):
-	$(MKDIR) $(BUILD_DIR)
-	$(MKDIR) $(BUILD_DIR)/mbedtls/library
-	$(MKDIR) $(BUILD_DIR)/libssh2/src
+ALL_OBJECTS = $(APP_OBJECTS) $(WOLFCRYPT_OBJECTS) $(WOLFSSH_OBJECTS)
 
-# Compile mbedtls source files
-$(BUILD_DIR)/mbedtls/library/%.o: $(MBEDTLS_DIR)/library/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+.PHONY: all clean run
 
-# Compile libssh2 source files
-$(BUILD_DIR)/libssh2/src/%.o: $(LIBSSH2_DIR)/src/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+all: $(EXE)
 
-# Compile project source files
-$(BUILD_DIR)/%$(OBJ_EXT): %.c $(HEADERS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+# Create required directories
+$(OBJDIR):
+	mkdir -p $@
 
-# Link final target with static static libraries
-$(TARGET)$(TARGET_EXT): $(OBJ_FILES) $(MBEDTLS_OBJS) $(LIBSSH2_OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
-	$(RM) -r $(BUILD_DIR)
+$(OBJDIR)/wolfssl:
+	mkdir -p $@
 
-# Clean build artifacts
+$(OBJDIR)/wolfssh:
+	mkdir -p $@
+
+# Link executable (order-only dependency on top-level build dir)
+$(EXE): $(ALL_OBJECTS) | $(OBJDIR)
+	@echo "Linking $(EXE)..."
+	$(CC) $(ALL_OBJECTS) -o $@ $(LDFLAGS)
+	@echo "Build completed: $(EXE)"
+	rm -rf $(OBJDIR)
+
+# Pattern rules for compiling sources
+
+# Application sources → build/*.o
+$(OBJDIR)/%.o: %.c | $(OBJDIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+# wolfSSL sources → build/wolfssl/*.o
+$(OBJDIR)/wolfssl/%.o: 3rd/wolfssl/wolfcrypt/src/%.c | $(OBJDIR)/wolfssl
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+# wolfSSH sources → build/wolfssh/*.o
+$(OBJDIR)/wolfssh/%.o: 3rd/wolfssh/src/%.c | $(OBJDIR)/wolfssh
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
 clean:
-	$(RM) $(TARGET)$(TARGET_EXT)
-	$(RM) -r $(BUILD_DIR)
+	rm -rf $(OBJDIR) $(EXE)
 
-# Install target (optional)
-install: $(TARGET)$(TARGET_EXT)
-ifeq ($(MINGW64),1)
-	@echo "On MinGW64, copy $(TARGET)$(TARGET_EXT) manually to desired location"
-else
-	cp $(TARGET)$(TARGET_EXT) /usr/local/bin/
-endif
-
-# Uninstall target (optional)
-uninstall:
-ifeq ($(MINGW64),1)
-	@echo "On MinGW64, remove $(TARGET)$(TARGET_EXT) manually from installed location"
-else
-	$(RM) /usr/local/bin/$(TARGET)$(TARGET_EXT)
-endif
-
-# Debug build
-debug:
-	$(MAKE) CFLAGS="-std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 \
-		-Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces -Wno-pointer-sign \
-		-ffunction-sections -fdata-sections \
-		-Imbedtls/include -Ilibssh2/include \
-		-DLIBSSH2_MBEDTLS -DLIBSSH2_STATIC \
-		-DDEBUG -g -O0" \
-	LDFLAGS="-Wl,--gc-sections -lunwind" \
-	clean all
-
-# Release build with maximum optimization
-release: CFLAGS += -O3 -DNDEBUG
-release: all
-
-# Help target
-help:
-	@echo "Available targets:"
-	@echo "  all      - Build socks5server with static libssh2/mbedtls (default)"
-	@echo "  clean    - Remove build artifacts"
-	@echo "  debug    - Build with debug symbols"
-	@echo "  release  - Build with maximum optimization"
-	@echo "  install  - Install the binary"
-	@echo "  uninstall- Remove the installed binary"
-	@echo "  help     - Show this help message"
-
-# Phony targets
-.PHONY: all clean install uninstall debug release help
-
-# Dependencies
-main_socks5.o: socket_util.h socks5_server.h xargs.h xpoll.h
-socks5_server.o: socket_util.h socks5_server.h
-ssh_tunnel.o: socket_util.h ssh_tunnel.h
-xpoll.o: socket_util.h xpoll.h
+run: all
+	./$(EXE)

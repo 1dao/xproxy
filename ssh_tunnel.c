@@ -1,4 +1,5 @@
 #include "ssh_tunnel.h"
+#include <wolfssl/wolfcrypt/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,284 +14,296 @@
 #include <unistd.h>
 #endif
 
-static int libssh2_initialized = 0;
+static int wolf_ssh_initialized = 0;
+static WOLFSSH_CTX* g_ssh_ctx = NULL;
 
-LIBSSH2_SESSION* ssh_tunnel_session_open(const char *host, int port,
-                                         const char *username, const char *password) {
+static int wsUserAuth(byte authType, WS_UserAuthData* authData, void* ctx)
+{
+    const char* password = (const char*)ctx;
+    int ret = WOLFSSH_USERAUTH_SUCCESS;
+
+    (void)authType;
+    if (password != NULL) {
+        word32 passwordSz = (word32)strlen(password);
+        authData->sf.password.password = (const byte*)password;
+        authData->sf.password.passwordSz = passwordSz;
+    }
+    else {
+        ret = WOLFSSH_USERAUTH_FAILURE;
+    }
+
+    return ret;
+}
+
+static int wsPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
+{
+    (void)pubKey;
+    (void)pubKeySz;
+    (void)ctx;
+    return 0;
+}
+
+WOLFSSH* wolfSSH_session_open(const char *host, int port,
+                              const char *username, const char *password) {
     if (!host || !username || !password) {
-        printf("ssh_tunnel_session_open: Invalid arguments\n");
+        printf("wolfSSH_session_open: Invalid arguments\n");
         return NULL;
     }
 
     struct sockaddr_in sin;
-    int rc;
     SOCKET_T sock;
-    // Create socket
+    int ret;
+
+    wolfSSH_Debugging_ON();
+
+    printf("[DEBUG] 1. Calling wolfSSH_Init...\n");
+    ret = wolfSSH_Init();
+    if (ret != WS_SUCCESS) {
+        fprintf(stderr, "wolfSSH_Init failed: %d\n", ret);
+        return NULL;
+    }
+    wolf_ssh_initialized = 1;
+    printf("[DEBUG] 2. wolfSSH_Init OK\n");
+
+    printf("[DEBUG] 3. Creating socket...\n");
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         perror("socket");
+
         return NULL;
     }
+    printf("[DEBUG] 6. Socket created: %d\n", (int)sock);
 
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(port);
+    sin.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &sin.sin_addr) <= 0) {
         fprintf(stderr, "Invalid address: %s\n", host);
         CLOSE_SOCKET(sock);
+
         return NULL;
     }
 
-    // Connect to SSH server
+    printf("[DEBUG] 7. Connecting to %s:%d...\n", host, port);
     if (connect(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-        // perror("connect");
-        // CLOSE_SOCKET(sock);
-        fprintf(stderr, "Connect failed: host=%s,port=%d, user=%s, password=%s\n", host, port, username, password);
+        fprintf(stderr, "Connect failed: host=%s, port=%d\n", host, port);
+        CLOSE_SOCKET(sock);
 
-        #ifdef _WIN32
-                int error_code = WSAGetLastError();
-                char error_msg[256];
-                FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                              NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                              error_msg, sizeof(error_msg), NULL);
-                fprintf(stderr, "connect failed: %s\n", error_msg);
-        #else
-                perror("connect");
-        #endif
-                CLOSE_SOCKET(sock);
-                fprintf(stderr, "Connect failed: host=%s,port=%d, user=%s, password=%s\n", host, port, username, password);
         return NULL;
     }
+    printf("[DEBUG] 8. Connected OK\n");
 
-    // Initialize libssh2
-    if (!libssh2_initialized) {
-        rc = libssh2_init(0);
-        if (rc != 0) {
-            fprintf(stderr, "libssh2_init failed: %d\n", rc);
+    printf("[DEBUG] 9. Creating SSH context...\n");
+    if (g_ssh_ctx == NULL) {
+        g_ssh_ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, NULL);
+        if (g_ssh_ctx == NULL) {
+            fprintf(stderr, "Could not initialize SSH context\n");
+            CLOSE_SOCKET(sock);
             return NULL;
         }
-        libssh2_initialized = 1;
+        wolfSSH_SetUserAuth(g_ssh_ctx, wsUserAuth);
+        wolfSSH_CTX_SetWindowPacketSize(g_ssh_ctx, 1024*1024, 32*1024);
     }
+    printf("[DEBUG] 8. SSH context OK\n");
 
-    // Create SSH session
-    LIBSSH2_SESSION *session = libssh2_session_init_ex(NULL, NULL, NULL, (void*)(intptr_t)sock);
-    if (!session) {
-        fprintf(stderr, "Could not initialize SSH session\n");
+    printf("[DEBUG] 9. Creating SSH session...\n");
+    WOLFSSH* ssh = wolfSSH_new(g_ssh_ctx);
+    if (ssh == NULL) {
+        fprintf(stderr, "Could not create SSH session\n");
+        CLOSE_SOCKET(sock);
+        return NULL;
+    }
+    printf("[DEBUG] 10. SSH session created: %p\n", ssh);
+
+    printf("[DEBUG] 11. Setting auth context...\n");
+    wolfSSH_SetUserAuthCtx(ssh, (void*)password);
+
+    printf("[DEBUG] 12. Setting fd...\n");
+    ret = wolfSSH_set_fd(ssh, sock);
+    if (ret != WS_SUCCESS) {
+        fprintf(stderr, "wolfSSH_set_fd failed: %d\n", ret);
+        wolfSSH_free(ssh);
         CLOSE_SOCKET(sock);
         return NULL;
     }
 
-    // SSH handshake
-    while ((rc = libssh2_session_handshake(session, sock)) == LIBSSH2_ERROR_EAGAIN) {
-        fd_set read_fds, write_fds;
-        FD_ZERO(&read_fds);
-        FD_ZERO(&write_fds);
-        int dir = libssh2_session_block_directions(session);
-        if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-            FD_SET(sock, &read_fds);
-        }
-        if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-            FD_SET(sock, &write_fds);
-        }
-        select((int)sock + 1, &read_fds, &write_fds, NULL, NULL);
-    }
-
-    if (rc) {
-        fprintf(stderr, "Error when starting up SSH session: %d\n", rc);
-        libssh2_session_free(session);
+    printf("[DEBUG] 13. Setting username...\n");
+    ret = wolfSSH_SetUsername(ssh, username);
+    if (ret != WS_SUCCESS) {
+        fprintf(stderr, "wolfSSH_SetUsername failed: %d\n", ret);
+        wolfSSH_free(ssh);
         CLOSE_SOCKET(sock);
         return NULL;
     }
 
-    // Get supported authentication methods
-    char *userauthlist = libssh2_userauth_list(session, username, (unsigned int)strlen(username));
-    if (userauthlist) {
-        fprintf(stderr, "Authentication methods: %s\n", userauthlist);
-    }
+    wolfSSH_SetPublicKeyCheckCtx(ssh, (void*)"socks5_proxy");
+    wolfSSH_CTX_SetPublicKeyCheck(g_ssh_ctx, wsPublicKeyCheck);
 
-    int auth_success = 0;
-
-    // Try keyboard-interactive authentication
-    if (userauthlist && strstr(userauthlist, "keyboard-interactive")) {
-        fprintf(stderr, "Trying keyboard-interactive authentication...\n");
-        while ((rc = libssh2_userauth_keyboard_interactive(session, username, NULL)) == LIBSSH2_ERROR_EAGAIN) {
-            fd_set read_fds, write_fds;
-            FD_ZERO(&read_fds);
-            FD_ZERO(&write_fds);
-            int dir = libssh2_session_block_directions(session);
-            if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-                FD_SET(sock, &read_fds);
-            }
-            if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-                FD_SET(sock, &write_fds);
-            }
-            select((int)sock + 1, &read_fds, &write_fds, NULL, NULL);
-        }
-        if (rc == 0) {
-            auth_success = 1;
-            fprintf(stderr, "Keyboard-interactive authentication succeeded\n");
-        } else {
-            fprintf(stderr, "Keyboard-interactive authentication failed: %d\n", rc);
-        }
-    }
-
-    // Try password authentication
-    if (!auth_success && userauthlist && strstr(userauthlist, "password")) {
-        fprintf(stderr, "Trying password authentication...\n");
-        while ((rc = libssh2_userauth_password(session, username, password)) == LIBSSH2_ERROR_EAGAIN) {
-            fd_set read_fds, write_fds;
-            FD_ZERO(&read_fds);
-            FD_ZERO(&write_fds);
-            int dir = libssh2_session_block_directions(session);
-            if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) {
-                FD_SET(sock, &read_fds);
-            }
-            if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-                FD_SET(sock, &write_fds);
-            }
-            select((int)sock + 1, &read_fds, &write_fds, NULL, NULL);
-        }
-        if (rc == 0) {
-            auth_success = 1;
-            fprintf(stderr, "Password authentication succeeded\n");
-        } else {
-            fprintf(stderr, "Password authentication failed: %d\n", rc);
-        }
-    }
-
-    if (!auth_success) {
-        fprintf(stderr, "All authentication methods failed\n");
-        libssh2_session_free(session);
+    printf("[DEBUG] 14. Calling wolfSSH_connect...\n");
+    ret = wolfSSH_connect(ssh);
+    if (ret != WS_SUCCESS) {
+        fprintf(stderr, "wolfSSH_connect failed: %d (%s)\n", ret, wolfSSH_get_error_name(ssh));
+        wolfSSH_free(ssh);
         CLOSE_SOCKET(sock);
         return NULL;
     }
+    printf("[DEBUG] 15. Connected!\n");
 
-    // Set to non-blocking mode
-    libssh2_session_set_blocking(session, 0);
-    libssh2_keepalive_config(session, 0, 30);
-    printf("SSH session established on socket (%d-%d)\n", sock, (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session)));
-    return session;
+    return ssh;
 }
 
-void ssh_tunnel_session_close(LIBSSH2_SESSION* session) {
-    if (!session) {
+void wolfSSH_session_close(WOLFSSH* ssh) {
+    if (!ssh) {
         return;
     }
 
-    // 获取socket文件描述符
-    SOCKET_T sock = (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
+    SOCKET_T sock = wolfSSH_get_fd(ssh);
 
-    if (session) {
-        libssh2_session_disconnect(session, "Normal Shutdown");
-        libssh2_session_free(session);
-    }
+    wolfSSH_shutdown(ssh);
+    wolfSSH_free(ssh);
 
     if (sock != INVALID_SOCKET) {
         CLOSE_SOCKET(sock);
     }
-}
 
-LIBSSH2_CHANNEL* ssh_tunnel_channel_open(LIBSSH2_SESSION* session,
-                                         const char *dest_host, int dest_port,
-                                         const char *source_host, int source_port) {
-    if (!session || !dest_host)
-        return NULL;
-    if (!source_host)
-        source_host = "127.0.0.1";
-    if (source_port == 0)
-        source_port = 12345;
+    if (wolf_ssh_initialized) {
+        wolfSSH_Cleanup();
 
-    int rc;
-    int retry_count = 0;
-    int max_retries = 1;
-    SOCKET_T sock = (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
-    LIBSSH2_CHANNEL *channel = NULL;
-    while (retry_count < max_retries) {
-        channel = libssh2_channel_direct_tcpip_ex(session,
-                            dest_host, dest_port,
-                            source_host, source_port);
-        if (channel)
-            break;
-
-        rc = libssh2_session_last_error(session, NULL, NULL, 0);
-        if (rc == LIBSSH2_ERROR_EAGAIN) {
-            retry_count++;
-            if (retry_count >= max_retries)
-                break;
-        } else {
-            char *error_msg = NULL;
-            libssh2_session_last_error(session, &error_msg, NULL, 0);
-            fprintf(stderr, "Failed to open direct-tcpip channel to %s:%d. Error %d: %s\n",
-                    dest_host, dest_port, rc, error_msg ? error_msg : "Unknown error");
-            //libssh2_session_set_blocking(session, 1);
-            return NULL;
-        }
+        wolf_ssh_initialized = 0;
     }
 
-    if (channel)
-        fprintf(stderr, "SSH channel opened successfully to %s:%d\n", dest_host, dest_port);
+    if (g_ssh_ctx) {
+        wolfSSH_CTX_free(g_ssh_ctx);
+        g_ssh_ctx = NULL;
+    }
+}
+
+void wolfSSH_channel_callback(WOLFSSH* session, WS_CallbackChannelClose fclose, WS_CallbackChannelOpen ffini, WS_CallbackChannelOpen ffail, void* ctx) {
+    wolfSSH_SetChannelCloseCtx(session, ctx);
+    wolfSSH_SetChannelOpenCtx(session, ctx);
+    wolfSSH_CTX_SetChannelCloseCb(g_ssh_ctx, fclose);
+    wolfSSH_CTX_SetChannelOpenRespCb(g_ssh_ctx, ffini, ffail);
+}
+
+WOLFSSH_CHANNEL* wolfSSH_channel_open(WOLFSSH* ssh,
+                                       const char *dest_host, int dest_port,
+                                       const char *source_host, int source_port) {
+    if (!ssh || !dest_host) {
+        return NULL;
+    }
+
+    if (!source_host) {
+        source_host = "127.0.0.1";
+    }
+    if (source_port == 0) {
+        source_port = 12345;
+    }
+
+    WOLFSSH_CHANNEL* channel = wolfSSH_ChannelFwdNew(ssh,
+        dest_host, (word16)dest_port,
+        source_host, (word16)source_port);
+
+    if (channel) {
+        fprintf(stderr, "SSH channel opened successfully to %s:%d, address=%p, error=%d\n", dest_host, dest_port, channel, wolfSSH_get_error(channel->ssh));
+    } else {
+        fprintf(stderr, "Failed to open channel to %s:%d, error: %d\n",
+                dest_host, dest_port, wolfSSH_get_error(ssh));
+    }
 
     return channel;
 }
 
-void ssh_tunnel_channel_close(LIBSSH2_CHANNEL* channel) {
+void wolfSSH_channel_close(WOLFSSH_CHANNEL* channel) {
     if (!channel)
         return;
 
-    libssh2_channel_close(channel);
-    libssh2_channel_free(channel);
+    // int ssh_error = wolfSSH_get_error(channel->ssh);
+    // if(ssh_error != WS_SOCKET_ERROR_E
+    //     && ssh_error != WS_CHANNEL_CLOSED
+    //     && ssh_error != WS_EOF
+    //     && ssh_error != WS_FATAL_ERROR) {
+    //     if (wolfSSH_channel_eof(channel) == 0) {
+    //         // read remain data
+    //         char temp[1024];int n;
+    //         while ((n = wolfSSH_ChannelRead(channel, temp, sizeof(temp))) > 0) {}
+    //     }
+    // }
+
+    fprintf(stderr, "SSH channel closed, address=%p\n", channel);
+    wolfSSH_ChannelFree(channel);
 }
 
-int ssh_tunnel_read(LIBSSH2_CHANNEL *channel, void *buffer, size_t buffer_size) {
+inline static int is_temporary_state(int error_code) {
+    switch (error_code) {
+        case WS_WANT_READ:
+        case WS_WANT_WRITE:
+        case WS_REKEYING:
+        case WS_CHAN_RXD:
+        case WS_CHANNEL_NOT_CONF:
+            return 1;  // 是临时状态
+        default:
+            return 0;  // 不是临时状态
+    }
+}
+
+int wolfSSH_channel_read(WOLFSSH_CHANNEL *channel, void *buffer, size_t buffer_size) {
     if (!channel || !buffer || buffer_size == 0)
         return -1;
 
-    int total_read = 0;
-
-    while (total_read < buffer_size) {
-        int rc = libssh2_channel_read(channel,
-                                      (char*)buffer + total_read,
-                                      buffer_size - total_read);
-        if (rc > 0) {
-            total_read += rc;
-        } else if (rc == LIBSSH2_ERROR_EAGAIN) {
-            if (total_read == 0)
-                return 0;
-            break;
-        } else if (rc == 0) {
-            // EOF
-            if (total_read == 0)
-                return -1;
-            break;
-        } else {
-            return -1;
-        }
-    }
-
-    return total_read;
-}
-
-int ssh_tunnel_write(LIBSSH2_CHANNEL *channel, const void *buffer, size_t buffer_size) {
-    if (!channel || !buffer || buffer_size == 0) {
+    int ret = wolfSSH_ChannelRead(channel, (byte*)buffer, (word32)buffer_size);
+    if (ret < 0) {
+        if (is_temporary_state(wolfSSH_get_error(channel->ssh)))
+            return 0;
         return -1;
     }
 
-    int rc = libssh2_channel_write(channel, buffer, buffer_size);
-    if (rc < 0)
-        return rc == LIBSSH2_ERROR_EAGAIN?0:rc;
+    return ret;
+}
+
+int wolfSSH_channel_write(WOLFSSH_CHANNEL *channel, const void *buffer, size_t buffer_size) {
+    if (!channel || !buffer || buffer_size == 0)
+        return -1;
+
+    int ret = wolfSSH_ChannelSend(channel, (const byte*)buffer, (word32)buffer_size);
+    if (ret < 0) {
+        if (is_temporary_state(wolfSSH_get_error(channel->ssh)))
+            return 0;
+        return ret;
+    }
+
+    return ret;
+}
+
+SOCKET_T wolfSSH_session_get_socket(WOLFSSH* ssh) {
+    if (!ssh) {
+        return INVALID_SOCKET;
+    }
+    return wolfSSH_get_fd(ssh);
+}
+
+int wolfSSH_process_events(WOLFSSH* ssh, word32* channelId) {
+    if (!ssh) {
+        return -1;
+    }
+    return wolfSSH_worker(ssh, channelId);
+}
+
+int wolfSSH_session_keepalive(WOLFSSH* session) {
+    int rc = wolfSSH_SendIgnore(session, NULL, 0);
+    if (rc < 0 && is_temporary_state(wolfSSH_get_error(session)))
+        return 0;
     return rc;
 }
 
-SOCKET_T ssh_tunnel_session_get_socket(LIBSSH2_SESSION* session) {
-    if (!session) {
-        return INVALID_SOCKET;
-    }
-    return (SOCKET_T)(intptr_t)(*libssh2_session_abstract(session));
-}
-
-int ssh_tunnel_get_error(LIBSSH2_SESSION* session, char **errmsg) {
-    if (!session) {
+int wolfSSH_channel_eof(WOLFSSH_CHANNEL *channel) {
+    if (!channel) {
         return -1;
     }
+    return wolfSSH_ChannelGetEof(channel);
+}
 
-    return libssh2_session_last_error(session, errmsg, NULL, 0);
+int wolfSSH_get_error_code(WOLFSSH* ssh) {
+    if (!ssh) {
+        return -1;
+    }
+    return wolfSSH_get_error(ssh);
 }

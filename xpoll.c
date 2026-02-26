@@ -94,7 +94,6 @@ xPollState* xpoll_create(void) {
         loop->poll_fds[i].revents = 0;
 #endif
     }
-
     /* Set as thread-local default instance */
     _xpoll = loop;
     return loop;
@@ -163,7 +162,7 @@ static int xpoll_find_fd(xPollState *loop, SOCKET_T fd) {
     if (!loop)
         return -1;
 
-    for (int i = 0; i < loop->setsize; i++) {
+    for (int i = 0; i < loop->nfds; i++) {  // ← 使用 nfds 而不是 setsize
         if (loop->events[i].fd == fd) {
             return i;
         }
@@ -251,6 +250,11 @@ void xpoll_del_event(xPollState *loop, SOCKET_T fd, int mask) {
     int idx = xpoll_find_fd(loop, fd);
     if (idx < 0)
         return;
+    if (loop->events[idx].fd != fd || loop->poll_fds[idx].fd!=fd) {
+        fprintf(stderr, "[xpoll] warn: fd or mask mismatch, find fd=%d, but events[%d].fd=%d, mask=%d\n",
+                (int)fd, idx, (int)loop->events[idx].fd, loop->events[idx].mask);
+        return;
+    }
 
     /* Update the mask */
     loop->events[idx].mask &= ~mask;
@@ -269,8 +273,8 @@ void xpoll_del_event(xPollState *loop, SOCKET_T fd, int mask) {
         if( loop->nfds!=idx+1 ) {
             loop->poll_fds[idx] = loop->poll_fds[loop->nfds-1];
             loop->events[idx] = loop->events[loop->nfds-1];
-            memset(&loop->poll_fds[loop->nfds-1], 0, sizeof(*loop->poll_fds) );
-            memset(&loop->events[loop->nfds-1], 0, sizeof(*loop->events) );
+            memset(&loop->poll_fds[loop->nfds-1], 0, sizeof(loop->poll_fds[0]) );
+            memset(&loop->events[loop->nfds-1], 0, sizeof(loop->events[0]));
             loop->events[loop->nfds-1].fd = INVALID_SOCKET;
             loop->poll_fds[loop->nfds-1].fd = INVALID_SOCKET;
         }
@@ -290,7 +294,7 @@ void xpoll_del_event(xPollState *loop, SOCKET_T fd, int mask) {
     /* Recalculate maxfd */
     if (loop->maxfd == (int)fd) {
         loop->maxfd = -1;
-        for (int i = 0; i < loop->setsize; i++) {
+        for (int i = 0; i < loop->nfds; i++) {
 #ifdef _WIN32
             if (loop->events[i].fd != INVALID_SOCKET && (int)loop->events[i].fd > loop->maxfd) {
 #else
@@ -332,13 +336,8 @@ int xpoll_poll(xPollState *loop, int timeout_ms) {
     int num_processed = 0; void* ud; xPoolFD * fe;
     xFileProc rfileProc, wfileProc, efileProc;   /* callback for read event */
     for (int i = nfds-1; i >= 0; i--) {
-#ifdef _WIN32
-        if (loop->poll_fds[i].fd == INVALID_SOCKET) {
-#else
-        if (loop->poll_fds[i].fd == -1) {
-#endif
+        if (loop->poll_fds[i].fd == INVALID_SOCKET)
             continue;
-        }
 
         short revents = loop->poll_fds[i].revents;
         if (revents == 0)
@@ -356,7 +355,7 @@ int xpoll_poll(xPollState *loop, int timeout_ms) {
         SOCKET_T fd = loop->poll_fds[i].fd;
         int idx = i;//xpoll_find_fd(loop, fd);
         if(fd!=loop->events[i].fd)
-            fprintf(stderr, "xpoll mismatch fd=%d, idx=%d, i=%d\n", fd, idx, i);
+            fprintf(stderr, "xpoll mismatch fd=%d, idx=%d, i=%d\n", (int)fd, idx, i);
 
         fe = &loop->events[idx];
         rfileProc = fe->rfileProc;
@@ -364,17 +363,17 @@ int xpoll_poll(xPollState *loop, int timeout_ms) {
         efileProc = fe->efileProc;
         ud = fe->clientData;
 
-        /* Invoke read callback */
-        if ((mask & XPOLL_READABLE) && rfileProc)
-            rfileProc(loop, fd, XPOLL_READABLE, ud);
-
         /* Invoke write callback */
         if ((mask & XPOLL_WRITABLE) && wfileProc)
             wfileProc(loop, fd, XPOLL_WRITABLE, ud);
 
+        /* Invoke read callback */
+        if ((mask & XPOLL_READABLE) && rfileProc)
+            rfileProc(loop, fd, XPOLL_READABLE, ud);
+
         /* Invoke error callback */
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && efileProc) {
-            fprintf(stderr, "xpoll to close fd=%d, idx=%d, i=%d, err=%d, hub=%d, nval=%d\n", fd, idx, i, revents&XPOLL_ERROR?1:0, revents&POLLHUP?1:0, revents&POLLNVAL?1:0);
+            fprintf(stderr, "xpoll to close fd=%d, idx=%d, i=%d, err=%d, hub=%d, nval=%d\n", (int)fd, idx, i, revents&XPOLL_ERROR?1:0, revents&POLLHUP?1:0, revents&POLLNVAL?1:0);
             efileProc(loop, fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
         }
 

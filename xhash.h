@@ -1,6 +1,7 @@
 #ifndef __XHASH_H__
 #define __XHASH_H__
 
+#include <stdio.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -114,6 +115,11 @@ XHASH_INLINE void xhash_destroy(xhash *hash, bool free_value) {
  * Hash function - integer key
  */
 XHASH_INLINE unsigned int xhash_int_func(long long key, size_t size) {
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
     return (unsigned int)((unsigned long long)key % size);
 }
 
@@ -225,10 +231,12 @@ XHASH_INLINE bool xhash_remove_int(xhash *hash, long long key, bool free_value) 
 
     unsigned int idx = xhash_int_func(key, hash->size);
     xhashNode **pp = &hash->buckets[idx];
+    bool removed_was_head = false;
 
     while (*pp) {
         if ((*pp)->key_type == XHASH_KEY_INT && (*pp)->key.int_key == key) {
             xhashNode *to_remove = *pp;
+            removed_was_head = (to_remove == hash->buckets[idx]);
             *pp = (*pp)->next;  // Remove from bucket's linked list
 
             if (free_value && to_remove->value)
@@ -248,7 +256,8 @@ XHASH_INLINE bool xhash_remove_int(xhash *hash, long long key, bool free_value) 
                 }
             } else {
                 // If bucket still has other nodes, new head node inherits deleted node's next_idx
-                hash->buckets[idx]->next_idx = to_remove->next_idx;
+                if (removed_was_head)
+                    hash->buckets[idx]->next_idx = to_remove->next_idx;
             }
 
             free(to_remove);
@@ -351,11 +360,13 @@ XHASH_INLINE bool xhash_remove_str(xhash *hash, const char *key, bool free_value
 
     unsigned int idx = xhash_str_func(key, hash->size);
     xhashNode **pp = &hash->buckets[idx];
+    bool removed_was_head = false;
 
     while (*pp) {
         if ((*pp)->key_type == XHASH_KEY_STR &&
             (*pp)->key.str_key && strcmp((*pp)->key.str_key, key) == 0) {
             xhashNode *to_remove = *pp;
+            removed_was_head = (to_remove == hash->buckets[idx]);
             *pp = (*pp)->next;  // Remove from bucket's linked list
 
             if (to_remove->key.str_key) {
@@ -376,7 +387,8 @@ XHASH_INLINE bool xhash_remove_str(xhash *hash, const char *key, bool free_value
                     hash->buckets[prev_idx]->next_idx = to_remove->next_idx;
                 } else if (hash->head_idx == (int)idx) {
                     // If deleting head node, update head_idx
-                    hash->head_idx = to_remove->next_idx;
+                    if (removed_was_head)
+                        hash->head_idx = to_remove->next_idx;
                 }
             } else {
                 // If bucket still has other nodes, new head node inherits deleted node's next_idx
@@ -413,22 +425,29 @@ XHASH_INLINE void xhash_foreach(xhash *hash, bool (*callback)(xhashNode *node, v
         return;
 
     int current_idx = hash->head_idx;
-    size_t processed_count = 0;
+    int processed_count = 0;
+    int ncount = (int)hash->count;
+    xhashNode *node, *next;
+    while (current_idx != -1 && processed_count < ncount) {
+        node = hash->buckets[current_idx];
 
-    while (current_idx != -1 && processed_count < hash->count) {
-        xhashNode *node = hash->buckets[current_idx];
+        // Move to next bucket
+        current_idx = node ? node->next_idx : -1;
 
         // Traverse all nodes in current bucket
-        while (node && processed_count < hash->count) {
+        while (node && processed_count < ncount) {
+            next = node->next;
             if (!callback(node, ctx)) {
                 return;
             }
-            node = node->next;
+            node = next;
             processed_count++;
         }
-
-        // Move to next bucket
-        current_idx = node ? node->next_idx : hash->buckets[current_idx]->next_idx;
+    }
+    if(ncount!=processed_count){
+        fprintf(stderr, "hash set invalid :%d-%d", ncount, processed_count);
+        fprintf(stderr, "hash set invalid :%d-%d", ncount, processed_count);
+        fprintf(stderr, "hash set invalid :%d-%d", ncount, processed_count);
     }
 }
 
@@ -476,7 +495,7 @@ XHASH_INLINE bool xhash_resize(xhash *hash, size_t new_size) {
 
     /* Rebuild head_idx/next_idx */
     hash->head_idx = -1;
-    for (int i = hash->size - 1; i >= 0; i--) {
+    for (int i = (int)hash->size - 1; i >= 0; i--) {
         if (hash->buckets[i]) {
             hash->buckets[i]->next_idx = hash->head_idx;
             hash->head_idx = i;

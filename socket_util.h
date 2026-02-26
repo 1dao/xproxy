@@ -55,6 +55,24 @@ static inline int socket_set_reuseaddr(SOCKET_T sock) {
 #endif
 }
 
+static inline void socket_set_keepalive(SOCKET_T sock, int iddle_sec, int interval_sec, int times) {
+    int keepalive = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(keepalive));
+    #if defined(__linux__)
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &iddle_sec, sizeof(iddle_sec));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &times, sizeof(times));
+    #elif defined(__APPLE__)
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPALIVE, &iddle_sec, sizeof(iddle_sec));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &times, sizeof(times));
+
+    #elif defined(_WIN32)
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&iddle_sec, sizeof(iddle_sec));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&interval_sec, sizeof(interval_sec));
+    #endif
+}
+
 #ifdef _WIN32
 static inline int winsock_init(void) {
     WSADATA wsaData;
