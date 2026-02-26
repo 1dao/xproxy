@@ -1,7 +1,6 @@
 #include "https_proxy.h"
 #include "socket_util.h"
 #include "xpoll.h"
-#include "socks5_client.h"
 #include "xpac_server.h"
 
 #include <stdint.h>

@@ -8,7 +8,6 @@
 #include "socks5_server.h"
 #include "https_proxy.h"
 #include "xpac_server.h"
-#include "socks5_client.h"
 
 static int g_running = 0;
 
