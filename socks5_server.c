@@ -574,7 +574,7 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
 
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
     xhash* hash_table = xpoll_get_client_data(loop, ssh_socket);
-    char client_rbuf[4096];
+    char client_rbuf[8192];
     int n = recv(client->client_sock, client_rbuf, sizeof(client_rbuf), 0);
     if (n <= 0) {
         if(socket_check_eagain()) return;
@@ -818,9 +818,8 @@ void socks5_server_update() {
 }
 
 int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
-    if (!config || !xpoll) {
+    if (!config || !xpoll)
         return -1;
-    }
 
     // Initialize server configuration
     memcpy(&g_server_config, config, sizeof(Socks5ServerConfig));

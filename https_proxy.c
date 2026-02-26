@@ -22,7 +22,7 @@ typedef struct {
     SOCKET_T client_sock;
     SOCKET_T socks5_sock;
     ConnState state;
-    char req_buf[4096];
+    char req_buf[8192];
     int req_buf_len;
     int req_buf_size;
     int is_https;
@@ -600,7 +600,7 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
             // HTTP directly forwards original request to target server
             // send(conn->socks5_sock, (const char*)conn->req_buf, conn->req_buf_len, 0);
             // HTTP request: convert proxy format to direct server format
-            char origin_req[4096];
+            char origin_req[9216];
             int origin_len = convert_http_request(
                 (const char*)conn->req_buf,
                 conn->req_buf_len,
