@@ -729,7 +729,7 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     SOCKET_T client_sock = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
     if (client_sock == INVALID_SOCKET) {
         if (g_server_running) {
-            XLOG_PRINT(stderr, "accept failed: %d\n", WSAGetLastError());
+            XLOG_PRINT(stderr, "accept failed: %d\n", GET_ERRNO());
         }
         return;
     }

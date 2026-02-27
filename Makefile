@@ -6,9 +6,23 @@ CC = gcc
 CFLAGS = -Wall -O2 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
 CPPFLAGS = -I. -I./3rd/wolfssl -I./3rd/wolfssl/wolfssl -I./3rd/wolfssh -I./3rd/wolfssh/wolfssh -DWOLFSSL_USER_SETTINGS -DWOLFSSH_USER_SETTINGS -DWOLFSSH_FWD
 
-# Windows-specific settings
-LDFLAGS = -lws2_32 -lcrypt32 -lbcrypt -ladvapi32
-EXE = xproxy.exe
+# Detect platform and set appropriate flags/libraries
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Windows_NT)
+    # Windows-specific settings
+    CFLAGS += -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601
+    LDFLAGS = -lws2_32 -lcrypt32 -lbcrypt -ladvapi32
+    EXE = xproxy.exe
+else ifeq ($(UNAME_S),Darwin)
+    # macOS-specific settings
+    CPPFLAGS += -D_XOPEN_SOURCE -D_DARWIN_UNLIMITED_SELECT
+    LDFLAGS = -framework Security -framework CoreFoundation
+    EXE = xproxy
+else
+    # Linux and other Unix-like systems
+    LDFLAGS = -lm -lpthread
+    EXE = xproxy
+endif
 
 # Object directory
 OBJDIR = .objs

@@ -23,6 +23,7 @@
     #include <sys/select.h>
     #include <sys/time.h>
     #include <errno.h>
+    #include <fcntl.h>  // Added for fcntl, F_GETFL, F_SETFL, O_NONBLOCK
     #define SOCKET_T int
     #define CLOSE_SOCKET(s) close(s)
     #define SOCKET_ERROR_VAL -1
@@ -33,6 +34,18 @@
     #define SHUTDOWN_SOCKET(s, how) shutdown(s, how)
     #define SHUTDOWN_WR SHUT_WR
     #define GET_ERRNO() errno
+#endif
+
+// Define BOOL for non-Windows platforms
+#ifndef _WIN32
+    typedef int BOOL;
+    #define TRUE 1
+    #define FALSE 0
+#endif
+
+// Include platform-specific TCP constants if needed
+#if !defined(_WIN32) && (defined(__APPLE__) || defined(__MACH__))
+    #include <netinet/tcp.h>  // Include TCP constants for macOS
 #endif
 
 typedef long long long64;
@@ -58,18 +71,18 @@ static inline int socket_set_reuseaddr(SOCKET_T sock) {
 static inline void socket_set_keepalive(SOCKET_T sock, int iddle_sec, int interval_sec, int times) {
     int keepalive = 1;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(keepalive));
-    #if defined(__linux__)
+
+    #ifdef _WIN32
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (char*)&iddle_sec, sizeof(iddle_sec));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (char*)&interval_sec, sizeof(interval_sec));
+    #elif defined(__linux__)
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &iddle_sec, sizeof(iddle_sec));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &times, sizeof(times));
-    #elif defined(__APPLE__)
+    #elif defined(__APPLE__) || defined(__MACH__)
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPALIVE, &iddle_sec, sizeof(iddle_sec));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &times, sizeof(times));
-
-    #elif defined(_WIN32)
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&iddle_sec, sizeof(iddle_sec));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&interval_sec, sizeof(interval_sec));
     #endif
 }
 
@@ -92,6 +105,7 @@ static inline BOOL socket_check_eagain() {
     int err = GET_ERRNO();
     return err == WSAEWOULDBLOCK || err == WSAEINTR;
 }
+
 static inline long64 time_get_ms() {
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
@@ -101,26 +115,29 @@ static inline long64 time_get_ms() {
     ull.HighPart = ft.dwHighDateTime;
     return ull.QuadPart / 10000 - 11644473600000LL;
 }
+
 #define socket_init() winsock_init()
 #define socket_cleanup() winsock_cleanup()
 #else
-#include <unistd.h>
-#define socket_init() 0
-#define socket_cleanup() do {} while(0)
 static inline int socket_set_nonblocking(SOCKET_T sock) {
     int flags = fcntl(sock, F_GETFL, 0);
     if (flags == -1) return -1;
     return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
+
 static inline BOOL socket_check_eagain() {
     int err = GET_ERRNO();
-    return err == EWOULDBLOCK || err == EAGAIN || EINTR==err;
+    return err == EWOULDBLOCK || err == EAGAIN || err == EINTR;
 }
+
 static inline long64 time_get_ms() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long64)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
 }
+
+#define socket_init() 0
+#define socket_cleanup() do {} while(0)
 #endif
 
 #ifndef max
