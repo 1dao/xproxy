@@ -3,6 +3,11 @@
 # 示例：*.google.com socks5
 #        *.xxx.com http
 
+*.redd.it socks5
+*.redditmedia.com socks5
+*.redditstatic.com socks5
+*.redditspace.com socks5
+*.googletagmanager.com socks5
 *.google.com socks5
 *.google-analytics.com socks5
 *.googleapis.com socks5
