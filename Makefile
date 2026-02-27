@@ -7,9 +7,18 @@ CFLAGS = -Wall -O2 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-p
 CPPFLAGS = -I. -I./3rd/wolfssl -I./3rd/wolfssl/wolfssl -I./3rd/wolfssh -I./3rd/wolfssh/wolfssh -DWOLFSSL_USER_SETTINGS -DWOLFSSH_USER_SETTINGS -DWOLFSSH_FWD
 
 # Detect platform and set appropriate flags/libraries
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Windows_NT)
-    # Windows-specific settings
+ifeq ($(OS),Windows_NT)
+    # Native Windows (cmd.exe)
+    CFLAGS += -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601
+    LDFLAGS = -lws2_32 -lcrypt32 -lbcrypt -ladvapi32
+    EXE = xproxy.exe
+else ifneq (,$(findstring NT-6,$(UNAME_S)))
+    # Windows with NT in the name (includes MinGW, MSYS2, Cygwin)
+    CFLAGS += -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601
+    LDFLAGS = -lws2_32 -lcrypt32 -lbcrypt -ladvapi32
+    EXE = xproxy.exe
+else ifneq (,$(findstring MINGW,$(UNAME_S)))
+    # Explicitly check for MinGW environment
     CFLAGS += -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601
     LDFLAGS = -lws2_32 -lcrypt32 -lbcrypt -ladvapi32
     EXE = xproxy.exe
