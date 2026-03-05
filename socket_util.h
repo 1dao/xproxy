@@ -5,6 +5,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__ANDROID__)
+#ifndef TCP_KEEPIDLE
+#define TCP_KEEPIDLE 4
+#endif
+#ifndef TCP_KEEPINTVL
+#define TCP_KEEPINTVL 5
+#endif
+#ifndef TCP_KEEPCNT
+#define TCP_KEEPCNT 6
+#endif
+#endif
+
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>

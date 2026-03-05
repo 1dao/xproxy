@@ -7,17 +7,18 @@
 
 #include "xpoll.h"
 #include "xhash.h"
+#include "xlog.h"
 
 #define MAX_CONCURRENT_CONNECTIONS 8192
 #define MAX_ERROR_COUNT 10
 #define MAX_REOPEN_COUNT 30
-#define XLOG_PRINT(fd, ...) {fprintf(fd, __VA_ARGS__); fflush(fd);}
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
 static int g_active_connections = 0;
 static xPollState *g_xpoll = NULL;
 static WOLFSSH *g_ssh_session = NULL;
+static SOCKET_T g_listen_sock = INVALID_SOCKET;
 
 typedef struct {
     SOCKET_T client_sock;
@@ -79,16 +80,25 @@ static void socks5_send_reply(Socks5Client* client, uint8_t rep) {
 static int socks5_handle_handshake(Socks5Client* client) {
     uint8_t buf[4096];
     int n = recv(client->client_sock, (char*)buf, sizeof(buf), 0);
-    if (n < 3) return -1;
-    if (buf[0] != 0x05) return -1;
+    if (n < 3) {
+        XLOGE("SOCKS5 handshake, recv failed, n=%d, err=%d", n, GET_ERRNO());
+        return -1;
+    }
+    if (buf[0] != 0x05) {
+        XLOGE("SOCKS5 handshake, protocol mismatch, n=%d, err=%d", n, GET_ERRNO());
+        return -1;
+    }
 
     uint8_t nmethods = buf[1];
-    XLOG_PRINT(stderr, "SOCKS5 handshake: version=0x%02X, nmethods=%d\n", buf[0], nmethods);
-    if (n < 2 + nmethods) return -1;
+    XLOGD("SOCKS5 handshake: version=0x%02X, nmethods=%d", buf[0], nmethods);
+    if (n < 2 + nmethods) {
+        XLOGE("SOCKS5 handshake, data limit exceeded, n=%d, err=%d", n, GET_ERRNO());
+        return -1;
+    }
 
     uint8_t selected_method = 0xFF;
     for (int i = 0; i < nmethods; i++) {
-        XLOG_PRINT(stderr, "  Method %d: 0x%02X\n", i, buf[2 + i]);
+        XLOGD("  Method %d: 0x%02X", i, buf[2 + i]);
         if (buf[2 + i] == SOCKS5_AUTH_NONE) {
             selected_method = SOCKS5_AUTH_NONE;
             break;
@@ -96,16 +106,18 @@ static int socks5_handle_handshake(Socks5Client* client) {
     }
 
     if (selected_method == 0xFF) {
-        XLOG_PRINT(stderr, "No acceptable authentication method found\n");
+        XLOGE("No acceptable authentication method found");
         uint8_t response[2] = {0x05, SOCKS5_AUTH_NO_ACCEPTABLE};
         send(client->client_sock,  (const char*)response, 2, 0);
         return -1;
     }
 
-    XLOG_PRINT(stderr, "Selected authentication method: 0x%02X\n", selected_method);
+    XLOGI("Selected authentication method: 0x%02X", selected_method);
     uint8_t response[2] = {0x05, selected_method};
-    if (send(client->client_sock,  (const char*)response, 2, 0) != 2) return -1;
-
+    if (send(client->client_sock,  (const char*)response, 2, 0) != 2) {
+        XLOGE("Failed to send authentication response, err=%d", GET_ERRNO());
+        return -1;
+    }
     client->auth_method = selected_method;
     return 0;
 }
@@ -131,58 +143,77 @@ static void socks5_client_stage(Socks5Client* client) {
     if (ud) {
         xhash *hash_table = (xhash*)ud;
         xhash_set_int(hash_table, (long)client->client_sock, client);
-        XLOG_PRINT(stderr, "Client fd=%d added to SSH socket hash table\n", (int)client->client_sock);
+        XLOGI("Client fd=%d added to SSH socket hash table", (int)client->client_sock);
         if (xhash_size(hash_table) == 1) {
             xpoll_add_event(g_xpoll, ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
                             ssh_read_cb, NULL, ssh_error_cb, hash_table);
-            XLOG_PRINT(stderr, "SSH socket fd=%d added to XPOLL_ALL event\n", (int)ssh_socket);
+            XLOGE("SSH socket fd=%d added to XPOLL_ALL event", (int)ssh_socket);
         }
     }
 }
 
 static int socks5_client_auth(Socks5Client* client) {
-    uint8_t buf[4096];
+    uint8_t buf[8192];
     int n = recv(client->client_sock, (char*)buf, sizeof(buf), 0);
-    if (n < 10) return -1;
-    if (buf[0] != 0x05) return -1;
+    if (n < 10) {
+        XLOGE("SOCKS5 auth failed1, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+        return -1;
+    }
+    if (buf[0] != 0x05) {
+        XLOGE("SOCKS5 auth failed2, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+        return -1;
+    }
 
     client->cmd = buf[1];
     if (client->cmd != SOCKS5_CMD_CONNECT) {
+        XLOGE("SOCKS5 auth failed3, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
         socks5_send_reply(client, SOCKS5_REP_COMMAND_NOT_SUPPORTED);
         return -1;
     }
 
     uint8_t atyp = buf[3];
-    XLOG_PRINT(stderr, "SOCKS5 request: cmd=0x%02X, atyp=0x%02X\n", buf[1], atyp);
+    XLOGD("SOCKS5 request: cmd=0x%02X, atyp=0x%02X", buf[1], atyp);
 
     char target_host[256];
     uint16_t target_port;
     int pos = 4;
 
     if (atyp == SOCKS5_ATYP_IPV4) {
-        XLOG_PRINT(stderr, "ATYP: IPv4\n");
-        if (n < pos + 6) return -1;
+        XLOGI("ATYP: IPv4");
+        if (n < pos + 6) {
+            XLOGE("SOCKS5 auth failed4, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+            return -1;
+        }
         struct in_addr addr;
         memcpy(&addr, &buf[pos], 4);
         inet_ntop(AF_INET, &addr, target_host, sizeof(target_host));
         pos += 4;
     } else if (atyp == SOCKS5_ATYP_DOMAIN) {
         uint8_t domain_len = buf[pos++];
-        XLOG_PRINT(stderr, "ATYP: Domain name, length=%d, fd=%d\n", domain_len, (int)client->client_sock);
-        if (n < pos + domain_len + 2) return -1;
-        if (domain_len >= sizeof(target_host)) return -1;
+        XLOGI("ATYP: Domain name, length=%d, fd=%d", domain_len, (int)client->client_sock);
+        if (n < pos + domain_len + 2) {
+            XLOGE("SOCKS5 auth failed5, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+            return -1;
+        }
+        if (domain_len >= sizeof(target_host)){
+            XLOGE("SOCKS5 auth failed6, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+            return -1;
+        }
         memcpy(target_host, &buf[pos], domain_len);
         target_host[domain_len] = '\0';
         pos += domain_len;
     } else if (atyp == SOCKS5_ATYP_IPV6) {
-        XLOG_PRINT(stderr, "ATYP: IPv6\n");
-        if (n < pos + 18) return -1;
+        XLOGE("ATYP: IPv6");
+        if (n < pos + 18) {
+            XLOGE("SOCKS5 auth failed7, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+            return -1;
+        }
         struct in6_addr addr6;
         memcpy(&addr6, &buf[pos], 16);
         inet_ntop(AF_INET6, &addr6, target_host, sizeof(target_host));
         pos += 16;
     } else {
-        XLOG_PRINT(stderr, "ATYP not supported: 0x%02X\n", atyp);
+        XLOGE("ATYP not supported: 0x%02X", atyp);
         socks5_send_reply(client, SOCKS5_REP_ADDRESS_NOT_SUPPORTED);
         return -1;
     }
@@ -190,10 +221,10 @@ static int socks5_client_auth(Socks5Client* client) {
     target_port = ntohs(*(uint16_t*)&buf[pos]);
     strncpy(client->target_host, target_host, sizeof(client->target_host) - 1);
     client->target_port = target_port;
-    XLOG_PRINT(stderr, "SOCKS5 request: connect to %s:%d, fd=%d\n", target_host, target_port, (int)client->client_sock);
+    XLOGI("SOCKS5 request: connect to %s:%d, fd=%d", target_host, target_port, (int)client->client_sock);
 
     if (!client->ssh_session) {
-        XLOG_PRINT(stderr, "SSH session not available\n");
+        XLOGE("SSH session not available, fd=%d, target=%s:%d", (int)client->client_sock, target_host, target_port);
         socks5_send_reply(client, SOCKS5_REP_GENERAL_FAILURE);
         return -1;
     }
@@ -204,7 +235,7 @@ static int socks5_client_auth(Socks5Client* client) {
                                                    client->client_host, client->client_port);
     if (!client->ssh_channel) {
         client->last_retry_time = time_get_ms() + 200;
-        XLOG_PRINT(stderr, "Failed to open SSH channel\n");
+        XLOGD("Failed to open SSH channel");
         return 0;// for retry
     }
 
@@ -245,7 +276,7 @@ static void socks5_client_cleanup(xPollState *loop, SOCKET_T fd, Socks5Client *c
 
             if (xhash_size(hash) <= 0) {
                 xpoll_del_event(g_xpoll, ssh_socket, XPOLL_READABLE);
-                XLOG_PRINT(stderr, "SSH socket fd=%d remove XPOLL_ALL event\n", (int)ssh_socket);
+                XLOGE("SSH socket fd=%d remove XPOLL_ALL event", (int)ssh_socket);
             }
         }
     }
@@ -254,7 +285,7 @@ static void socks5_client_cleanup(xPollState *loop, SOCKET_T fd, Socks5Client *c
     free(client);
 
     g_active_connections--;
-    XLOG_PRINT(stderr, "Active connections: %d (connection closed)\n", g_active_connections);
+    XLOGE("Active connections: %d (connection closed)", g_active_connections);
 }
 
 static bool ssh_read_each_client(xhashNode *node, void* ud) {
@@ -267,13 +298,13 @@ static bool ssh_read_each_client(xhashNode *node, void* ud) {
 
     // If client state is ERROR, clean up immediately and remove from hash table
     if (client->state == SOCKS5_STATE_ERROR) {
-        XLOG_PRINT(stderr, "Cleaning up error client fd=%d\n", (int)client->client_sock);
+        XLOGE("Cleaning up error client fd=%d", (int)client->client_sock);
         // socks5_client_cleanup(g_xpoll, client->client_sock, client);
         return true;
     }
 
     if (client->read_buffer_size < 0 || client->read_buffer_size >= sizeof(client->read_buffer)) {
-        XLOG_PRINT(stderr, "Warning: Invalid read_buffer_size=%d, resetting to 0 for fd=%d\n",
+        XLOGE("Warning: Invalid read_buffer_size=%d, resetting to 0 for fd=%d",
                    client->read_buffer_size, (int)client->client_sock);
         client->read_buffer_size = 0;
         client->state = SOCKS5_STATE_ERROR;
@@ -282,7 +313,7 @@ static bool ssh_read_each_client(xhashNode *node, void* ud) {
     }
 
     if (client->write_buffer_size < 0 || client->write_buffer_size >= sizeof(client->write_buffer)) {
-        XLOG_PRINT(stderr, "Warning: Invalid write_buffer_size=%d, resetting to 0 for fd=%d\n",
+        XLOGE("Warning: Invalid write_buffer_size=%d, resetting to 0 for fd=%d",
                    client->write_buffer_size, (int)client->client_sock);
         client->write_buffer_size = 0;
         client->state = SOCKS5_STATE_ERROR;
@@ -309,21 +340,21 @@ static bool ssh_read_each_client(xhashNode *node, void* ud) {
         if (sent != total) {
             if (sent <= 0 ){
                 if(socket_check_eagain()) {
-                    XLOG_PRINT(stderr, "Channel send failed %d bytes to client fd=%d (sent=%d), eagain got\n",
+                    XLOGI("Channel send failed %d bytes to client fd=%d (sent=%d), eagain got",
                            n, (int)client->client_sock, sent);
                 } else {
                     client->state = SOCKS5_STATE_ERROR;
-                    XLOG_PRINT(stderr, "Channel send failed %d bytes to client fd=%d (sent=%d), close got\n",
+                    XLOGE("Channel send failed %d bytes to client fd=%d (sent=%d), close got",
                            n, (int)client->client_sock, sent);
                 }
             } else {
                 if (sent > 0 && sent < total) {
                     memmove(client->read_buffer, client->read_buffer + sent, total - sent);
                     client->read_buffer_size = total - sent;
-                    XLOG_PRINT(stderr, "Channel data send %d bytes to client fd=%d (sent=%d)\n",
+                    XLOGI("Channel data send %d bytes to client fd=%d (sent=%d)",
                            n, (int)client->client_sock, sent);
                 } else {
-                    XLOG_PRINT(stderr, "Invalid sent value %d, resetting buffer\n", sent);
+                    XLOGE("Invalid sent value %d, resetting buffer", sent);
                     client->read_buffer_size = 0;
                 }
             }
@@ -331,7 +362,7 @@ static bool ssh_read_each_client(xhashNode *node, void* ud) {
             // Check if channel is EOF
             client->read_buffer_size = 0;
             if (wolfSSH_channel_eof(client->ssh_channel)!=0) {
-                XLOG_PRINT(stderr, "Channel read finished && EOF for fd=%d\n", (int)client->client_sock);
+                XLOGE("Channel read finished && EOF for fd=%d", (int)client->client_sock);
                 client->state = SOCKS5_STATE_ERROR;
             }
         }
@@ -339,13 +370,13 @@ static bool ssh_read_each_client(xhashNode *node, void* ud) {
         if (wolfSSH_channel_eof(client->ssh_channel)!=0) {
             client->state = SOCKS5_STATE_ERROR;
         } else {
-            XLOG_PRINT(stderr, "Channel read failed for fd=%d, n=%d\n", (int)client->client_sock, n);
+            XLOGE("Channel read failed for fd=%d, n=%d", (int)client->client_sock, n);
             client->state = SOCKS5_STATE_ERROR;
         }
         return true;
     } else {
         if (wolfSSH_channel_eof(client->ssh_channel)!=0) {
-            XLOG_PRINT(stderr, "Channel closed by remote fd=%d\n", (int)client->client_sock);
+            XLOGE("Channel closed by remote fd=%d", (int)client->client_sock);
             client->state = SOCKS5_STATE_ERROR;
         }
     }
@@ -362,7 +393,7 @@ static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDat
 
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table) {
-        XLOG_PRINT(stderr, "ERROR: ssh_read_cb called with NULL hash table!\n");
+        XLOGE("ERROR: ssh_read_cb called with NULL hash table!");
         return;
     }
 
@@ -375,11 +406,11 @@ static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDat
     if (ret < 0 && ret != WS_CHAN_RXD && ret != WS_WANT_READ && ret != WS_WANT_WRITE) {
         int error = wolfSSH_get_error(g_ssh_session);
         if (error == WS_SOCKET_ERROR_E || error == WS_FATAL_ERROR) {
-            XLOG_PRINT(stderr, "wolfSSH_worker fatal error: %d\n", error);
+            XLOGE("wolfSSH_worker fatal error: %d", error);
             ssh_error_cb(loop, fd, XPOLL_ERROR, clientData);
             return;
         } else if(error != WS_CHANOPEN_FAILED && WS_INVALID_CHANID != error) {
-            XLOG_PRINT(stderr, "wolfSSH_worker error: %d-%s\n", error, wolfSSH_ErrorToName(error));
+            XLOGE("wolfSSH_worker error: %d-%s", error, wolfSSH_ErrorToName(error));
         }
     }
 
@@ -410,18 +441,18 @@ static bool ssh_write_each_client(xhashNode *node, void * ctx) {
     if (written < 0) {
         client->state = SOCKS5_STATE_ERROR;
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-        XLOG_PRINT(stderr, "Channel write failed, fd=%d, host=%s\n",
-               (int)client->client_sock, client->target_host);
+        XLOGE("Channel write failed, fd=%d, host=%s, err=%d",
+               (int)client->client_sock, client->target_host, GET_ERRNO());
     } else if (written >= remaining) {
         // All data has been written
         client->write_buffer_size = 0;
-        XLOG_PRINT(stderr, "All buffered data (%d bytes) written for fd=%d\n",
+        XLOGE("All buffered data (%d bytes) written for fd=%d",
                written, (int)client->client_sock);
     } else if(written != 0) {
         // Partial write
         memmove(client->write_buffer, client->write_buffer + written, remaining - written);
         client->write_buffer_size = remaining - written;
-        XLOG_PRINT(stderr, "Partially buffered data written: %d/%d bytes for fd=%d\n",
+        XLOGE("Partially buffered data written: %d/%d bytes for fd=%d",
                written, remaining - written, (int)client->client_sock);
          *(int*)ctx = 1;
     } else {
@@ -440,7 +471,7 @@ static void ssh_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
     _call_count++;
 
     if (_call_count % 10000 == 0) {
-        XLOG_PRINT(stderr, "ssh_write_cb called (count=%d, mask=%d)\n", _call_count, mask);
+        XLOGD("ssh_write_cb called (count=%d, mask=%d)", _call_count, mask);
     }
 
     int has_data = 0;
@@ -477,7 +508,7 @@ static bool client_channel_refuse(xhashNode* node, void* channel_ptr) {
         client->ssh_channel = NULL;
         client->state = SOCKS5_STATE_ERROR;
         socks5_send_reply(client, SOCKS5_REP_CONNECTION_REFUSED);
-        XLOG_PRINT(stderr, "SSH channel refuse connect, fd=%d, host=%s\n", (int)client->client_sock, client->target_host);
+        XLOGE("SSH channel refuse connect, fd=%d, host=%s", (int)client->client_sock, client->target_host);
         return false;
     }
     return true;
@@ -490,7 +521,7 @@ static bool client_channel_closed(xhashNode* node, void* channel_ptr) {
         client->ssh_channel = NULL;
         client->state = SOCKS5_STATE_ERROR;
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-        XLOG_PRINT(stderr, "Marked client as error due to SSH channel close, fd=%d, host=%s\n", (int)client->client_sock, client->target_host);
+        XLOGE("Marked client as error due to SSH channel close, fd=%d, host=%s", (int)client->client_sock, client->target_host);
         return false;
     }
     return true;
@@ -505,7 +536,7 @@ static int ssh_channel_close_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
 }
 
 static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
-    XLOG_PRINT(stderr, "ssh channel opened:%p\n", channel);
+    XLOGE("ssh channel opened:%p", channel);
     xhash* hash = (xhash*)ctx;
     if (hash)
         xhash_foreach(hash, client_channel_confirm, channel);
@@ -523,13 +554,14 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table)
         return;
-    XLOG_PRINT(stderr, "ssh_error_cb called (fd=%d)\n", (int)fd);
-    XLOG_PRINT(stderr, "ssh_error_cb called (fd=%d)\n", (int)fd);
-    XLOG_PRINT(stderr, "ssh_error_cb called (fd=%d)\n", (int)fd);
+    XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
+    XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
+    XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
 
     xhash_foreach(hash_table, client_on_closed, NULL);
     xpoll_del_event(loop, fd, XPOLL_ALL);
     wolfSSH_session_close(g_ssh_session);
+    xhash_destroy(hash_table, false);
     g_ssh_session = NULL;
 
     // Create shared SSH session
@@ -541,16 +573,16 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
         config->ssh_password);
 
     if (!ssh_session) {
-        XLOG_PRINT(stderr, "ReCreating Failed to create shared SSH session\n");
+        XLOGE("ReCreating Failed to create shared SSH session");
         return;
     }
-    XLOG_PRINT(stderr, "ReCreating Shared SSH session created successfully\n");
+    XLOGW("ReCreating Shared SSH session created successfully");
 
     // Setup hash table for SSH socket
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
     hash_table = xhash_create(1024);
     if (!hash_table) {
-        XLOG_PRINT(stderr, "ReCreating Failed to create hash table\n");
+        XLOGE("ReCreating Failed to create hash table");
         wolfSSH_session_close(ssh_session);
         return;
     }
@@ -558,7 +590,7 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
     // Register SSH socket events
     if (xpoll_add_event(loop, ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
                         ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
-        XLOG_PRINT(stderr, "ReCreating Failed to register SSH socket event\n");
+        XLOGE("ReCreating Failed to register SSH socket event");
         xhash_destroy(hash_table, false);
         wolfSSH_session_close(ssh_session);
         return;
@@ -577,14 +609,14 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
     char client_rbuf[8192];
     int n = recv(client->client_sock, client_rbuf, sizeof(client_rbuf), 0);
     if (n <= 0) {
-        if(socket_check_eagain()) return;
-        XLOG_PRINT(stderr, "Client disconnected\n");
+        if(n < 0 && socket_check_eagain()) return;
+        XLOGE("Client disconnected, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
         client->state = SOCKS5_STATE_ERROR;
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
         return;
     }
     if (!client->ssh_channel){
-        XLOG_PRINT(stderr, "ERROR: No SSH channel available\n");
+        XLOGE("ERROR: No SSH channel available");
         client->state = SOCKS5_STATE_ERROR;
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
         return;
@@ -593,7 +625,7 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
     if (client->write_buffer_size > 0) {
         int buffer_space = sizeof(client->write_buffer) - client->write_buffer_size;
         if (n > buffer_space) {
-            XLOG_PRINT(stderr, "ERROR: Buffer overflow. Available: %d, needed: %d, %s\n",
+            XLOGE("ERROR: Buffer overflow. Available: %d, needed: %d, %s",
                    buffer_space, n, client->target_host);
             client->state = SOCKS5_STATE_ERROR;
             SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
@@ -602,41 +634,41 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
         memcpy(client->write_buffer + client->write_buffer_size, client_rbuf, n);
         client->write_buffer_size += n;
 
-        XLOG_PRINT(stderr, "Appended %d bytes to write buffer, total buffered: %d bytes, %s\n",
+        XLOGE("Appended %d bytes to write buffer, total buffered: %d bytes, %s",
                n, client->write_buffer_size, client->target_host);
     } else {
         int written = wolfSSH_channel_write(client->ssh_channel, client_rbuf, n);
         if (written < 0) {
             client->retry_error_count++;
-            XLOG_PRINT(stderr, "Failed to write to SSH channel: error count=%d, host=%s, errno=%d\n", client->retry_error_count, client->target_host, written);
+            XLOGE("Failed to write to SSH channel: error count=%d, host=%s, errno=%d", client->retry_error_count, client->target_host, written);
             client->state = SOCKS5_STATE_ERROR;
         } else if (written == 0) {
-            XLOG_PRINT(stderr, "SSH channel not ready for write (EAGAIN), buffering %d bytes:%s...\n", n, client->target_host);
+            XLOGE("SSH channel not ready for write (EAGAIN), buffering %d bytes:%s...", n, client->target_host);
             if (n > sizeof(client->write_buffer)) {
-                XLOG_PRINT(stderr, "ERROR: Buffer too small for %d bytes, dropping data:%s\n", n, client->target_host);
+                XLOGE("ERROR: Buffer too small for %d bytes, dropping data:%s", n, client->target_host);
                 client->state = SOCKS5_STATE_ERROR;
             } else {
                 memcpy(client->write_buffer, client_rbuf, n);
                 client->write_buffer_size = n;
-                XLOG_PRINT(stderr, "Buffered %d bytes, will retry writing:%s\n", n, client->target_host);
+                XLOGD("Buffered %d bytes, will retry writing:%s", n, client->target_host);
                 xpoll_add_event(loop, ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
             }
         } else {
             client->retry_error_count = 0;
-            XLOG_PRINT(stderr, "SSH channel wrote %d bytes to %s\n", written, client->target_host);
+            XLOGD("SSH channel wrote %d bytes to %s", written, client->target_host);
 
             if (written < n) {
                 int remaining = n - written;
-                XLOG_PRINT(stderr, "Partially written: %d/%d bytes, buffering remaining %d bytes:%s...\n",
+                XLOGD("Partially written: %d/%d bytes, buffering remaining %d bytes:%s...",
                        written, n, remaining, client->target_host);
 
                 if (remaining > sizeof(client->write_buffer)) {
-                    XLOG_PRINT(stderr, "ERROR: Buffer too small for %d bytes, dropping data,%s\n", remaining, client->target_host);
+                    XLOGE("ERROR: Buffer too small for %d bytes, dropping data,%s", remaining, client->target_host);
                     client->state = SOCKS5_STATE_ERROR;
                 } else {
                     memcpy(client->write_buffer, client_rbuf + written, remaining);
                     client->write_buffer_size = remaining;
-                    XLOG_PRINT(stderr, "Buffered remaining %d bytes:%s\n", remaining, client->target_host);
+                    XLOGE("Buffered remaining %d bytes:%s", remaining, client->target_host);
                     xpoll_add_event(loop, ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
                 }
             }
@@ -649,14 +681,14 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
 
 static void client_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
     Socks5Client *client = (Socks5Client*)clientData;
-    XLOG_PRINT(stderr, "client try close:%s, mask=%d\n", client->target_host, mask);
+    XLOGE("client try close:%s, mask=%d", client->target_host, mask);
 
     if (client->state != SOCKS5_STATE_ERROR) {
         client->state = SOCKS5_STATE_ERROR;
-        XLOG_PRINT(stderr, "client closed %d-%d\n", (int)fd, (int)client->client_sock);
+        XLOGE("client closed %d-%d", (int)fd, (int)client->client_sock);
         socks5_client_cleanup(loop, fd, client);
     } else {
-        XLOG_PRINT(stderr, "client closed1 %d-%d\n", (int)fd, (int)client->client_sock);
+        XLOGE("client closed1 %d-%d", (int)fd, (int)client->client_sock);
         socks5_client_cleanup(loop, fd, client);
     }
 }
@@ -676,9 +708,9 @@ static bool socks5_channel_retry_open(Socks5Client *client) {
             socks5_send_reply(client, SOCKS5_REP_TTL_EXPIRED);
             client->state = SOCKS5_STATE_ERROR;
             SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-            XLOG_PRINT(stderr, "socks5_channel_retry_open retries reached, fd=%d, host=%s\n", (int)client->client_sock, client->target_host);
-            XLOG_PRINT(stderr, "socks5_channel_retry_open retries reached, fd=%d, host=%s\n", (int)client->client_sock, client->target_host);
-            XLOG_PRINT(stderr, "socks5_channel_retry_open retries reached, fd=%d, host=%s\n", (int)client->client_sock, client->target_host);
+            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s", (int)client->client_sock, client->target_host);
+            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s", (int)client->client_sock, client->target_host);
+            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s", (int)client->client_sock, client->target_host);
             return false;
         }
     } else {
@@ -729,13 +761,13 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     SOCKET_T client_sock = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
     if (client_sock == INVALID_SOCKET) {
         if (g_server_running) {
-            XLOG_PRINT(stderr, "accept failed: %d\n", GET_ERRNO());
+            XLOGE("accept failed: %d", GET_ERRNO());
         }
         return;
     }
 
     if (g_active_connections >= MAX_CONCURRENT_CONNECTIONS) {
-        XLOG_PRINT(stderr, "Too many connections (%d), rejecting new connection\n", g_active_connections);
+        XLOGE("Too many connections (%d), rejecting new connection", g_active_connections);
         CLOSE_SOCKET(client_sock);
         return;
     }
@@ -744,7 +776,7 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
 
     Socks5Client *client = (Socks5Client*)malloc(sizeof(Socks5Client));
     if (!client) {
-        XLOG_PRINT(stderr, "client malloc failed...\n");
+        XLOGE("client malloc failed...");
         CLOSE_SOCKET(client_sock);
         return;
     }
@@ -757,14 +789,14 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     if (true) {
         inet_ntop(AF_INET, &client_addr.sin_addr, client->client_host, sizeof(client->client_host));
         client->client_port = ntohs(client_addr.sin_port);
-        XLOG_PRINT(stderr, "New client connection from %s:%d, socket=%d\n",
+        XLOGE("New client connection from %s:%d, socket=%d",
                 client->client_host, client->client_port, (int)client_sock);
     }
 
     if (xpoll_add_event(g_xpoll, client_sock,
                         XPOLL_READABLE | XPOLL_ERROR | XPOLL_CLOSE,
                         client_state_cb, NULL, client_error_cb, client) != 0) {
-        XLOG_PRINT(stderr, "Failed to register client state event\n");
+        XLOGE("Failed to register client state event");
         socks5_client_free(client);
         free(client);
         CLOSE_SOCKET(client_sock);
@@ -773,7 +805,7 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     client->state = SOCKS5_STATE_AUTH;
 
     g_active_connections++;
-    XLOG_PRINT(stderr, "New client registered, active connections: %d\n", g_active_connections);
+    XLOGE("New client registered, active connections: %d", g_active_connections);
 }
 
 static bool socks5_channel_each_reopen(xhashNode *node, void* ud) {
@@ -799,14 +831,14 @@ void socks5_server_update() {
             // wolfSSH doesn't have direct keepalive, send ignore packet instead
             int rc = wolfSSH_session_keepalive(g_ssh_session);
             if (rc < 0) {
-                XLOG_PRINT(stderr, "keepalive error: %d\n", rc);
-                XLOG_PRINT(stderr, "keepalive error: %d\n", rc);
-                XLOG_PRINT(stderr, "keepalive error: %d\n", rc);
+                XLOGE("keepalive error: %d", rc);
+                XLOGE("keepalive error: %d", rc);
+                XLOGE("keepalive error: %d", rc);
                 handle_ssh_session_error();
                 return;
             }
         }
-        XLOG_PRINT(stderr, "keepalive success %lld\n", time_get_ms());
+        XLOGI("keepalive success %lld", time_get_ms());
     }
 
     if (g_ssh_session) {
@@ -825,7 +857,7 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
     memcpy(&g_server_config, config, sizeof(Socks5ServerConfig));
 
     // Create shared SSH session
-    XLOG_PRINT(stdout, "Creating shared SSH session to %s:%d...\n", config->ssh_host, config->ssh_port);
+    XLOGI("Creating shared SSH session to %s:%d...", config->ssh_host, config->ssh_port);
     WOLFSSH *ssh_session = wolfSSH_session_open(
         config->ssh_host,
         config->ssh_port,
@@ -833,16 +865,16 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
         config->ssh_password);
 
     if (!ssh_session) {
-        XLOG_PRINT(stderr, "Failed to create shared SSH session\n");
+        XLOGE("Failed to create shared SSH session");
         return -1;
     }
-    XLOG_PRINT(stdout, "Shared SSH session created successfully\n");
+    XLOGI("Shared SSH session created successfully");
 
     // Setup hash table for SSH socket
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
     xhash *hash_table = xhash_create(20);
     if (!hash_table) {
-        XLOG_PRINT(stderr, "Failed to create hash table\n");
+        XLOGE("Failed to create hash table");
         wolfSSH_session_close(ssh_session);
         return -1;
     }
@@ -850,24 +882,24 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
     // Register SSH socket events
     if (xpoll_add_event(xpoll, ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
                         ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
-        XLOG_PRINT(stderr, "Failed to register SSH socket event\n");
+        XLOGE("Failed to register SSH socket event");
         xhash_destroy(hash_table, false);
         wolfSSH_session_close(ssh_session);
         return -1;
     }
 
     // Create listening socket
-    SOCKET_T listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock == INVALID_SOCKET) {
-        XLOG_PRINT(stderr, "listen socket creation failed\n");
+    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_listen_sock == INVALID_SOCKET) {
+        XLOGE("listen socket creation failed");
         xhash_destroy(hash_table, false);
         wolfSSH_session_close(ssh_session);
         return -1;
     }
 
-    // // Set SO_REUSEADDR
-    // int opt = 1;
-    // setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    // Set SO_REUSEADDR
+    int opt = 1;
+    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     // Bind address
     struct sockaddr_in server_addr;
@@ -877,30 +909,33 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
         inet_addr(config->bind_address) : INADDR_ANY;
     server_addr.sin_port = htons(config->bind_port);
 
-    if (bind(listen_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        XLOG_PRINT(stderr, "bind failed");
+    if (bind(g_listen_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        XLOGE("bind failed");
         xhash_destroy(hash_table, false);
         wolfSSH_session_close(ssh_session);
-        CLOSE_SOCKET(listen_sock);
+        CLOSE_SOCKET(g_listen_sock);
+        g_listen_sock = INVALID_SOCKET;
         return -1;
     }
 
     // Listen
-    if (listen(listen_sock, SOMAXCONN) < 0) {
-        XLOG_PRINT(stderr, "listen failed");
+    if (listen(g_listen_sock, SOMAXCONN) < 0) {
+        XLOGE("listen failed");
         xhash_destroy(hash_table, false);
         wolfSSH_session_close(ssh_session);
-        CLOSE_SOCKET(listen_sock);
+        CLOSE_SOCKET(g_listen_sock);
+        g_listen_sock = INVALID_SOCKET;
         return -1;
     }
 
     // Register listening socket event
-    if (xpoll_add_event(xpoll, listen_sock, XPOLL_READABLE,
+    if (xpoll_add_event(xpoll, g_listen_sock, XPOLL_READABLE,
                         (xFileProc)accept_cb_single, NULL, NULL, NULL) != 0) {
-        XLOG_PRINT(stderr, "Failed to register listen socket event\n");
+        XLOGE("Failed to register listen socket event");
         xhash_destroy(hash_table, false);
         wolfSSH_session_close(ssh_session);
-        CLOSE_SOCKET(listen_sock);
+        CLOSE_SOCKET(g_listen_sock);
+        g_listen_sock = INVALID_SOCKET;
         return -1;
     }
     wolfSSH_channel_callback(ssh_session, ssh_channel_close_callback, ssh_channel_open_fini_callback, ssh_channel_open_fail_callback, hash_table);
@@ -914,16 +949,26 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
     // Set server running flag
     g_server_running = 1;
 
-    XLOG_PRINT(stdout, "SOCKS5 proxy is running...\n");
-    XLOG_PRINT(stdout, "Listen address: %s:%d\n", config->bind_address, config->bind_port);
-    XLOG_PRINT(stdout, "SSH tunnel: %s:%d (user: %s)\n", config->ssh_host, config->ssh_port, config->ssh_username);
-    XLOG_PRINT(stdout, "Using %s for I/O multiplexing\n", xpoll_name());
+    XLOGI("SOCKS5 proxy is running...");
+    XLOGI("Listen address: %s:%d", config->bind_address, config->bind_port);
+    XLOGI("SSH tunnel: %s:%d (user: %s)", config->ssh_host, config->ssh_port, config->ssh_username);
+    XLOGI("Using %s for I/O multiplexing", xpoll_name());
 
     return 0;
 }
 
 void socks5_server_stop(void) {
     if(g_server_running==0) return;
+
+    // Close listening socket and remove from xpoll
+    if (g_listen_sock != INVALID_SOCKET) {
+        if (g_xpoll) {
+            xpoll_del_event(g_xpoll, g_listen_sock, XPOLL_ALL);
+        }
+        CLOSE_SOCKET(g_listen_sock);
+        g_listen_sock = INVALID_SOCKET;
+        XLOGI("SOCKS5 listening socket closed");
+    }
 
     SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_session);
     xhash* hash = (xhash*)xpoll_get_client_data(g_xpoll, ssh_sock);
@@ -933,4 +978,6 @@ void socks5_server_stop(void) {
     }
 
     g_server_running = 0;
+    g_xpoll = NULL;
+    g_ssh_session = NULL;
 }
