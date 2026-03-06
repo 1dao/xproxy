@@ -2,9 +2,12 @@
 #include "socket_util.h"
 #include "xpoll.h"
 #include "xpac_server.h"
+#ifdef LOG_TAG
+    #undef LOG_TAG
+#endif
+#define LOG_TAG "xhttp"
 #include "xlog.h"
 
-#include <basetsd.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>

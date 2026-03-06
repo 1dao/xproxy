@@ -3,8 +3,9 @@
 
 
 #ifdef __ANDROID__
+#ifndef LOG_TAG
 #define LOG_TAG "socks5_server"
-
+#endif
 #include <android/log.h>
 #include <stdio.h>
 

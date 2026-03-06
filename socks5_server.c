@@ -7,6 +7,10 @@
 
 #include "xpoll.h"
 #include "xhash.h"
+#ifdef LOG_TAG
+    #undef LOG_TAG
+#endif
+#define LOG_TAG "xsocks5"
 #include "xlog.h"
 
 #define MAX_CONCURRENT_CONNECTIONS 8192
@@ -189,7 +193,7 @@ static int socks5_client_auth(Socks5Client* client) {
         inet_ntop(AF_INET, &addr, target_host, sizeof(target_host));
         pos += 4;
     } else if (atyp == SOCKS5_ATYP_DOMAIN) {
-        uint8_t domain_len = buf[pos++];
+        int domain_len = buf[pos++];
         XLOGI("ATYP: Domain name, length=%d, fd=%d", domain_len, (int)client->client_sock);
         if (n < pos + domain_len + 2) {
             XLOGE("SOCKS5 auth failed5, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());

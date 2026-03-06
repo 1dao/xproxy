@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #if defined(__ANDROID__)
 #ifndef TCP_KEEPIDLE
 #define TCP_KEEPIDLE 4
@@ -15,6 +19,9 @@
 #ifndef TCP_KEEPCNT
 #define TCP_KEEPCNT 6
 #endif
+#endif
+#ifndef INT_PTR
+typedef intptr_t INT_PTR;
 #endif
 
 #ifdef _WIN32
@@ -156,4 +163,7 @@ static inline long64 time_get_ms() {
     #define max(a,b) ((a) > (b) ? (a) : (b))
 #endif
 
+#ifdef __cplusplus
+}
+#endif
 #endif // SOCKET_UTIL_H
