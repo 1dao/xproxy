@@ -147,7 +147,7 @@ static void socks5_client_stage(Socks5Client* client) {
         if (xhash_size(hash_table) == 1) {
             xpoll_add_event(g_xpoll, ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
                             ssh_read_cb, NULL, ssh_error_cb, hash_table);
-            XLOGE("SSH socket fd=%d added to XPOLL_ALL event", (int)ssh_socket);
+            XLOGD("SSH socket fd=%d added to XPOLL_ALL event", (int)ssh_socket);
         }
     }
 }
@@ -285,7 +285,7 @@ static void socks5_client_cleanup(xPollState *loop, SOCKET_T fd, Socks5Client *c
     free(client);
 
     g_active_connections--;
-    XLOGE("Active connections: %d (connection closed)", g_active_connections);
+    XLOGI("Active connections: %d (connection closed)", g_active_connections);
 }
 
 static bool ssh_read_each_client(xhashNode *node, void* ud) {
@@ -536,7 +536,7 @@ static int ssh_channel_close_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
 }
 
 static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
-    XLOGE("ssh channel opened:%p", channel);
+    XLOGI("ssh channel opened:%p", channel);
     xhash* hash = (xhash*)ctx;
     if (hash)
         xhash_foreach(hash, client_channel_confirm, channel);
@@ -789,7 +789,7 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     if (true) {
         inet_ntop(AF_INET, &client_addr.sin_addr, client->client_host, sizeof(client->client_host));
         client->client_port = ntohs(client_addr.sin_port);
-        XLOGE("New client connection from %s:%d, socket=%d",
+        XLOGW("New client connection from %s:%d, socket=%d",
                 client->client_host, client->client_port, (int)client_sock);
     }
 
@@ -805,7 +805,7 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     client->state = SOCKS5_STATE_AUTH;
 
     g_active_connections++;
-    XLOGE("New client registered, active connections: %d", g_active_connections);
+    XLOGD("New client registered, active connections: %d", g_active_connections);
 }
 
 static bool socks5_channel_each_reopen(xhashNode *node, void* ud) {

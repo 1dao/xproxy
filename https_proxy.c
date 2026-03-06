@@ -23,9 +23,10 @@ typedef struct {
     SOCKET_T client_sock;
     SOCKET_T socks5_sock;
     ConnState state;
-    char req_buf[81920];
+    char req_buf[32767];
     int req_buf_len;
-    int req_buf_size;
+    char rep_buf[65536];
+    int rep_buf_len;
     int is_https;
 
     char host[128];
@@ -40,7 +41,7 @@ int https_parse_connect(const char* req_buf, int req_len, char* target_host, int
 int https_send_200(SOCKET_T client_sock);
 
 // Parse normal HTTP request (GET/POST etc.), extract target host and port
-int http_parse_request(const char* req_buf, int req_len, char* target_host, int host_len, uint16_t* target_port);
+int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_host, int host_len, uint16_t* target_port);
 
 // ===================== Global Variables =====================
 static HttpProxyConfig g_config;
@@ -53,15 +54,16 @@ static xPollState* g_xpoll = NULL;
 // ===================== HTTP Parsing Functions =====================
 // Parse CONNECT request, extract target_host and target_port
 int https_parse_connect(const char* req_buf, int req_len, char* target_host, int host_len, uint16_t* target_port) {
-    char method[16], path[256], version[16];
-    if (sscanf(req_buf, "%s %s %s", method, path, version) != 3) {
+    if (strncmp(req_buf, "CONNECT", 7) != 0)
         return -1;
-    }
+
+    char method[16], path[512], version[16];
+    if (sscanf(req_buf, "%15s %511s %15s", method, path, version) != 3)
+        return -1;
 
     // Verify if it's CONNECT method
-    if (strcmp(method, "CONNECT") != 0) {
+    if (strcmp(method, "CONNECT") != 0)
         return -1;
-    }
 
     // Split host and port from path (default 443)
     char* colon_pos = strchr(path, ':');
@@ -87,13 +89,106 @@ int https_send_200(SOCKET_T client_sock) {
     return sent == len ? 0 : -1;
 }
 
+// Convert proxy-formatted HTTP request to direct server format
+// Example: GET http://host:port/path HTTP/1.1 -> GET /path HTTP/1.1
+static int convert_http_request_inplace(char* req_buf, int* req_len, int buf_size) {
+    if (!req_buf || !req_len || *req_len <= 0 || buf_size <= 0)
+        return -1;
+    // Ensure we have room for null terminator
+    if (*req_len >= buf_size)
+        return -1; // Buffer already full, no room for null terminator
+    // Find first space (after method)
+    const char* space1 = memchr(req_buf, ' ', *req_len);
+    if (!space1) return -1;
+
+    // Find second space (after URL)
+    int space1_offset = space1 - req_buf;
+    const char* space2 = memchr(space1 + 1, ' ', *req_len - space1_offset - 1);
+    if (!space2) return -1;
+
+    int space2_offset = space2 - req_buf;
+
+    // Check if URL contains "://" (bounded search within URL only)
+    const char* url_start = space1 + 1;
+    const char* proto = NULL;
+    if (space2 - url_start < 7) return 0; // "http://" 最短 7 字节
+    const char* end_search = space2 - 3;
+    for (const char* p = url_start; p <= end_search; p++) {
+        if (p[0] == ':' && p[1] == '/' && p[2] == '/') {
+            proto = p;
+            break;
+        }
+    }
+
+    if (!proto)       // No "://", already in direct format
+        return 0;
+
+    // Find first '/' after "://" (path start, bounded search)
+    const char* slash = NULL;
+    for (const char* p = proto + 3; p < space2; p++) {
+        if (*p == '/') {
+            slash = p;
+            break;
+        }
+    }
+
+    if (!slash) {
+        // No path, use "/"
+        int method_len = space1_offset;
+        int remaining_len = *req_len - space2_offset;
+        int new_len = method_len + 2 + remaining_len; // "METHOD / HTTP/1.1..."
+
+        if (new_len > *req_len) {
+            XLOGE("[http] no slash convert_http_request_inplace overwrite1...");
+            XLOGE("[http] no slash convert_http_request_inplace overwrite1...");
+            XLOGE("[http] no slash convert_http_request_inplace overwrite1...");
+            return -1; // Buffer too small (shouldn't happen as we're shortening)
+        }
+
+        // Safety check: ensure we don't exceed buffer
+        if (new_len >= buf_size) {
+            XLOGE("[http] no slash convert_http_request_inplace overwrite2...");
+            XLOGE("[http] no slash convert_http_request_inplace overwrite2...");
+            XLOGE("[http] no slash convert_http_request_inplace overwrite2...");
+            return -1;
+        }
+
+        // Shift remaining part to make room for "/"
+        memmove(req_buf + method_len + 2, req_buf + space2_offset, remaining_len);
+        req_buf[method_len] = ' ';
+        req_buf[method_len + 1] = '/';
+        *req_len = new_len;
+        req_buf[*req_len] = '\0';  // Ensure null termination
+    } else {
+        // Has path, move path part to replace URL
+        int method_len = space1_offset;
+        int path_len = space2_offset - (slash - req_buf);
+        int remaining_len = *req_len - space2_offset;
+
+        // Move path to right after method
+        memmove(req_buf + method_len + 1, slash, path_len + remaining_len);
+        *req_len = method_len + 1 + path_len + remaining_len;
+
+        // Safety check: ensure we don't exceed buffer
+        if (*req_len >= buf_size) {
+            XLOGE("[http] slash convert_http_request_inplace overwrite...");
+            XLOGE("[http] slash convert_http_request_inplace overwrite...");
+            XLOGE("[http] slash convert_http_request_inplace overwrite...");
+            return -1;
+        }
+        req_buf[*req_len] = '\0';  // Ensure null termination
+    }
+
+    return 0;
+}
+
 // Parse normal HTTP request (extract target address from Host header)
-int http_parse_request(const char* req_buf, int req_len, char* target_host, int host_len, uint16_t* target_port) {
+// Note: This function modifies req_buf to convert absolute URL to relative path
+int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_host, int host_len, uint16_t* target_port) {
     // 1. Extract Host header first (core of HTTP request, format: Host: www.baidu.com:80)
     const char* host_header = strstr(req_buf, "Host: ");
-    if (host_header == NULL) {
+    if (host_header == NULL)
         return -1;
-    }
     host_header += 6; // Skip "Host: " string
 
     // 2. Extract Host content (until \r or \n ends)
@@ -122,37 +217,13 @@ int http_parse_request(const char* req_buf, int req_len, char* target_host, int 
         snprintf(target_host, host_len, "%s", start);
         *target_port = 80; // HTTP default port
     }
-    return 0;
-}
 
-
-// Parse normal HTTP request (extract target address from Host header)
-int http_parse_request_raw(const char* req_buf, int req_len, char* target_host, int host_len, uint16_t* target_port) {
-    // 1. Extract Host header first (core of HTTP request, format: Host: www.baidu.com:80)
-    const char* host_header = strstr(req_buf, "Host: ");
-    if (host_header == NULL) {
-        return -1;
-    }
-    host_header += 6; // Skip "Host: " string
-
-    // 2. Extract Host content (until \r or \n ends)
-    char host_buf[256] = {0};
-    int i = 0;
-    while (host_header[i] != '\r' && host_header[i] != '\n' && host_header[i] != '\0' && i < sizeof(host_buf)-1) {
-        host_buf[i] = host_header[i];
-        i++;
-    }
-
-    // 3. Split host and port (HTTP default port 80)
-    char* colon_pos = strchr(host_buf, ':');
-    if (colon_pos) {
-        *colon_pos = '\0';
-        snprintf(target_host, host_len, "%s", host_buf);
-        *target_port = atoi(colon_pos + 1);
-    } else {
-        snprintf(target_host, host_len, "%s", host_buf);
-        *target_port = 80; // HTTP default port
-    }
+    // 4. Convert absolute URL to relative path using the improved method
+    XLOGD("convert before:");
+    XLOGD("\n%s\n", req_buf);
+    convert_http_request_inplace(req_buf, req_len, buf_size);
+    XLOGD("convert after:");
+    XLOGD("\n%s\n", req_buf);
 
     return 0;
 }
@@ -171,7 +242,6 @@ static int init_conn_list(void) {
         g_conn_list[i].state = CONN_STATE_CLOSED;
         g_conn_list[i].is_https = 0;
         g_conn_list[i].req_buf_len = 0;
-        g_conn_list[i].req_buf_size = sizeof(g_conn_list[i].req_buf);
         memset(g_conn_list[i].req_buf, 0, sizeof(g_conn_list[i].req_buf));
     }
     g_conn_count = 0;
@@ -277,7 +347,7 @@ static int handle_client_request(int slot) {
     if (https_parse_connect(conn->req_buf, conn->req_buf_len, conn->host, sizeof(conn->host), &conn->port) == 0) {
         is_https = 1;
         XLOGI("[http] Parsed HTTPS CONNECT request: %s:%d", conn->host, conn->port);
-    } else if (http_parse_request(conn->req_buf, conn->req_buf_len, conn->host, sizeof(conn->host), &conn->port) == 0) {
+    } else if (http_parse_request(conn->req_buf, &conn->req_buf_len, sizeof(conn->req_buf), conn->host, sizeof(conn->host), &conn->port) == 0) {
         is_https = 0;
         XLOGI("[http]  Parsed HTTP request: %s:%d", conn->host, conn->port);
     } else {
@@ -307,7 +377,7 @@ static int handle_client_request(int slot) {
     };
 
     if (connect(socks5_sock, (struct sockaddr*)&socks5_addr, sizeof(socks5_addr)) != 0) {
-        XLOGE("[http] Failed to connect Socks5 server");
+        XLOGE("[http] Failed to connect Socks5 server, from host=%s, client socket=%d", conn->host, (int)conn->client_sock);
         CLOSE_SOCKET(socks5_sock);
         return -1;
     }
@@ -358,33 +428,103 @@ static int handle_client_request(int slot) {
     return 0;
 }
 
-// ===================== Data Forwarding Functions =====================
-// Data forwarding (based on event trigger)
-static int forward_data(SOCKET_T src_sock, SOCKET_T dst_sock) {
-    char buf[8192];
-    int recv_len = recv(src_sock, buf, sizeof(buf), 0);
-    if (recv_len <= 0) {
-        if(socket_check_eagain()){
-            XLOGW("[http] forward recv, got eagain target_fd=%d", (int)dst_sock);
+static inline int do_recv(SOCKET_T s, char* buf, int len) {
+    int recv_len = recv(s, buf, len, 0);
+    if( recv_len ==0 ) {
+        XLOGE("[http] forward recv, peer close target_fd=%d", (int)s);
+        return -1;
+    } else if (recv_len < 0) {
+        if( socket_check_eagain() ){
+            XLOGW("[http] forward recv, got eagain target_fd=%d", (int)s);
             return 0;
         }
+        XLOGE("[http] forward recv, got failed target_fd=%d", (int)s);
         return -1;
     }
+    return recv_len;
+}
 
-    // Forward data to destination socket
-    int send_len = send(dst_sock, (const char*)buf, recv_len, 0);
-    if (send_len <= 0) {
-        if(socket_check_eagain()) {
-            XLOGW("[Data Forward] eagain target_fd=%d", (int)dst_sock);
+static inline int do_send(SOCKET_T s, char* buf, int len) {
+    int send_len = send(s, buf, len, 0);
+    if (send_len < 0) {
+        if (socket_check_eagain()) {
+            XLOGW("[http] forward send eagain target_fd=%d", (int)s);
             return 0;
         }
+        XLOGE("[http] forward send, got failed target_fd=%d", (int)s);
         return -1;
+    }
+    return send_len;
+}
+
+static inline int forward2socks5(ProxyConn* conn) {
+    SOCKET_T src_sock = conn->client_sock, dst_sock = conn->socks5_sock;
+    if( conn->req_buf_len > 0) {
+        int ret = do_send(dst_sock, conn->req_buf, conn->req_buf_len);
+        if(ret < 0) return ret;
+        if(ret==conn->req_buf_len)
+            conn->req_buf_len = 0;
+        else if(ret > 0) {
+            memmove(conn->req_buf, conn->req_buf + ret, conn->req_buf_len - ret);
+            conn->req_buf_len -= ret;
+        }
+    }
+
+    int n = sizeof(conn->req_buf) - conn->req_buf_len;
+    if (n==0) {
+        XLOGW("[http] forward2socks5, buffer full, host=%s", conn->host);
+        return 0;
+    }
+
+    int recv_len = do_recv(src_sock, conn->req_buf + conn->req_buf_len, n);
+    if (recv_len <= 0)
+        return recv_len;
+    conn->req_buf_len += recv_len;
+    int ret = do_send(dst_sock, conn->req_buf, conn->req_buf_len);
+    if(ret <= 0) return ret;
+    if(ret==conn->req_buf_len)
+        conn->req_buf_len = 0;
+    else {
+        memmove(conn->req_buf, conn->req_buf + ret, conn->req_buf_len - ret);
+        conn->req_buf_len -= ret;
     }
     return 0;
 }
 
-// ===================== 内部回调函数 =====================
-// 新客户端连接回调
+static inline int forward2client(ProxyConn* conn) {
+    SOCKET_T src_sock = conn->socks5_sock, dst_sock = conn->client_sock;
+    if( conn->rep_buf_len > 0) {
+        int ret = do_send(dst_sock, conn->rep_buf, conn->rep_buf_len);
+        if(ret < 0) return ret;
+        if(ret==conn->rep_buf_len)
+            conn->rep_buf_len = 0;
+        else if(ret > 0) {
+            memmove(conn->rep_buf, conn->rep_buf + ret, conn->rep_buf_len - ret);
+            conn->rep_buf_len -= ret;
+        }
+    }
+
+    int n = sizeof(conn->rep_buf) - conn->rep_buf_len;
+    if (n==0) {
+        XLOGW("[http] forward2client, buffer full, host=%s", conn->host);
+        return 0;
+    }
+
+    int recv_len = do_recv(src_sock, conn->rep_buf + conn->rep_buf_len, n);
+    if (recv_len <= 0)
+        return recv_len;
+    conn->rep_buf_len += recv_len;
+    int ret = do_send(dst_sock, conn->rep_buf, conn->rep_buf_len);
+    if(ret <= 0) return ret;
+    if(ret==conn->rep_buf_len)
+        conn->rep_buf_len = 0;
+    else {
+        memmove(conn->rep_buf, conn->rep_buf + ret, conn->rep_buf_len - ret);
+        conn->rep_buf_len -= ret;
+    }
+    return 0;
+}
+
 static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
@@ -421,10 +561,10 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
     if (conn->state == CONN_STATE_NEW) {
         // New connection: read client request (unparsed)
         int recv_len = recv(conn->client_sock, conn->req_buf + conn->req_buf_len,
-                           conn->req_buf_size - conn->req_buf_len - 1, 0);
+                           sizeof(conn->req_buf) - conn->req_buf_len - 1, 0);
 
         if (recv_len <= 0) {
-            if(!socket_check_eagain()) {
+            if(!socket_check_eagain() && recv_len < 0) {
                 XLOGE("[http] Client socket %d closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
                 close_conn_slot(slot);
             }
@@ -444,21 +584,21 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
                 XLOGE("[http] PAC request handling exception, closing connection");
                 close_conn_slot(slot);
             }
-        } else if (conn->req_buf_len >= conn->req_buf_size - 1) {
+        } else if (conn->req_buf_len >= sizeof(conn->req_buf) - 1) {
             // Request too large
             XLOGE("[http] Request too large, closing connection");
             close_conn_slot(slot);
         }
     } else if (conn->state == CONN_STATE_SOCKS5_OK) {
         // trans to socks5
-        if (forward_data(conn->client_sock, conn->socks5_sock) != 0) {
+        if (forward2socks5(conn) != 0) {
             XLOGE("[Read Callback] Client → Socks5 forwarding failed, closing connection");
             close_conn_slot(slot);
         }
     }
 }
 
-static inline int  socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
+static inline int socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
     // 2. Second step: construct domain name mode connection request (variable length, need dynamic memory allocation)
     int domain_len = strlen(host);
     // Total message length: fixed header (5 bytes) + domain name length (domain_len) + port (2 bytes)
@@ -514,7 +654,7 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
             return;
         }
         if(socks5_send_connect(fd, conn->host, conn->port)!=0) {
-            XLOGE("socks5 domain connect send failed");
+            XLOGE("socks5 domain connect send failed, host=%s", conn->host);
             close_conn_slot(slot);
             return;
         }
@@ -539,17 +679,18 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
 
         // HTTPS needs to return 200 response, establish tunnel
         if (conn->is_https) {
+            conn->req_buf_len = 0;
             https_send_200(conn->client_sock);
             XLOGD("[http] HTTPS tunnel established");
         } else {
-            send(conn->socks5_sock, (const char*)conn->req_buf, conn->req_buf_len, 0);
+            forward2socks5(conn);
             XLOGD("[http] HTTP plaintext request forwarded");
         }
         break;
     }
     case CONN_STATE_SOCKS5_OK:
         // Forward Socks5 server data to client
-        if (forward_data(conn->socks5_sock, conn->client_sock) != 0) {
+        if (forward2client(conn) != 0) {
             XLOGE("[http] Socks5 → Client forwarding failed, closing connection");
             close_conn_slot(slot);
         }

@@ -600,6 +600,16 @@ static int is_admin_request(const char* req_buf, int req_len) {
         }
     }
 
+    // 根路径检查：GET / 或 GET /?... 直接返回管理界面
+    // 请求格式: "GET / " 或 "GET /?xxx" 或 "GET /HTTP"
+    if (req_len >= 6 && req_buf[4] == '/') {
+        char next_char = req_buf[5];
+        // 如果 / 后面是空格、问号或者是 HTTP 协议，说明是根路径
+        if (next_char == ' ' || next_char == '?' ||
+            (req_len >= 8 && strncmp(req_buf + 5, "HTTP/", 5) == 0)) {
+            return 1; // 根路径返回管理界面
+        }
+    }
     return 0;
 }
 
