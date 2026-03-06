@@ -4,6 +4,7 @@
 #include "xpac_server.h"
 #include "xlog.h"
 
+#include <basetsd.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -23,12 +24,18 @@ typedef struct {
     SOCKET_T client_sock;
     SOCKET_T socks5_sock;
     ConnState state;
-    char req_buf[32767];
-    int req_buf_len;
-    char rep_buf[65536];
-    int rep_buf_len;
-    int is_https;
 
+    // request buf
+    char req_buf[32767];
+    int req_head;
+    int req_size;
+
+    // response buf
+    char rep_buf[65536];
+    int rep_head;
+    int rep_size;
+
+    int is_https;
     char host[128];
     uint16_t port;
 } ProxyConn;
@@ -232,16 +239,16 @@ int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_h
 // Initialize connection list
 static int init_conn_list(void) {
     g_conn_list = (ProxyConn*)calloc(g_config.max_conns, sizeof(ProxyConn));
-    if (!g_conn_list) {
+    if ( !g_conn_list )
         return -1;
-    }
 
     for (int i = 0; i < g_config.max_conns; i++) {
         g_conn_list[i].client_sock = INVALID_SOCKET;
         g_conn_list[i].socks5_sock = INVALID_SOCKET;
         g_conn_list[i].state = CONN_STATE_CLOSED;
         g_conn_list[i].is_https = 0;
-        g_conn_list[i].req_buf_len = 0;
+        g_conn_list[i].req_size = 0; g_conn_list[i].req_head = 0;
+        g_conn_list[i].rep_size = 0; g_conn_list[i].rep_head = 0;
         memset(g_conn_list[i].req_buf, 0, sizeof(g_conn_list[i].req_buf));
     }
     g_conn_count = 0;
@@ -276,7 +283,8 @@ static int add_new_client_conn(SOCKET_T client_sock) {
     g_conn_list[slot].client_sock = client_sock;
     g_conn_list[slot].socks5_sock = INVALID_SOCKET;
     g_conn_list[slot].state = CONN_STATE_NEW;
-    g_conn_list[slot].req_buf_len = 0;
+    g_conn_list[slot].req_size = 0; g_conn_list[slot].req_head = 0;
+    g_conn_list[slot].rep_size = 0; g_conn_list[slot].rep_head = 0;
     memset(g_conn_list[slot].req_buf, 0, sizeof(g_conn_list[slot].req_buf));
 
     g_conn_count++;
@@ -307,7 +315,8 @@ static void close_conn_slot(int slot) {
     g_conn_list[slot].client_sock = INVALID_SOCKET;
     g_conn_list[slot].socks5_sock = INVALID_SOCKET;
     g_conn_list[slot].state = CONN_STATE_CLOSED;
-    g_conn_list[slot].req_buf_len = 0;
+    g_conn_list[slot].req_size = 0; g_conn_list[slot].req_head = 0;
+    g_conn_list[slot].rep_size = 0; g_conn_list[slot].rep_head = 0;
     memset(g_conn_list[slot].req_buf, 0, sizeof(g_conn_list[slot].req_buf));
 
     if (g_conn_count > 0) g_conn_count--;
@@ -340,14 +349,14 @@ static void socks5_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clien
 // Handle client request (parse + establish Socks5 connection)
 static int handle_client_request(int slot) {
     ProxyConn* conn = &g_conn_list[slot];
-    if (conn->req_buf_len == 0) return -1;
+    if (conn->req_size == 0) return -1;
 
     // Parse request (distinguish between HTTP/HTTPS)
     int is_https = 0;
-    if (https_parse_connect(conn->req_buf, conn->req_buf_len, conn->host, sizeof(conn->host), &conn->port) == 0) {
+    if (https_parse_connect(conn->req_buf, conn->req_size, conn->host, sizeof(conn->host), &conn->port) == 0) {
         is_https = 1;
         XLOGI("[http] Parsed HTTPS CONNECT request: %s:%d", conn->host, conn->port);
-    } else if (http_parse_request(conn->req_buf, &conn->req_buf_len, sizeof(conn->req_buf), conn->host, sizeof(conn->host), &conn->port) == 0) {
+    } else if (http_parse_request(conn->req_buf, &conn->req_size, sizeof(conn->req_buf), conn->host, sizeof(conn->host), &conn->port) == 0) {
         is_https = 0;
         XLOGI("[http]  Parsed HTTP request: %s:%d", conn->host, conn->port);
     } else {
@@ -359,7 +368,7 @@ static int handle_client_request(int slot) {
     if (strcmp(conn->host, "127.0.0.1") == 0 || strcmp(conn->host, "localhost") == 0) {
         if (conn->port == g_config.listen_port) {
             // Handle management request
-            return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_buf_len)==1?-2:-1;
+            return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_size)==1?-2:-1;
         }
     }
 
@@ -407,7 +416,7 @@ static int handle_client_request(int slot) {
     //     printf("[请求处理] HTTPS 隧道建立完成");
     // } else {
     //     // HTTP 直接转发原始请求到目标服务器
-    //     send(socks5_sock, (const char*)conn->req_buf, conn->req_buf_len, 0);
+    //     send(socks5_sock, (const char*)conn->req_buf, conn->req_size, 0);
     //     printf("[请求处理] HTTP 明文请求转发完成");
     // }
 
@@ -417,7 +426,7 @@ static int handle_client_request(int slot) {
     conn->is_https = is_https;
 
     if (xpoll_add_event(g_xpoll, socks5_sock, XPOLL_READABLE,
-                        socks5_read_cb, NULL, socks5_error_cb, (void*)(long)slot) != 0) {
+                        socks5_read_cb, NULL, socks5_error_cb, (void*)(INT_PTR)slot) != 0) {
         XLOGE("[http] Failed to register SOCKS5 socket event");
         CLOSE_SOCKET(socks5_sock);
         return -1;
@@ -428,100 +437,104 @@ static int handle_client_request(int slot) {
     return 0;
 }
 
-static inline int do_recv(SOCKET_T s, char* buf, int len) {
-    int recv_len = recv(s, buf, len, 0);
-    if( recv_len ==0 ) {
-        XLOGE("[http] forward recv, peer close target_fd=%d", (int)s);
-        return -1;
-    } else if (recv_len < 0) {
-        if( socket_check_eagain() ){
-            XLOGW("[http] forward recv, got eagain target_fd=%d", (int)s);
-            return 0;
-        }
-        XLOGE("[http] forward recv, got failed target_fd=%d", (int)s);
-        return -1;
+// Ring send: sends data from the head pointer (head) and swipes the head pointer backwards after sending
+static int rb_send(SOCKET_T fd, char* buf, int capacity, int* head, int* size) {
+    if (*size == 0) return 0; // no data
+
+    // Calculate contiguous memory length to the end of the physics
+    int contiguous_data = capacity - *head;
+    if (contiguous_data > *size)
+        contiguous_data = *size; // If not reversed, only the length owned is actually issued
+
+    int ret = send(fd, buf + *head, contiguous_data, 0);
+    if (ret > 0) {
+        *head = (*head + ret) % capacity; // Move the read pointer (may wrap around 0)
+        *size -= ret;                     // reduce sent
     }
-    return recv_len;
+    return ret;
 }
 
-static inline int do_send(SOCKET_T s, char* buf, int len) {
-    int send_len = send(s, buf, len, 0);
-    if (send_len < 0) {
-        if (socket_check_eagain()) {
-            XLOGW("[http] forward send eagain target_fd=%d", (int)s);
-            return 0;
-        }
-        XLOGE("[http] forward send, got failed target_fd=%d", (int)s);
-        return -1;
+// Ring reception: find the tail pointer gap and read the network card data into
+static int rb_recv(SOCKET_T fd, char* buf, int capacity, int* head, int* size) {
+    if (*size == capacity) return 0; // 缓冲区满
+
+    // If the buffer is empty, reset the pointer immediately for maximum continuous read space
+    if (*size == 0)
+        *head = 0;
+
+    int tail = (*head + *size) % capacity;
+    int contiguous_space;
+
+    if (tail >= *head) {
+        // The tail is on the right side of the read pointer, first read to the end of the physics
+        contiguous_space = capacity - tail;
+    } else {
+        // has been folded back, the tail is on the left side of the reading pointer, you can only read
+        contiguous_space = *head - tail;
     }
-    return send_len;
+
+    int ret = recv(fd, buf + tail, contiguous_space, 0);
+    if (ret > 0) {
+        *size += ret;
+    }
+    return ret;
 }
 
-static inline int forward2socks5(ProxyConn* conn) {
-    SOCKET_T src_sock = conn->client_sock, dst_sock = conn->socks5_sock;
-    if( conn->req_buf_len > 0) {
-        int ret = do_send(dst_sock, conn->req_buf, conn->req_buf_len);
-        if(ret < 0) return ret;
-        if(ret==conn->req_buf_len)
-            conn->req_buf_len = 0;
-        else if(ret > 0) {
-            memmove(conn->req_buf, conn->req_buf + ret, conn->req_buf_len - ret);
-            conn->req_buf_len -= ret;
+static int forward2socks5(ProxyConn* conn) {
+    // 1. Send existing backlog data in buf to socks5 as much as possible
+    if (conn->req_size > 0) {
+        int ret = rb_send(conn->socks5_sock, conn->req_buf, sizeof(conn->req_buf),
+                          &conn->req_head, &conn->req_size);
+        if (ret < 0 && !socket_check_eagain()) {
+            XLOGE("[http] forward2socks5 send failed");
+            return -1;
         }
     }
 
-    int n = sizeof(conn->req_buf) - conn->req_buf_len;
-    if (n==0) {
-        XLOGW("[http] forward2socks5, buffer full, host=%s", conn->host);
-        return 0;
+    // 2. Read new data from client if buf is still free
+    if (conn->req_size < sizeof(conn->req_buf)) {
+        int ret = rb_recv(conn->client_sock, conn->req_buf, sizeof(conn->req_buf),
+                          &conn->req_head, &conn->req_size);
+        if (ret == 0) {
+            XLOGE("[http] forward2socks5, client closed");
+            return -1; // 对端关闭
+        } else if (ret < 0 && !socket_check_eagain()) {
+            XLOGE("[http] forward2socks5 recv failed");
+            return -1;
+        }
     }
 
-    int recv_len = do_recv(src_sock, conn->req_buf + conn->req_buf_len, n);
-    if (recv_len <= 0)
-        return recv_len;
-    conn->req_buf_len += recv_len;
-    int ret = do_send(dst_sock, conn->req_buf, conn->req_buf_len);
-    if(ret <= 0) return ret;
-    if(ret==conn->req_buf_len)
-        conn->req_buf_len = 0;
-    else {
-        memmove(conn->req_buf, conn->req_buf + ret, conn->req_buf_len - ret);
-        conn->req_buf_len -= ret;
+    // 3. If you just read the new data, take advantage of the system call and send it again
+    if (conn->req_size > 0) {
+        int ret = rb_send(conn->socks5_sock, conn->req_buf, sizeof(conn->req_buf),
+                          &conn->req_head, &conn->req_size);
+        if (ret < 0 && !socket_check_eagain()) return -1;
     }
+
     return 0;
 }
 
-static inline int forward2client(ProxyConn* conn) {
-    SOCKET_T src_sock = conn->socks5_sock, dst_sock = conn->client_sock;
-    if( conn->rep_buf_len > 0) {
-        int ret = do_send(dst_sock, conn->rep_buf, conn->rep_buf_len);
-        if(ret < 0) return ret;
-        if(ret==conn->rep_buf_len)
-            conn->rep_buf_len = 0;
-        else if(ret > 0) {
-            memmove(conn->rep_buf, conn->rep_buf + ret, conn->rep_buf_len - ret);
-            conn->rep_buf_len -= ret;
-        }
+static int forward2client(ProxyConn* conn) {
+    // The logic is exactly the same as above, only in the opposite direction
+    if (conn->rep_size > 0) {
+        int ret = rb_send(conn->client_sock, conn->rep_buf, sizeof(conn->rep_buf),
+                          &conn->rep_head, &conn->rep_size);
+        if (ret < 0 && !socket_check_eagain()) return -1;
     }
 
-    int n = sizeof(conn->rep_buf) - conn->rep_buf_len;
-    if (n==0) {
-        XLOGW("[http] forward2client, buffer full, host=%s", conn->host);
-        return 0;
+    if (conn->rep_size < sizeof(conn->rep_buf)) {
+        int ret = rb_recv(conn->socks5_sock, conn->rep_buf, sizeof(conn->rep_buf),
+                          &conn->rep_head, &conn->rep_size);
+        if (ret == 0) return -1;
+        if (ret < 0 && !socket_check_eagain()) return -1;
     }
 
-    int recv_len = do_recv(src_sock, conn->rep_buf + conn->rep_buf_len, n);
-    if (recv_len <= 0)
-        return recv_len;
-    conn->rep_buf_len += recv_len;
-    int ret = do_send(dst_sock, conn->rep_buf, conn->rep_buf_len);
-    if(ret <= 0) return ret;
-    if(ret==conn->rep_buf_len)
-        conn->rep_buf_len = 0;
-    else {
-        memmove(conn->rep_buf, conn->rep_buf + ret, conn->rep_buf_len - ret);
-        conn->rep_buf_len -= ret;
+    if (conn->rep_size > 0) {
+        int ret = rb_send(conn->client_sock, conn->rep_buf, sizeof(conn->rep_buf),
+                          &conn->rep_head, &conn->rep_size);
+        if (ret < 0 && !socket_check_eagain()) return -1;
     }
+
     return 0;
 }
 
@@ -542,7 +555,7 @@ static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData)
             return;
         }
         if (xpoll_add_event(g_xpoll, client_sock, XPOLL_READABLE,
-                            client_read_cb, NULL, client_error_cb, (void*)(long)slot) != 0) {
+                            client_read_cb, NULL, client_error_cb, (void*)(INT_PTR)slot) != 0) {
             XLOGE("[http] Connection list full, rejecting new connection");
             close_conn_slot(slot);
         }
@@ -560,8 +573,8 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
 
     if (conn->state == CONN_STATE_NEW) {
         // New connection: read client request (unparsed)
-        int recv_len = recv(conn->client_sock, conn->req_buf + conn->req_buf_len,
-                           sizeof(conn->req_buf) - conn->req_buf_len - 1, 0);
+        int recv_len = recv(conn->client_sock, conn->req_buf + conn->req_size,
+                           sizeof(conn->req_buf) - conn->req_size - 1, 0);
 
         if (recv_len <= 0) {
             if(!socket_check_eagain() && recv_len < 0) {
@@ -572,8 +585,8 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
         }
 
         // Update request buffer length
-        conn->req_buf_len += recv_len;
-        conn->req_buf[conn->req_buf_len] = '\0';
+        conn->req_size += recv_len;
+        conn->req_buf[conn->req_size] = '\0';
 
         // Try to parse request (complete request received)
         if (strstr(conn->req_buf, "\r\n\r\n") != NULL) {
@@ -584,7 +597,7 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
                 XLOGE("[http] PAC request handling exception, closing connection");
                 close_conn_slot(slot);
             }
-        } else if (conn->req_buf_len >= sizeof(conn->req_buf) - 1) {
+        } else if (conn->req_size >= sizeof(conn->req_buf) - 1) {
             // Request too large
             XLOGE("[http] Request too large, closing connection");
             close_conn_slot(slot);
@@ -679,7 +692,8 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
 
         // HTTPS needs to return 200 response, establish tunnel
         if (conn->is_https) {
-            conn->req_buf_len = 0;
+            conn->req_size = 0;conn->req_head = 0;
+            conn->rep_size = 0;conn->rep_head = 0;
             https_send_200(conn->client_sock);
             XLOGD("[http] HTTPS tunnel established");
         } else {
