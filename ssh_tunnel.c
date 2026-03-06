@@ -281,10 +281,15 @@ SOCKET_T wolfSSH_session_get_socket(WOLFSSH* ssh) {
 }
 
 int wolfSSH_process_events(WOLFSSH* ssh, word32* channelId) {
-    if (!ssh) {
+    if (!ssh)
         return -1;
-    }
-    return wolfSSH_worker(ssh, channelId);
+
+    int ret = wolfSSH_worker(ssh, channelId);
+    if(ret >=0 ) return ret;
+    if (is_temporary_state(wolfSSH_get_error(ssh)))
+        return 0;
+
+    return ret;
 }
 
 int wolfSSH_session_keepalive(WOLFSSH* session) {
