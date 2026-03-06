@@ -792,7 +792,7 @@ int https_proxy_start(const HttpProxyConfig* config, xPollState *xpoll) {
         return -1;
     }
 
-    XLOGI("[http] HTTP/HTTPS proxy service started successfully, listening on port: %d", g_config.listen_port);
+    XLOGI("[http] HTTP/HTTPS sevice started, port: %d", g_config.listen_port);
     return 0;
 }
 

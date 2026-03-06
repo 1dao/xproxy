@@ -5,11 +5,12 @@
 #include "xpac_server.h"
 #include "xargs.h"
 #include "xpoll.h"
+#include "xlog.h"
 #include "socks5_server.h"
 #include "https_proxy.h"
 #include "xpac_server.h"
 
-static int g_running = 0;
+int g_running = 0;
 
 // Signal handler function
 void signal_handler(int sig) {
@@ -147,7 +148,13 @@ void show_help(const char *prog_name) {
     printf("  %s -l 1080 -t 7890 -b 192.168.1.100\n", prog_name);
 }
 
+#ifdef __ANDROID__
+int xproxy_main(int argc, char *argv[]) {
+#else
 int main(int argc, char *argv[]) {
+#endif
+    XLOGI("[VPN] xproxy_main prepare to start with argc=%d", argc);
+
     console_set_consolas_font();
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -203,9 +210,9 @@ int main(int argc, char *argv[]) {
 
     // Interactive mode for SOCKS5 server if no SSH args provided
     if (!has_ssh_args && enable_http) {
-        printf("No SSH arguments provided, running HTTP proxy only...\n\n");
+        XLOGE("No SSH arguments provided, running HTTP proxy only...");
     } else if (!has_ssh_args && !enable_http) {
-        fprintf(stderr, "Error: No SSH arguments provided and HTTP proxy is disabled\n");
+        XLOGE("Error: No SSH arguments provided and HTTP proxy is disabled");
         show_help(argv[0]);
         xargs_cleanup();
         return EXIT_FAILURE;
@@ -224,7 +231,7 @@ int main(int argc, char *argv[]) {
             interactive_config(&config);
 
             if (strlen(config.ssh_host) == 0) {
-                fprintf(stderr, "Error: SSH server address cannot be empty\n");
+                XLOGE("Error: SSH server address cannot be empty");
                 xargs_cleanup();
                 return EXIT_FAILURE;
             }
@@ -235,7 +242,7 @@ int main(int argc, char *argv[]) {
 
     // Initialize socket library
     if (socket_init() != 0) {
-        fprintf(stderr, "Socket library initialization failed\n");
+        XLOGE("Socket library initialization failed");
         xargs_cleanup();
         return EXIT_FAILURE;
     }
@@ -243,7 +250,7 @@ int main(int argc, char *argv[]) {
     // Create global xpoll instance
     xPollState *xpoll = xpoll_create();
     if (!xpoll) {
-        fprintf(stderr, "Failed to create xpoll loop\n");
+        XLOGE("Failed to create xpoll loop");
         socket_cleanup();
         xargs_cleanup();
         return EXIT_FAILURE;
@@ -268,12 +275,12 @@ int main(int argc, char *argv[]) {
         printf("========================================\n");
         printf("Bind Address: %s\n", socks5_config.bind_address);
         printf("Bind Port:    %d\n", socks5_config.bind_port);
-        printf("SSH Server:    %s:%d\n", socks5_config.ssh_host, socks5_config.ssh_port);
-        printf("SSH Username:  %s\n", socks5_config.ssh_username);
+        printf("SSH Server:   %s:%d\n", socks5_config.ssh_host, socks5_config.ssh_port);
+        printf("SSH Username: %s\n", socks5_config.ssh_username);
         printf("========================================\n\n");
 
         if (socks5_server_start(&socks5_config, xpoll) != 0) {
-            fprintf(stderr, "Failed to start SOCKS5 server\n");
+            XLOGE("Failed to start SOCKS5 server\n");
             xpoll_free(xpoll);
             socket_cleanup();
             xargs_cleanup();
@@ -296,18 +303,18 @@ int main(int argc, char *argv[]) {
         strncpy(http_config.socks5_server_ip, bind_addr, sizeof(http_config.socks5_server_ip) - 1);
         http_config.socks5_server_ip[sizeof(http_config.socks5_server_ip) - 1] = '\0';
 
-        printf("\n========================================\n");
-        printf("  HTTP/HTTPS to SOCKS5 Proxy\n");
-        printf("========================================\n");
-        printf("HTTP Proxy Port:    %d\n", http_config.listen_port);
-        printf("SOCKS5 Backend:     %s:%d\n",
+        XLOGI("\n========================================");
+        XLOGI("  HTTP/HTTPS to SOCKS5 Proxy");
+        XLOGI("========================================");
+        XLOGI("HTTP Proxy Port:    %d", http_config.listen_port);
+        XLOGI("SOCKS5 Backend:     %s:%d",
                http_config.socks5_server_ip,
                http_config.socks5_server_port);
-        printf("Max Connections:    %d\n", http_config.max_conns);
-        printf("========================================\n");
+        XLOGI("Max Connections:    %d", http_config.max_conns);
+        XLOGI("========================================");
 
         if (https_proxy_start(&http_config, xpoll) != 0) {
-            fprintf(stderr, "Failed to start HTTP/HTTPS proxy\n");
+            XLOGE("Failed to start HTTP/HTTPS proxy");
             if (socks5_started) {
                 socks5_server_stop();
             }
@@ -328,13 +335,13 @@ int main(int argc, char *argv[]) {
         };
         xpac_init(&pac_config);
 
-        printf("\nPAC Files:\n");
-        printf("  http://127.0.0.1:%d/proxy.pac\n", http_config.listen_port);
-        printf("  http://127.0.0.1:%d/proxy.socks5.pac\n", http_config.listen_port);
-        printf("  http://127.0.0.1:%d/proxy.http.pac\n", http_config.listen_port);
-        printf("\nWeb Admin Interface:\n");
-        printf("  http://127.0.0.1:%d/admin\n", http_config.listen_port);
-        printf("\n");
+        XLOGI("\nPAC Files:");
+        XLOGI("  http://127.0.0.1:%d/proxy.pac", http_config.listen_port);
+        XLOGI("  http://127.0.0.1:%d/proxy.socks5.pac", http_config.listen_port);
+        XLOGI("  http://127.0.0.1:%d/proxy.http.pac", http_config.listen_port);
+        XLOGI("\nWeb Admin Interface:");
+        XLOGI("  http://127.0.0.1:%d/admin", http_config.listen_port);
+        XLOGI("\n");
     }
 
     printf("Press Ctrl+C to stop\n");
