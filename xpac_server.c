@@ -18,7 +18,7 @@
 
 // ===================== 域名规则结构 =====================
 typedef struct DomainRule {
-    char pattern[64];            // 域名匹配模式（如 "*.google.com"）
+    char pattern[256];            // 域名匹配模式（如 "*.google.com"）
     ProxyType proxy_type;         // 代理类型
     struct DomainRule* next;      // 链表下一个节点
 } DomainRule;
@@ -480,23 +480,30 @@ static char* xpac_generate_pac_content(int pac_type) {
 
             // 生成域名匹配条件
             // 注意：shExpMatch支持通配符模式
-            if (strncmp(current->pattern, "*.", 2) == 0) {
-                // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
-                pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-                    "    }\n"
-                    "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-                    "    }\n",
-                    current->pattern, proxy_str, port, current->pattern+2, proxy_str, port);  // 跳过 '*' 字符
-            } else {
-                pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-                    "    }\n",
-                    current->pattern, proxy_str, port);
-            }
+            // if (strncmp(current->pattern, "*.", 2) == 0) {
+            //     // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
+            //     pos += snprintf(pac_content + pos, buffer_size - pos,
+            //         "    if (shExpMatch(host, \"%s\")) {\n"
+            //         "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+            //         "    }\n"
+            //         "    if (shExpMatch(host, \"%s\")) {\n"
+            //         "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+            //         "    }\n",
+            //         current->pattern, proxy_str, port, current->pattern+2, proxy_str, port);  // 跳过 '*' 字符
+            // } else {
+            //     pos += snprintf(pac_content + pos, buffer_size - pos,
+            //         "    if (shExpMatch(host, \"%s\")) {\n"
+            //         "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+            //         "    }\n",
+            //         current->pattern, proxy_str, port);
+            // }
+
+            // 注意：shExpMatch支持通配符模式，*.example.com 匹配 example.com 和所有子域名
+            pos += snprintf(pac_content + pos, buffer_size - pos,
+                "    if (shExpMatch(host, \"%s\")) {\n"
+                "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                "    }\n",
+                current->pattern, proxy_str, port);
 
             current = current->next;
         }
@@ -536,9 +543,9 @@ static int is_pac_request(const char* req_buf, int req_len) {
         return 0; // 不是GET请求
     if (req_len >= 14 && strncmp(req_buf + 5, "proxy.pac", 9) == 0)
         return 1; // proxy.pac request
-    if (req_len >= 17 && strncmp(req_buf + 5, "proxy.socks5.pac", 13) == 0)
+    if (req_len >= 21 && strncmp(req_buf + 5, "proxy.socks5.pac", 16) == 0)
         return 2; // proxy.socks5.pac
-    if (req_len >= 18 && strncmp(req_buf + 5, "proxy.http.pac", 13) == 0)
+    if (req_len >= 19 && strncmp(req_buf + 5, "proxy.http.pac", 14) == 0)
         return 3; // proxy.http.pac
 
     return 0;
@@ -698,7 +705,7 @@ static const char* generate_admin_html(void) {
     printf("[PAC-DEBUG] domain_list=%p, domain_rows will be generated\n", (void*)g_domain_list);
 
     // 生成域名规则表格行
-    char domain_rows[8192] = {0};
+    static char domain_rows[20480] = {0};
     DomainRule* current = g_domain_list;
     int pos = 0;
     int row_count = 0;
