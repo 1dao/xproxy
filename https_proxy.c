@@ -39,7 +39,7 @@ typedef struct {
     int rep_size;
 
     int is_https;
-    char host[128];
+    char host[255];
     uint16_t port;
 } ProxyConn;
 
@@ -176,9 +176,7 @@ static int convert_http_request_inplace(char* req_buf, int* req_len, int buf_siz
         int remaining_len = *req_len - space2_offset;
 
         // Move path to right after method
-        memmove(req_buf + method_len + 1, slash, path_len + remaining_len);
         *req_len = method_len + 1 + path_len + remaining_len;
-
         // Safety check: ensure we don't exceed buffer
         if (*req_len >= buf_size) {
             XLOGE("[http] slash convert_http_request_inplace overwrite...");
@@ -186,6 +184,7 @@ static int convert_http_request_inplace(char* req_buf, int* req_len, int buf_siz
             XLOGE("[http] slash convert_http_request_inplace overwrite...");
             return -1;
         }
+        memmove(req_buf + method_len + 1, slash, path_len + remaining_len);
         req_buf[*req_len] = '\0';  // Ensure null termination
     }
 
@@ -580,7 +579,10 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
                            sizeof(conn->req_buf) - conn->req_size - 1, 0);
 
         if (recv_len <= 0) {
-            if(!socket_check_eagain() && recv_len < 0) {
+            if(recv_len==0) {
+                XLOGE("[http] Client socket %d peer closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
+                close_conn_slot(slot);
+            }else if(!socket_check_eagain()) {
                 XLOGE("[http] Client socket %d closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
                 close_conn_slot(slot);
             }
@@ -756,7 +758,7 @@ int https_proxy_start(const HttpProxyConfig* config, xPollState *xpoll) {
 
     // Set socket reusable
     int opt = 1;
-    //setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     // Bind port
     struct sockaddr_in listen_addr = {

@@ -37,9 +37,9 @@ typedef struct {
     uint16_t client_port;
 
     // IO buffers and state
-    char rbuf[131070]; // ssh read
+    char rbuf[131072]; // ssh read
     int rlen;
-    char wbuf[65535];// ssh write
+    char wbuf[65536];// ssh write
     int wlen;
 
     // reopen cd
@@ -296,16 +296,8 @@ static bool ssh_read_each_client(xhashNode *node, void* ud) {
     (void)ud;
     // Get client from hash node
     Socks5Client *client = (Socks5Client*)node->value;
-    if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel) {
+    if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel)
         return true;  // Continue to next client
-    }
-
-    // If client state is ERROR, clean up immediately and remove from hash table
-    if (client->state == SOCKS5_STATE_ERROR) {
-        XLOGE("Cleaning up error client fd=%d", (int)client->client_sock);
-        // socks5_client_cleanup(g_xpoll, client->client_sock, client);
-        return true;
-    }
 
     if (client->rlen < 0 || client->rlen >= sizeof(client->rbuf)) {
         XLOGE("Warning: Invalid rlen=%d, resetting to 0 for fd=%d",
@@ -967,11 +959,13 @@ void socks5_server_stop(void) {
         XLOGI("SOCKS5 listening socket closed");
     }
 
-    SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_session);
-    xhash* hash = (xhash*)xpoll_get_client_data(g_xpoll, ssh_sock);
-    if(hash) {
-        xhash_foreach(hash, client_on_closed, NULL);
-        xhash_destroy(hash, false);
+    if( g_ssh_session ) {
+        SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_session);
+        xhash* hash = (xhash*)xpoll_get_client_data(g_xpoll, ssh_sock);
+        if(hash) {
+            xhash_foreach(hash, client_on_closed, NULL);
+            xhash_destroy(hash, false);
+        }
     }
 
     g_server_running = 0;
