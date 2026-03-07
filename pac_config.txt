@@ -3,6 +3,18 @@
 # 示例：*.google.com socks5
 #        *.xxx.com http
 
+*.facebook.net socks5
+*.intellimizeio.com socks5
+*.anthropic.com socks5
+*.amplitude.com socks5
+*.unpkg.com socks5
+*.jsdelivr.net socks5
+*.cloudfront.net socks5
+*.intellimize.co socks5
+*.website-files.com socks5
+*.claude.com socks5
+*.claude.ai socks5
+*.amplitude.com socks5
 *.android.com socks5
 *.truthsocial.com socks5
 *.manus.im socks5
