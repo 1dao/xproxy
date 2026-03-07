@@ -11,10 +11,10 @@
 *.jsdelivr.net socks5
 *.cloudfront.net socks5
 *.intellimize.co socks5
+*.intercom.io socks5
 *.website-files.com socks5
 *.claude.com socks5
 *.claude.ai socks5
-*.amplitude.com socks5
 *.android.com socks5
 *.truthsocial.com socks5
 *.manus.im socks5
@@ -80,10 +80,3 @@
 *.facebook.com socks5
 *.twitter.com socks5
 *.amazon.com socks5
-*.sf.net socks5
-*.sourceforge.net socks5
-*.githubusercontent.com socks5
-*.github.io socks5
-*.github.com socks5
-*.githubassets.com socks5
-*.githubcopilot.com socks5

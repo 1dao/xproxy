@@ -477,34 +477,24 @@ static char* xpac_generate_pac_content(int pac_type) {
                 port = g_config.http_proxy_port;
             }
 
-
             // 生成域名匹配条件
-            // 注意：shExpMatch支持通配符模式
-            // if (strncmp(current->pattern, "*.", 2) == 0) {
-            //     // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
-            //     pos += snprintf(pac_content + pos, buffer_size - pos,
-            //         "    if (shExpMatch(host, \"%s\")) {\n"
-            //         "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-            //         "    }\n"
-            //         "    if (shExpMatch(host, \"%s\")) {\n"
-            //         "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-            //         "    }\n",
-            //         current->pattern, proxy_str, port, current->pattern+2, proxy_str, port);  // 跳过 '*' 字符
-            // } else {
-            //     pos += snprintf(pac_content + pos, buffer_size - pos,
-            //         "    if (shExpMatch(host, \"%s\")) {\n"
-            //         "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-            //         "    }\n",
-            //         current->pattern, proxy_str, port);
-            // }
-
-            // 注意：shExpMatch支持通配符模式，*.example.com 匹配 example.com 和所有子域名
-            pos += snprintf(pac_content + pos, buffer_size - pos,
-                "    if (shExpMatch(host, \"%s\")) {\n"
-                "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
-                "    }\n",
-                current->pattern, proxy_str, port);
-
+            if (strncmp(current->pattern, "*.", 2) == 0) {
+                // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
+                pos += snprintf(pac_content + pos, buffer_size - pos,
+                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "    }\n"
+                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "    }\n",
+                    current->pattern, proxy_str, port, current->pattern+2, proxy_str, port);  // 跳过 '*' 字符
+            } else {
+                pos += snprintf(pac_content + pos, buffer_size - pos,
+                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "    }\n",
+                    current->pattern, proxy_str, port);
+            }
             current = current->next;
         }
     }
@@ -673,6 +663,24 @@ static void send_error_response(SOCKET_T client_sock, int code, const char* mess
     send(client_sock, body, strlen(body), 0);
 }
 
+static void url_decode(const char* src, char* dst, int dst_len) {
+    int i = 0, j = 0;
+    while (src[i] && j < dst_len - 1) {
+        if (src[i] == '%' && isxdigit((unsigned char)src[i+1])
+                          && isxdigit((unsigned char)src[i+2])) {
+            char hex[3] = { src[i+1], src[i+2], '\0' };
+            dst[j++] = (char)strtol(hex, NULL, 16);
+            i += 3;
+        } else if (src[i] == '+') {
+            dst[j++] = ' ';
+            i++;
+        } else {
+            dst[j++] = src[i++];
+        }
+    }
+    dst[j] = '\0';
+}
+
 // 从查询字符串中提取参数
 static const char* get_query_param(const char* query_str, const char* key,
                                   char* buffer, int buf_len) {
@@ -692,6 +700,10 @@ static const char* get_query_param(const char* query_str, const char* key,
     }
     buffer[i] = '\0';
 
+    char decoded[256];
+    url_decode(buffer, decoded, sizeof(decoded));
+    strncpy(buffer, decoded, buf_len - 1);
+    buffer[buf_len - 1] = '\0';
     return buffer;
 }
 
