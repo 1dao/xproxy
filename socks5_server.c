@@ -409,7 +409,6 @@ static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDat
 static bool ssh_write_each_client(xhashNode *node, void * ctx) {
     // Get client from hash node
     Socks5Client *client = (Socks5Client*)node->value;
-
     if (!client || client->state != SOCKS5_STATE_CONNECTED ||
         !client->ssh_channel || client->wlen == 0) {
         return true;  // Continue to next client
@@ -948,6 +947,7 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
 
 void socks5_server_stop(void) {
     if(g_server_running==0) return;
+    XLOGW("[socks5] try stop socks5 service...");
 
     // Close listening socket and remove from xpoll
     if (g_listen_sock != INVALID_SOCKET) {
@@ -971,4 +971,5 @@ void socks5_server_stop(void) {
     g_server_running = 0;
     g_xpoll = NULL;
     g_ssh_session = NULL;
+    XLOGW("[socks5] socks5 service stoped");
 }

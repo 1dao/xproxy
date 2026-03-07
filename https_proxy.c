@@ -16,6 +16,7 @@
 // ===================== Connection State =====================
 typedef enum {
     CONN_STATE_NEW,
+    CONN_STATE_TCP_CONNECTING,
     CONN_STATE_AUTHING,
     CONN_STATE_CONNECTING,
     CONN_STATE_SOCKS5_OK,
@@ -344,12 +345,111 @@ static void cleanup_conn_list(void) {
 static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
+static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void client_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void socks5_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 
 // ===================== Core Processing Functions =====================
 // Handle client request (parse + establish Socks5 connection)
 static int handle_client_request(int slot) {
+    ProxyConn* conn = &g_conn_list[slot];
+    if (conn->req_size == 0) return -1;
+
+    // Parse request (distinguish between HTTP/HTTPS)
+    int is_https = 0;
+    if (https_parse_connect(conn->req_buf, conn->req_size, conn->host, sizeof(conn->host), &conn->port) == 0) {
+        is_https = 1;
+        XLOGI("[http] Parsed HTTPS CONNECT request: %s:%d", conn->host, conn->port);
+    } else if (http_parse_request(conn->req_buf, &conn->req_size, sizeof(conn->req_buf), conn->host, sizeof(conn->host), &conn->port) == 0) {
+        is_https = 0;
+        XLOGI("[http]  Parsed HTTP request: %s:%d", conn->host, conn->port);
+    } else {
+        XLOGE("[http] Invalid request, closing connection");
+        return -1;
+    }
+
+    // First check if it's a PAC request or management request
+    if (strcmp(conn->host, "127.0.0.1") == 0 || strcmp(conn->host, "localhost") == 0) {
+        if (conn->port == g_config.listen_port) {
+            // Handle management request
+            return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_size)==1?-2:-1;
+        }
+    }
+
+    SOCKET_T socks5_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (socks5_sock == INVALID_SOCKET) {
+        XLOGE("[http] create socks5 socket failed");
+        CLOSE_SOCKET(socks5_sock);
+        return -1;
+    }
+
+    // ✅ set noblocking before connect
+    socket_set_nonblocking(socks5_sock);
+
+    struct sockaddr_in socks5_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = inet_addr(g_config.socks5_server_ip),
+        .sin_port = htons(g_config.socks5_server_port)
+    };
+
+    int ret = connect(socks5_sock, (struct sockaddr*)&socks5_addr, sizeof(socks5_addr));
+    if (ret != 0) {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        int in_progress = (err == WSAEWOULDBLOCK);
+#else
+        int in_progress = (errno == EINPROGRESS);
+#endif
+        if (!in_progress) {
+            // connect failed
+            XLOGE("[http] connect() failed immediately, host=%s", conn->host);
+            CLOSE_SOCKET(socks5_sock);
+            return -1;
+        }
+
+        // EINPROGRESS：connecting
+        conn->socks5_sock = socks5_sock;
+        conn->state = CONN_STATE_TCP_CONNECTING;
+        conn->is_https = is_https;
+
+        // ✅ reg WRITABLE ev，wait connect fini
+        if (xpoll_add_event(g_xpoll, socks5_sock,
+                            XPOLL_WRITABLE | XPOLL_ERROR,
+                            NULL,
+                            socks5_write_cb,
+                            socks5_error_cb,
+                            (void*)(INT_PTR)slot) != 0) {
+            XLOGE("[http] Failed to register SOCKS5 connect event");
+            CLOSE_SOCKET(socks5_sock);
+            return -1;
+        }
+    } else {
+        // ret == 0：connected，send handshark
+        XLOGD("[http] connect() succeeded immediately, host=%s", conn->host);
+        uint8_t handshake_req[] = {0x05, 0x01, 0x00};
+        if (send(socks5_sock, (const char*)handshake_req, sizeof(handshake_req), 0) <= 0) {
+            XLOGE("[http] socks5 handshake send failed");
+            CLOSE_SOCKET(socks5_sock);
+            return -1;
+        }
+
+        conn->socks5_sock = socks5_sock;
+        conn->state = CONN_STATE_AUTHING;
+        conn->is_https = is_https;
+
+        if (xpoll_add_event(g_xpoll, socks5_sock,
+                            XPOLL_READABLE | XPOLL_ERROR,
+                            socks5_read_cb, NULL, socks5_error_cb,
+                            (void*)(INT_PTR)slot) != 0) {
+            XLOGE("[http] Failed to register SOCKS5 read event");
+            CLOSE_SOCKET(socks5_sock);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int handle_client_request_old(int slot) {
     ProxyConn* conn = &g_conn_list[slot];
     if (conn->req_size == 0) return -1;
 
@@ -499,7 +599,7 @@ static int forward2socks5(ProxyConn* conn) {
                           &conn->req_head, &conn->req_size);
         if (ret == 0) {
             XLOGE("[http] forward2socks5, client closed");
-            return -1; // 对端关闭
+            return -1; // peer closed
         } else if (ret < 0 && !socket_check_eagain()) {
             XLOGE("[http] forward2socks5 recv failed");
             return -1;
@@ -661,7 +761,7 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
     case CONN_STATE_AUTHING:{
         // Receive handshake response
         uint8_t handshake_resp[2];
-        if (recv(fd, handshake_resp, sizeof(handshake_resp), 0) <= 0) {
+        if (recv(fd, (char*)handshake_resp, sizeof(handshake_resp), 0) <= 0) {
             XLOGE("socks5 domain handshake recv failed");
             close_conn_slot(slot);
             return;
@@ -716,6 +816,42 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
         break;
     default:
         break;
+    }
+}
+
+static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    int slot = (int)(intptr_t)clientData;
+    if (slot < 0 || slot >= g_config.max_conns) return;
+
+    ProxyConn* conn = &g_conn_list[slot];
+
+    if (conn->state == CONN_STATE_TCP_CONNECTING) {
+        // ✅ using getsockopt(SO_ERROR) confirm connect ok
+        int err = 0;
+        socklen_t errlen = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&err, &errlen) != 0 || err != 0) {
+            XLOGE("[http] async connect failed, SO_ERROR=%d, host=%s", err, conn->host);
+            close_conn_slot(slot);
+            return;
+        }
+
+        XLOGD("[http] async connect succeeded, host=%s:%d", conn->host, conn->port);
+
+        // connected：send SOCKS5 hanshark
+        uint8_t handshake_req[] = {0x05, 0x01, 0x00};
+        if (send(fd, (const char*)handshake_req, sizeof(handshake_req), 0) <= 0) {
+            XLOGE("[http] socks5 handshake send failed");
+            close_conn_slot(slot);
+            return;
+        }
+
+        conn->state = CONN_STATE_AUTHING;
+
+        // remove write ev,add read ev
+        xpoll_add_event(loop, fd, XPOLL_READABLE,
+                        socks5_read_cb, NULL, socks5_error_cb,
+                        (void*)(INT_PTR)slot);
+        xpoll_del_event(loop, fd, XPOLL_WRITABLE);
     }
 }
 
