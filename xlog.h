@@ -1,11 +1,11 @@
 #ifndef XLOG_H
 #define XLOG_H
 
-
-#ifdef __ANDROID__
 #ifndef LOG_TAG
 #define LOG_TAG "socks5_server"
 #endif
+
+#ifdef __ANDROID__
 #include <android/log.h>
 #include <stdio.h>
 
@@ -56,6 +56,7 @@ extern void native_log_to_java(int level, const char* tag, const char* msg);
     char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_FATAL, LOG_TAG, _buf); \
 } while(0)
 #else
+
 // VT100 颜色代码
 #define XLOG_COLOR_RED     "\033[31m"
 #define XLOG_COLOR_GREEN   "\033[32m"
@@ -67,12 +68,42 @@ extern void native_log_to_java(int level, const char* tag, const char* msg);
 #define XLOG_COLOR_GRAY    "\033[90m"
 #define XLOG_COLOR_RESET   "\033[0m"
 
+#ifdef _WIN32
+#include <windows.h>
+static int g_vt_enabled = 0;
+
+static inline void enable_vt100_support() {
+    if (g_vt_enabled) return;
+
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return;
+
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) return;
+
+    // 启用虚拟终端序列支持
+    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if (SetConsoleMode(hOut, mode)) {
+        g_vt_enabled = 1;
+    }
+}
+
+// Windows版本：先初始化VT支持再输出
+#define XLOGI(fmt, ...) do { enable_vt100_support(); printf(XLOG_COLOR_WHITE fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#define XLOGE(fmt, ...) do { enable_vt100_support(); fprintf(stderr, XLOG_COLOR_RED fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#define XLOGD(fmt, ...) do { enable_vt100_support(); printf(XLOG_COLOR_GRAY fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#define XLOGW(fmt, ...) do { enable_vt100_support(); fprintf(stderr, XLOG_COLOR_YELLOW fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#define XLOGV(fmt, ...) do { enable_vt100_support(); printf(XLOG_COLOR_CYAN fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#define XLOGF(fmt, ...) do { enable_vt100_support(); fprintf(stderr, XLOG_COLOR_MAGENTA fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#else
+// 非Windows版本保持不变
 #define XLOGI(fmt, ...) do { printf(XLOG_COLOR_WHITE fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
 #define XLOGE(fmt, ...) do { fprintf(stderr, XLOG_COLOR_RED fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
 #define XLOGD(fmt, ...) do { printf(XLOG_COLOR_GRAY fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
 #define XLOGW(fmt, ...) do { fprintf(stderr, XLOG_COLOR_YELLOW fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
 #define XLOGV(fmt, ...) do { printf(XLOG_COLOR_CYAN fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
 #define XLOGF(fmt, ...) do { fprintf(stderr, XLOG_COLOR_MAGENTA fmt XLOG_COLOR_RESET "\n", ##__VA_ARGS__); } while(0)
+#endif
 #endif
 
 #endif // XLOG_H
