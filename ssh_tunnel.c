@@ -239,6 +239,7 @@ inline static int is_temporary_state(int error_code) {
         case WS_REKEYING:
         case WS_CHAN_RXD:
         case WS_CHANNEL_NOT_CONF:
+        case WS_WINDOW_FULL:
             return 1;  // 是临时状态
         default:
             return 0;  // 不是临时状态
@@ -311,4 +312,8 @@ int wolfSSH_get_error_code(WOLFSSH* ssh) {
         return -1;
     }
     return wolfSSH_get_error(ssh);
+}
+
+BOOL wolfSSH_is_temporary_state(WOLFSSH* ssh) {
+    return is_temporary_state(wolfSSH_get_error(ssh));
 }

@@ -7,11 +7,7 @@
 #endif
 #define LOG_TAG "xhttp"
 #include "xlog.h"
-
 #include <stdint.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 // ===================== Connection State =====================
 typedef enum {
@@ -229,11 +225,7 @@ int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_h
     }
 
     // 4. Convert absolute URL to relative path using the improved method
-    XLOGD("convert before:");
-    XLOGD("\n%s\n", req_buf);
     convert_http_request_inplace(req_buf, req_len, buf_size);
-    XLOGD("convert after:");
-    XLOGD("\n%s\n", req_buf);
 
     return 0;
 }
@@ -449,96 +441,6 @@ static int handle_client_request(int slot) {
     return 0;
 }
 
-static int handle_client_request_old(int slot) {
-    ProxyConn* conn = &g_conn_list[slot];
-    if (conn->req_size == 0) return -1;
-
-    // Parse request (distinguish between HTTP/HTTPS)
-    int is_https = 0;
-    if (https_parse_connect(conn->req_buf, conn->req_size, conn->host, sizeof(conn->host), &conn->port) == 0) {
-        is_https = 1;
-        XLOGI("[http] Parsed HTTPS CONNECT request: %s:%d", conn->host, conn->port);
-    } else if (http_parse_request(conn->req_buf, &conn->req_size, sizeof(conn->req_buf), conn->host, sizeof(conn->host), &conn->port) == 0) {
-        is_https = 0;
-        XLOGI("[http]  Parsed HTTP request: %s:%d", conn->host, conn->port);
-    } else {
-        XLOGE("[http] Invalid request, closing connection");
-        return -1;
-    }
-
-    // First check if it's a PAC request or management request
-    if (strcmp(conn->host, "127.0.0.1") == 0 || strcmp(conn->host, "localhost") == 0) {
-        if (conn->port == g_config.listen_port) {
-            // Handle management request
-            return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_size)==1?-2:-1;
-        }
-    }
-
-    // Connect to Socks5 server
-    SOCKET_T socks5_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (socks5_sock == INVALID_SOCKET) {
-        XLOGE("[http] create socks4 socket failed");
-        return -1;
-    }
-
-    struct sockaddr_in socks5_addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = inet_addr(g_config.socks5_server_ip),
-        .sin_port = htons(g_config.socks5_server_port)
-    };
-
-    if (connect(socks5_sock, (struct sockaddr*)&socks5_addr, sizeof(socks5_addr)) != 0) {
-        XLOGE("[http] Failed to connect Socks5 server, from host=%s, client socket=%d", conn->host, (int)conn->client_sock);
-        CLOSE_SOCKET(socks5_sock);
-        return -1;
-    }
-
-    // // Socks5 域名直接转发（建立与目标服务器的连接）
-    // if (socks5_connect_domain(socks5_sock, conn->host, conn->port) != 0) {
-    //     fprintf(stderr, "[请求处理] Socks5 域名转发失败 (目标: %s:%d, SOCKS5: %s:%d)",
-    //             conn->host, conn->port,
-    //             g_config.socks5_server_ip, g_config.socks5_server_port);
-    //     CLOSE_SOCKET(socks5_sock);
-    //     return -1;
-    // } else {
-    //     //printf("[调试] SOCKS5 域名转发成功:%s:%d", conn->host, conn->port);
-    // }
-
-    // 1. First step: Socks5 no-authentication handshake (same as IPv4 mode)
-    uint8_t handshake_req[] = {0x05, 0x01, 0x00}; // 简化：直接用数组代替结构体
-    if (send(socks5_sock, (const char*)handshake_req, sizeof(handshake_req), 0) <= 0) {
-        XLOGE("socks5 domain handshake send failed");
-        CLOSE_SOCKET(socks5_sock);
-        return -1;
-    }
-
-    // // HTTPS 需返回 200 响应，建立隧道
-    // if (is_https) {
-    //     https_send_200(conn->client_sock);
-    //     printf("[请求处理] HTTPS 隧道建立完成");
-    // } else {
-    //     // HTTP 直接转发原始请求到目标服务器
-    //     send(socks5_sock, (const char*)conn->req_buf, conn->req_size, 0);
-    //     printf("[请求处理] HTTP 明文请求转发完成");
-    // }
-
-    // Update connection state and Socks5 socket
-    conn->socks5_sock = socks5_sock;
-    conn->state = CONN_STATE_AUTHING;
-    conn->is_https = is_https;
-
-    if (xpoll_add_event(g_xpoll, socks5_sock, XPOLL_READABLE,
-                        socks5_read_cb, NULL, socks5_error_cb, (void*)(INT_PTR)slot) != 0) {
-        XLOGE("[http] Failed to register SOCKS5 socket event");
-        CLOSE_SOCKET(socks5_sock);
-        return -1;
-    }
-
-    // Immediately set to non-blocking mode
-    socket_set_nonblocking(socks5_sock);
-    return 0;
-}
-
 // Ring send: sends data from the head pointer (head) and swipes the head pointer backwards after sending
 static int rb_send(SOCKET_T fd, char* buf, int capacity, int* head, int* size) {
     if (*size == 0) return 0; // no data
@@ -656,12 +558,13 @@ static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData)
             CLOSE_SOCKET(client_sock);
             return;
         }
+
+        socket_set_nonblocking(client_sock);
         if (xpoll_add_event(g_xpoll, client_sock, XPOLL_READABLE,
                             client_read_cb, NULL, client_error_cb, (void*)(INT_PTR)slot) != 0) {
             XLOGE("[http] Connection list full, rejecting new connection");
             close_conn_slot(slot);
         }
-        socket_set_nonblocking(client_sock);
     }
 }
 

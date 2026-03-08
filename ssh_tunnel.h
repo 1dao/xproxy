@@ -47,4 +47,7 @@ int wolfSSH_channel_eof(WOLFSSH_CHANNEL *channel);
 /* 获取错误信息 */
 int wolfSSH_get_error_code(WOLFSSH* session);
 
+/* 判断是否为临时错误状态 */
+BOOL wolfSSH_is_temporary_state(WOLFSSH* ssh);
+
 #endif /* SSH_TUNNEL_V2_H */
