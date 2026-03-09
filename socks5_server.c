@@ -11,7 +11,7 @@
 #include "xlog.h"
 
 #define MAX_CONCURRENT_CONNECTIONS 8192
-#define MAX_REOPEN_COUNT 1000 // wait for 3min
+#define MAX_REOPEN_COUNT 10 // wait for 3min
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
@@ -77,51 +77,6 @@ static void socks5_send_reply(Socks5Client* client, uint8_t rep) {
     send(client->client_sock,  (const char*)response, len, 0);
 }
 
-static int socks5_handle_handshake(Socks5Client* client) {
-    uint8_t buf[4096];
-    int n = recv(client->client_sock, (char*)buf, sizeof(buf), 0);
-    if (n < 3) {
-        XLOGE("SOCKS5 handshake, recv failed, n=%d, err=%d", n, GET_ERRNO());
-        return -1;
-    }
-    if (buf[0] != 0x05) {
-        XLOGE("SOCKS5 handshake, protocol mismatch, n=%d, err=%d", n, GET_ERRNO());
-        return -1;
-    }
-
-    uint8_t nmethods = buf[1];
-    XLOGD("SOCKS5 handshake: version=0x%02X, nmethods=%d", buf[0], nmethods);
-    if (n < 2 + nmethods) {
-        XLOGE("SOCKS5 handshake, data limit exceeded, n=%d, err=%d", n, GET_ERRNO());
-        return -1;
-    }
-
-    uint8_t selected_method = 0xFF;
-    for (int i = 0; i < nmethods; i++) {
-        XLOGD("  Method %d: 0x%02X", i, buf[2 + i]);
-        if (buf[2 + i] == SOCKS5_AUTH_NONE) {
-            selected_method = SOCKS5_AUTH_NONE;
-            break;
-        }
-    }
-
-    if (selected_method == 0xFF) {
-        XLOGE("No acceptable authentication method found");
-        uint8_t response[2] = {0x05, SOCKS5_AUTH_NO_ACCEPTABLE};
-        send(client->client_sock,  (const char*)response, 2, 0);
-        return -1;
-    }
-
-    XLOGI("Selected authentication method: 0x%02X", selected_method);
-    uint8_t response[2] = {0x05, selected_method};
-    if (send(client->client_sock,  (const char*)response, 2, 0) != 2) {
-        XLOGE("Failed to send authentication response, err=%d", GET_ERRNO());
-        return -1;
-    }
-    client->auth_method = selected_method;
-    return 0;
-}
-
 #ifdef _MSC_VER
     #define UNUSED_FUNCTION
 #else
@@ -136,6 +91,7 @@ UNUSED_FUNCTION static int socks5_accout_auth(Socks5Client* client) {
 }
 
 static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
+static void ssh_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void socks5_client_stage(Socks5Client* client) {
@@ -153,99 +109,186 @@ static void socks5_client_stage(Socks5Client* client) {
     }
 }
 
-static int socks5_client_auth(Socks5Client* client) {
-    uint8_t buf[8192];
-    int n = recv(client->client_sock, (char*)buf, sizeof(buf), 0);
-    if (n < 10) {
-        XLOGE("SOCKS5 auth failed1, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
-        return -1;
-    }
-    if (buf[0] != 0x05) {
-        XLOGE("SOCKS5 auth failed2, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+static int socks5_handle_handshake(Socks5Client* client) {
+    int room = (int)sizeof(client->rbuf) - client->rlen;
+    if (room <= 0) {
+        XLOGE("Handshake buffer full, fd=%d", (int)client->client_sock);
         return -1;
     }
 
-    client->cmd = buf[1];
-    if (client->cmd != SOCKS5_CMD_CONNECT) {
-        XLOGE("SOCKS5 auth failed3, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
+    int n = recv(client->client_sock,
+                 (char*)client->rbuf + client->rlen, room, 0);
+    if (n < 0) {
+        if (socket_check_eagain()) return 0;
+        XLOGE("Handshake recv error, fd=%d, err=%d",
+              (int)client->client_sock, GET_ERRNO());
+        return -1;
+    }
+    if (n == 0) {
+        XLOGE("Handshake peer closed, fd=%d", (int)client->client_sock);
+        return -1;
+    }
+    client->rlen += n;
+
+    if (client->rlen < 2) return 0;
+
+    uint8_t* buf      = (uint8_t*)client->rbuf;
+    uint8_t  nmethods = buf[1];
+    int      need     = 2 + (int)nmethods;
+
+    if (client->rlen < need) return 0;
+
+    if (buf[0] != 0x05) {
+        XLOGE("SOCKS5 version mismatch 0x%02X, fd=%d",
+              buf[0], (int)client->client_sock);
+        return -1;
+    }
+
+    uint8_t selected = 0xFF;
+    for (int i = 0; i < (int)nmethods; i++) {
+        if (buf[2 + i] == SOCKS5_AUTH_NONE) {
+            selected = SOCKS5_AUTH_NONE;
+            break;
+        }
+    }
+
+    if (selected == 0xFF) {
+        XLOGE("No acceptable auth method, fd=%d", (int)client->client_sock);
+        uint8_t resp[2] = {0x05, SOCKS5_AUTH_NO_ACCEPTABLE};
+        send(client->client_sock, (const char*)resp, 2, 0);
+        return -1;
+    }
+
+    uint8_t resp[2] = {0x05, selected};
+    if (send(client->client_sock, (const char*)resp, 2, 0) != 2) {
+        XLOGE("Failed to send auth response, fd=%d, err=%d",
+              (int)client->client_sock, GET_ERRNO());
+        return -1;
+    }
+    client->auth_method = selected;
+
+    // consume greeting，keep any remaining data for next read
+    int consumed = need;
+    if (client->rlen > consumed)
+        memmove(client->rbuf, client->rbuf + consumed, client->rlen - consumed);
+    client->rlen -= consumed;
+
+    return 1;
+}
+
+static int socks5_client_auth(Socks5Client* client) {
+    int room = (int)sizeof(client->rbuf) - client->rlen;
+    if (room <= 0) {
+        XLOGE("Request buffer full, fd=%d", (int)client->client_sock);
+        return -1;
+    }
+
+    int n = recv(client->client_sock,
+                 (char*)client->rbuf + client->rlen, room, 0);
+    if (n < 0) {
+        if (!socket_check_eagain()) {
+            XLOGE("Request recv error, fd=%d, err=%d",
+                  (int)client->client_sock, GET_ERRNO());
+            return -1;
+        }
+    } else if (n == 0) {
+        XLOGE("Request peer closed, fd=%d", (int)client->client_sock);
+        return -1;
+    } else client->rlen += n;
+
+    uint8_t* buf = (uint8_t*)client->rbuf;
+    if (client->rlen < 4) return 0;
+    if (buf[0] != 0x05) {
+        XLOGE("SOCKS5 request version mismatch, fd=%d", (int)client->client_sock);
+        return -1;
+    }
+    if (buf[1] != SOCKS5_CMD_CONNECT) {
+        XLOGE("Unsupported cmd=0x%02X, fd=%d", buf[1], (int)client->client_sock);
         socks5_send_reply(client, SOCKS5_REP_COMMAND_NOT_SUPPORTED);
         return -1;
     }
 
     uint8_t atyp = buf[3];
-    XLOGD("SOCKS5 request: cmd=0x%02X, atyp=0x%02X", buf[1], atyp);
-
-    char target_host[256];
-    uint16_t target_port;
     int pos = 4;
+    int addr_len = 0;
 
     if (atyp == SOCKS5_ATYP_IPV4) {
-        XLOGI("ATYP: IPv4");
-        if (n < pos + 6) {
-            XLOGE("SOCKS5 auth failed4, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
-            return -1;
-        }
+        addr_len = 4;
+    } else if (atyp == SOCKS5_ATYP_IPV6) {
+        addr_len = 16;
+    } else if (atyp == SOCKS5_ATYP_DOMAIN) {
+        if (client->rlen < pos + 1) return 0;
+        addr_len = 1 + (int)buf[pos];
+    } else {
+        XLOGE("Unsupported ATYP=0x%02X, fd=%d", atyp, (int)client->client_sock);
+        socks5_send_reply(client, SOCKS5_REP_ADDRESS_NOT_SUPPORTED);
+        return -1;
+    }
+
+    int need = pos + addr_len + 2;
+    if (client->rlen < need) return 0;
+
+    char target_host[256];
+    if (atyp == SOCKS5_ATYP_IPV4) {
         struct in_addr addr;
         memcpy(&addr, &buf[pos], 4);
         inet_ntop(AF_INET, &addr, target_host, sizeof(target_host));
         pos += 4;
-    } else if (atyp == SOCKS5_ATYP_DOMAIN) {
-        int domain_len = buf[pos++];
-        XLOGI("ATYP: Domain name, length=%d, fd=%d", domain_len, (int)client->client_sock);
-        if (n < pos + domain_len + 2) {
-            XLOGE("SOCKS5 auth failed5, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
-            return -1;
-        }
-        if (domain_len >= sizeof(target_host)){
-            XLOGE("SOCKS5 auth failed6, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
-            return -1;
-        }
-        memcpy(target_host, &buf[pos], domain_len);
-        target_host[domain_len] = '\0';
-        pos += domain_len;
     } else if (atyp == SOCKS5_ATYP_IPV6) {
-        XLOGE("ATYP: IPv6");
-        if (n < pos + 18) {
-            XLOGE("SOCKS5 auth failed7, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
-            return -1;
-        }
         struct in6_addr addr6;
         memcpy(&addr6, &buf[pos], 16);
         inet_ntop(AF_INET6, &addr6, target_host, sizeof(target_host));
         pos += 16;
     } else {
-        XLOGE("ATYP not supported: 0x%02X", atyp);
-        socks5_send_reply(client, SOCKS5_REP_ADDRESS_NOT_SUPPORTED);
-        return -1;
+        int domain_len = buf[pos++];
+        if (domain_len >= (int)sizeof(target_host)) {
+            XLOGE("Domain too long, fd=%d", (int)client->client_sock);
+            return -1;
+        }
+        memcpy(target_host, &buf[pos], domain_len);
+        target_host[domain_len] = '\0';
+        pos += domain_len;
     }
 
-    target_port = ntohs(*(uint16_t*)&buf[pos]);
+    uint16_t target_port = ntohs(*(uint16_t*)&buf[pos]);
+    pos += 2;
+
     strncpy(client->target_host, target_host, sizeof(client->target_host) - 1);
     client->target_port = target_port;
-    XLOGI("SOCKS5 request: connect to %s:%d, fd=%d", target_host, target_port, (int)client->client_sock);
+
+    XLOGI("SOCKS5 CONNECT -> %s:%d, fd=%d",
+          target_host, target_port, (int)client->client_sock);
 
     if (!client->ssh_session) {
-        XLOGE("SSH session not available, fd=%d, target=%s:%d", (int)client->client_sock, target_host, target_port);
+        XLOGE("No SSH session, fd=%d", (int)client->client_sock);
         socks5_send_reply(client, SOCKS5_REP_GENERAL_FAILURE);
         return -1;
     }
 
+    // handshake done, clear rbuf for SSH data
+    client->rlen = 0;
+
     client->state = SOCKS5_STATE_OPENING;
-    client->ssh_channel = wolfSSH_channel_open(client->ssh_session,
-                                client->target_host, client->target_port,
-                                client->client_host, client->client_port);
-    socks5_client_stage(client);
+    client->ssh_channel = wolfSSH_channel_open(
+        client->ssh_session,
+        client->target_host, client->target_port,
+        client->client_host, client->client_port);
     if (!client->ssh_channel) {
-        if(wolfSSH_is_temporary_state(client->ssh_session)) {
+        if (!wolfSSH_check_fatal(wolfSSH_get_error(client->ssh_session))) {
+            SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
+            xhash* hash_table = xpoll_get_client_data(g_xpoll, ssh_socket);
+            if (hash_table) {
+                xpoll_add_event(g_xpoll, ssh_socket, XPOLL_WRITABLE,
+                                NULL, ssh_write_cb, NULL, hash_table);
+            }
             client->last_retry_time = time_get_ms() + 200;
-            XLOGD("Failed to open SSH channel");
-            return 0;// for retry
+            return 0;
         } else {
             socks5_send_reply(client, SOCKS5_REP_GENERAL_FAILURE);
             return -1;
         }
     }
-    return 0;
+    return 1;
 }
 
 void socks5_client_free(Socks5Client* client) {
@@ -397,7 +440,7 @@ static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDat
     int ret = wolfSSH_process_events(g_ssh_session, &channelId);
     if (ret < 0) {
         int error = wolfSSH_get_error(g_ssh_session);
-        if (error == WS_SOCKET_ERROR_E || error == WS_FATAL_ERROR) {
+        if (wolfSSH_check_fatal(error)) {
             XLOGE("wolfSSH_worker fatal error: %d:%s", error, wolfSSH_ErrorToName(error));
             ssh_error_cb(loop, fd, XPOLL_ERROR, clientData);
             return;
@@ -488,6 +531,9 @@ static bool client_channel_confirm(xhashNode* node, void* channel_ptr) {
     if (client->ssh_channel == channel) {
         client->state = SOCKS5_STATE_CONNECTED;
         socks5_send_reply(client, SOCKS5_REP_SUCCESS);
+        XLOGE("SSH channel confirm connect, fd=%d, host=%s, trycount=%d"
+                , (int)client->client_sock, client->target_host, client->retry_error_count);
+        client->retry_error_count = 0;
         return false;
     }
     return true;
@@ -498,28 +544,20 @@ static bool client_channel_refuse(xhashNode* node, void* channel_ptr) {
     WOLFSSH_CHANNEL* channel = (WOLFSSH_CHANNEL*)channel_ptr;
     if(client->ssh_channel != channel) return true;
 
-    if( client->retry_error_count >= MAX_REOPEN_COUNT) {
-        client->ssh_channel = NULL;
+    XLOGE("SSH channel refuse connect, fd=%d, host=%s, trycount=%d, error=%d"
+            , (int)client->client_sock, client->target_host
+            , client->retry_error_count, wolfSSH_get_error_code(client->ssh_session));
+
+    client->ssh_channel = NULL;
+    if( client->retry_error_count >= MAX_REOPEN_COUNT
+        || !wolfSSH_is_temporary_state(client->ssh_session) ) {
         client->state = SOCKS5_STATE_ERROR;
         socks5_send_reply(client, SOCKS5_REP_CONNECTION_REFUSED);
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-        XLOGE("SSH channel refuse connect, fd=%d, host=%s", (int)client->client_sock, client->target_host);
+        XLOGE("SSH channel refuse connect, fd=%d, host=%s, errno=%d"
+                , (int)client->client_sock, client->target_host, wolfSSH_get_error_code(client->ssh_session));
     } else {
-        client->retry_error_count++;
-        client->ssh_channel = wolfSSH_channel_open(client->ssh_session,
-                                client->target_host, client->target_port,
-                                client->client_host, client->client_port);
 
-        if(!client->ssh_channel) {
-            if(wolfSSH_is_temporary_state(client->ssh_session)) {
-                client->last_retry_time = time_get_ms() + 200;
-            } else {
-                socks5_send_reply(client, SOCKS5_REP_CONNECTION_REFUSED);
-                client->state = SOCKS5_STATE_ERROR;
-                SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-                XLOGE("SSH channel connect error, fd=%d, host=%s", (int)client->client_sock, client->target_host);
-            }
-        }
     }
     return false;
 }
@@ -739,17 +777,17 @@ static bool socks5_channel_retry_open(Socks5Client *client) {
     client->ssh_channel = wolfSSH_channel_open(client->ssh_session,
                                                client->target_host, client->target_port,
                                                client->client_host, client->client_port);
-    client->last_retry_time = time_get_ms() + 200;
+    client->last_retry_time = time_get_ms() + 50;
+    client->retry_error_count++;
 
-    if (!client->ssh_channel) {
-        client->retry_error_count++;
-        if (client->retry_error_count > MAX_REOPEN_COUNT || !wolfSSH_is_temporary_state(client->ssh_session)) {
+    if (client->ssh_channel == NULL) {
+        if (client->retry_error_count > MAX_REOPEN_COUNT
+            || wolfSSH_check_fatal(wolfSSH_get_error(client->ssh_session))) {
             socks5_send_reply(client, SOCKS5_REP_TTL_EXPIRED);
             client->state = SOCKS5_STATE_ERROR;
             SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s", (int)client->client_sock, client->target_host);
-            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s", (int)client->client_sock, client->target_host);
-            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s", (int)client->client_sock, client->target_host);
+            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s",
+                  (int)client->client_sock, client->target_host);
             return false;
         }
     }
@@ -762,17 +800,24 @@ void client_state_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) 
         return;
 
     switch (client->state) {
-        case SOCKS5_STATE_AUTH:
-            if (socks5_handle_handshake(client) == 0) {
-                client->state = SOCKS5_STATE_REQUEST;  // 移动到认证状态
-            } else {
+        case SOCKS5_STATE_AUTH:{
+            int r = socks5_handle_handshake(client);
+            if (r < 0) {
                 client->state = SOCKS5_STATE_ERROR;
+                break;
             }
+            if (r == 0) break; // 数据不够，等下次
+
+            // r == 1: handshake done，switch to REQUEST state
+            client->state = SOCKS5_STATE_REQUEST;
+            if (client->rlen == 0) break;
+            if (socks5_client_auth(client) < 0)
+                client->state = SOCKS5_STATE_ERROR;
             break;
+        }
         case SOCKS5_STATE_REQUEST:
-            if (socks5_client_auth(client) != 0) {
+            if (socks5_client_auth(client) < 0)
                 client->state = SOCKS5_STATE_ERROR;
-            }
             break;
         case SOCKS5_STATE_OPENING:
             socks5_channel_retry_open(client);
@@ -837,6 +882,7 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
         return;
     }
     client->state = SOCKS5_STATE_AUTH;
+    socks5_client_stage(client);
 
     g_active_connections++;
     XLOGD("New client registered, active connections: %d", g_active_connections);
@@ -906,7 +952,7 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
 
     // Setup hash table for SSH socket
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-    xhash *hash_table = xhash_create(20);
+    xhash *hash_table = xhash_create(1024);
     if (!hash_table) {
         XLOGE("Failed to create hash table");
         wolfSSH_session_close(ssh_session);

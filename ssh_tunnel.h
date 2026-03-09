@@ -50,4 +50,7 @@ int wolfSSH_get_error_code(WOLFSSH* session);
 /* 判断是否为临时错误状态 */
 BOOL wolfSSH_is_temporary_state(WOLFSSH* ssh);
 
+/* 判断wolfSSH fatal错误状态 */
+int wolfSSH_check_fatal(int err_code);
+
 #endif /* SSH_TUNNEL_V2_H */

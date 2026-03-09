@@ -336,6 +336,7 @@ static void cleanup_conn_list(void) {
 // ===================== Forward Declare Callback Functions =====================
 static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
+static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
 static void client_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
@@ -513,6 +514,9 @@ static int forward2socks5(ProxyConn* conn) {
         int ret = rb_send(conn->socks5_sock, conn->req_buf, sizeof(conn->req_buf),
                           &conn->req_head, &conn->req_size);
         if (ret < 0 && !socket_check_eagain()) return -1;
+        if (conn->req_size > 0)
+            xpoll_add_event(g_xpoll, conn->socks5_sock, XPOLL_WRITABLE,
+                NULL, socks5_write_cb, socks5_error_cb,(void*)(INT_PTR)(conn - g_conn_list));
     }
 
     return 0;
@@ -537,6 +541,10 @@ static int forward2client(ProxyConn* conn) {
         int ret = rb_send(conn->client_sock, conn->rep_buf, sizeof(conn->rep_buf),
                           &conn->rep_head, &conn->rep_size);
         if (ret < 0 && !socket_check_eagain()) return -1;
+        if (conn->rep_size > 0)
+            xpoll_add_event(g_xpoll, conn->client_sock, XPOLL_WRITABLE,
+                            NULL, client_write_cb, client_error_cb,
+                            (void*)(INT_PTR)(conn - g_conn_list));
     }
 
     return 0;
@@ -617,6 +625,21 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
             close_conn_slot(slot);
         }
     }
+}
+
+static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+    int slot = (int)(intptr_t)clientData;
+    ProxyConn* conn = &g_conn_list[slot];
+
+    if (conn->rep_size > 0) {
+        int ret = rb_send(conn->client_sock, conn->rep_buf, sizeof(conn->rep_buf),
+                          &conn->rep_head, &conn->rep_size);
+        if (ret < 0 && !socket_check_eagain()) {
+            close_conn_slot(slot); return;
+        }
+    }
+    if (conn->rep_size == 0)
+        xpoll_del_event(loop, fd, XPOLL_WRITABLE);
 }
 
 static inline int socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
@@ -755,6 +778,19 @@ static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clien
                         socks5_read_cb, NULL, socks5_error_cb,
                         (void*)(INT_PTR)slot);
         xpoll_del_event(loop, fd, XPOLL_WRITABLE);
+    } else if (conn->state == CONN_STATE_SOCKS5_OK) {
+        // drain req_buf → socks5
+        if (conn->req_size > 0) {
+            int ret = rb_send(conn->socks5_sock, conn->req_buf, sizeof(conn->req_buf),
+                                &conn->req_head, &conn->req_size);
+            if (ret < 0 && !socket_check_eagain()) {
+                close_conn_slot(slot); return;
+            }
+        }
+
+        // send fini & del write event
+        if (conn->req_size == 0)
+            xpoll_del_event(loop, fd, XPOLL_WRITABLE);
     }
 }
 
