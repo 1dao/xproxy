@@ -658,7 +658,8 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
 
 static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
     Socks5Client *client = (Socks5Client*)clientData;
-
+    if( client->wlen > (sizeof(client->wbuf) * 3 / 4) )
+        return;// wait send
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
     xhash* hash_table = xpoll_get_client_data(loop, ssh_socket);
     char client_rbuf[8192];
