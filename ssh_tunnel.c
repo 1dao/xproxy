@@ -232,19 +232,47 @@ void wolfSSH_channel_close(WOLFSSH_CHANNEL* channel) {
     wolfSSH_ChannelFree(channel);
 }
 
-inline static int is_temporary_state(int error_code) {
-    switch (error_code) {
-        case WS_WANT_READ:
-        case WS_WANT_WRITE:
-        case WS_REKEYING:
-        case WS_CHAN_RXD:
-        case WS_CHANNEL_NOT_CONF:
-        case WS_WINDOW_FULL:
-        case WS_CHANOPEN_FAILED: // half temporary_state， need retry limited times
-            return 1;  // 是临时状态
+static inline int check_fatal_err(int err_code) {
+    switch (err_code) {
+        /* 传输层致命错误 - 必须关闭 */
+        case WS_SOCKET_ERROR_E:
+        case WS_FATAL_ERROR:
+        case WS_CRYPTO_FAILED:
+
+        /* 握手阶段错误 - 无法建立连接 */
+        case WS_VERSION_E:
+        case WS_MATCH_KEX_ALGO_E:
+        case WS_MATCH_KEY_ALGO_E:
+        case WS_MATCH_ENC_ALGO_E:
+        case WS_MATCH_MAC_ALGO_E:
+
+        /* 认证错误 - 凭据无效 */
+        case WS_USER_AUTH_E:
+        case WS_PUBKEY_REJECTED_E:
+        case WS_INVALID_USERNAME:
+
+        /* 安全错误 - 可能存在攻击或数据损坏 */
+        case WS_VERIFY_MAC_E:
+        case WS_DECRYPT_E:
+        case WS_ENCRYPT_E:
+        case WS_CREATE_MAC_E:
+        case WS_CERT_EXPIRED_E:
+        case WS_CERT_REVOKED_E:
+        case WS_CERT_SIG_CONFIRM_E:
+
+        /* 协议错误 - 无法继续 */
+        case WS_PARSE_E:
+        case WS_INVALID_STATE_E:
+        case WS_MSGID_NOT_ALLOWED_E:
+            return 1;
+
         default:
-            return 0;  // 不是临时状态
+            return 0;
     }
+}
+
+inline static int is_temporary_state(int error_code) {
+    return !check_fatal_err(error_code);
 }
 
 int wolfSSH_channel_read(WOLFSSH_CHANNEL *channel, void *buffer, size_t buffer_size) {
@@ -321,8 +349,5 @@ BOOL wolfSSH_is_temporary_state(WOLFSSH* ssh) {
 
 /* 判断wolfSSH fatal错误状态 */
 int wolfSSH_check_fatal(int err_code) {
-    if (err_code == WS_SOCKET_ERROR_E || err_code == WS_FATAL_ERROR)
-        return 1;
-    else
-        return 0;
+    return check_fatal_err(err_code);
 }
