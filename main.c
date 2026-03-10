@@ -326,10 +326,15 @@ int main(int argc, char *argv[]) {
         http_proxy_started = 1;
 
         // Initialize PAC server
+        // 使用 xargs_get 获取实际的 pac-file 参数值（可能来自命令行）
+        const char* pac_file_path = xargs_get("pac-file");
+        if (!pac_file_path || strlen(pac_file_path) == 0) {
+            pac_file_path = pac_file;  // 回退到默认值
+        }
         XpacConfig pac_config = {
             .http_proxy_port = http_config.listen_port,
             .socks5_proxy_port = http_config.socks5_server_port,
-            .config_file = pac_file,
+            .config_file = pac_file_path,
             .enable_web_admin = 1,
             .admin_password = NULL
         };

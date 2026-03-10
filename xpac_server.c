@@ -1,7 +1,5 @@
 #include "xpac_server.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include "xlog.h"
 #include <ctype.h>
 
 #ifdef _WIN32
@@ -303,7 +301,7 @@ static int xpac_add_domain(const char* pattern, ProxyType proxy_type) {
     g_domain_list = new_rule;
     g_domain_count++;
 
-    printf("[PAC] 添加域名规则: %s -> %s\n",
+    XLOGI("[PAC] 添加域名规则: %s -> %s\n",
            pattern, proxy_type_to_str(proxy_type));
 
     // 自动保存到配置文件（如果配置了）

@@ -602,6 +602,13 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table)
         return;
+    if(xpoll_get_client_data(loop, fd)!=clientData) {
+        XLOGE("ssh_error_cb: clientData mismatch for fd=%d, ", (int)fd);
+        XLOGE("ssh_error_cb: clientData mismatch for fd=%d", (int)fd);
+        XLOGE("ssh_error_cb: clientData mismatch for fd=%d", (int)fd);
+        return;
+    }
+
     XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
     XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
     XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
@@ -898,8 +905,9 @@ static bool socks5_channel_each_reopen(xhashNode *node, void* ud) {
 static void handle_ssh_session_error() {
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
     xhash* hash_table = (xhash*)xpoll_get_client_data(g_xpoll, ssh_socket);
-    if (hash_table)
+    if (hash_table) {
         ssh_error_cb(g_xpoll, ssh_socket, XPOLL_ERROR | XPOLL_CLOSE, hash_table);
+    }
 }
 
 void socks5_server_update() {
