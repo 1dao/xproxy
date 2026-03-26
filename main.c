@@ -25,6 +25,19 @@ void signal_handler(int sig) {
 
 #ifdef _WIN32
 #include <conio.h>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+// 阻止系统进入睡眠
+static void prevent_sleep(void) {
+    SetThreadExecutionState(ES_AWAYMODE_REQUIRED | ES_SYSTEM_REQUIRED | ES_CONTINUOUS);
+}
+
+// 允许系统睡眠（退出时调用）
+static void allow_sleep(void) {
+    SetThreadExecutionState(ES_CONTINUOUS);
+}
 #else
 #include <termios.h>
 #include <unistd.h>
@@ -162,6 +175,12 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGSEGV, signal_handler);
 
+#ifdef _WIN32
+    // 阻止系统进入睡眠
+    prevent_sleep();
+    XLOGI("[System] Sleep prevention enabled");
+#endif
+
     // Configuration variables
     static char bind_addr[256], ssh_host[256], ssh_user[256], ssh_pass[256];
     static char http_port_str[16];
@@ -246,6 +265,68 @@ int main(int argc, char *argv[]) {
         xargs_cleanup();
         return EXIT_FAILURE;
     }
+
+#ifdef _WIN32
+    // 等待网络就绪（开机启动时网络可能还未连接）
+    if (has_ssh_args) {
+        XLOGI("[Network] Waiting for network to be ready...");
+        int retries = 0;
+        int max_retries = 60;
+        int network_ready = 0;
+
+        while (retries < max_retries && !network_ready) {
+            // 尝试真正的 TCP 连接到 SSH 服务器
+            SOCKET test_sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (test_sock != INVALID_SOCKET) {
+                struct sockaddr_in addr = {0};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(atoi(xargs_get("p")));
+
+                // 先尝试解析主机名
+                struct hostent *host = gethostbyname(ssh_host);
+                if (host != NULL) {
+                    memcpy(&addr.sin_addr, host->h_addr, host->h_length);
+
+                    // 设置非阻塞模式进行连接测试
+                    u_long nonblock = 1;
+                    ioctlsocket(test_sock, FIONBIO, &nonblock);
+
+                    int result = connect(test_sock, (struct sockaddr*)&addr, sizeof(addr));
+                    if (result == 0 || WSAGetLastError() == WSAEWOULDBLOCK) {
+                        // 使用 select 等待连接完成
+                        fd_set fdset;
+                        FD_ZERO(&fdset);
+                        FD_SET(test_sock, &fdset);
+                        struct timeval tv = {3, 0}; // 3秒超时
+
+                        if (select(0, NULL, &fdset, NULL, &tv) > 0) {
+                            int so_error;
+                            int len = sizeof(so_error);
+                            getsockopt(test_sock, SOL_SOCKET, SO_ERROR, (char*)&so_error, &len);
+                            if (so_error == 0) {
+                                XLOGI("[Network] TCP connection to %s:%s successful after %d seconds", ssh_host, xargs_get("p"), retries);
+                                network_ready = 1;
+                            }
+                        }
+                    }
+                }
+                closesocket(test_sock);
+            }
+
+            if (!network_ready) {
+                retries++;
+                if (retries < max_retries) {
+                    XLOGI("[Network] Waiting for network... (%d/%d)", retries, max_retries);
+                    Sleep(1000);
+                }
+            }
+        }
+
+        if (!network_ready) {
+            XLOGE("[Network] Failed to connect after %d seconds, will retry anyway...", max_retries);
+        }
+    }
+#endif
 
     // Create global xpoll instance
     xPollState *xpoll = xpoll_create();
@@ -389,6 +470,11 @@ int main(int argc, char *argv[]) {
     xpoll_free(xpoll);
     xargs_cleanup();
     socket_cleanup();
+
+#ifdef _WIN32
+    // 恢复系统睡眠
+    allow_sleep();
+#endif
 
     if (socks5_started || http_proxy_started) {
         printf("\nProxy servers stopped\n");

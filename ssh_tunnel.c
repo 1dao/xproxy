@@ -230,6 +230,7 @@ void wolfSSH_channel_close(WOLFSSH_CHANNEL* channel) {
 
     fprintf(stderr, "SSH channel closed, address=%p\n", channel);
     wolfSSH_ChannelFree(channel);
+    //wolfSSH_ChannelExit(channel);
 }
 
 static inline int check_fatal_err(int err_code) {

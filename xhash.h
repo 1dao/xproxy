@@ -420,9 +420,9 @@ XHASH_INLINE size_t xhash_size(xhash *hash) {
  * @param callback Callback function: bool (*callback)(xhashNode *node, void *ctx)
  * @param ctx Context pointer
  */
-XHASH_INLINE void xhash_foreach(xhash *hash, bool (*callback)(xhashNode *node, void *ctx), void *ctx) {
+XHASH_INLINE BOOL xhash_foreach(xhash *hash, bool (*callback)(xhashNode *node, void *ctx), void *ctx) {
     if (!hash || !callback)
-        return;
+        return FALSE;
 
     int current_idx = hash->head_idx;
     int processed_count = 0;
@@ -438,7 +438,7 @@ XHASH_INLINE void xhash_foreach(xhash *hash, bool (*callback)(xhashNode *node, v
         while (node && processed_count < ncount) {
             next = node->next;
             if (!callback(node, ctx)) {
-                return;
+                return FALSE;
             }
             node = next;
             processed_count++;
@@ -449,6 +449,7 @@ XHASH_INLINE void xhash_foreach(xhash *hash, bool (*callback)(xhashNode *node, v
         fprintf(stderr, "hash set invalid :%d-%d", ncount, processed_count);
         fprintf(stderr, "hash set invalid :%d-%d", ncount, processed_count);
     }
+    return TRUE;
 }
 
 /**

@@ -550,14 +550,15 @@ static bool client_channel_refuse(xhashNode* node, void* channel_ptr) {
 
     client->ssh_channel = NULL;
     if( client->retry_error_count >= MAX_REOPEN_COUNT
-        || !wolfSSH_is_temporary_state(client->ssh_session) ) {
+        || !wolfSSH_is_temporary_state(client->ssh_session)
+        || WS_CHANOPEN_FAILED==wolfSSH_get_error_code(client->ssh_session) ) {
         client->state = SOCKS5_STATE_ERROR;
         socks5_send_reply(client, SOCKS5_REP_CONNECTION_REFUSED);
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
         XLOGE("SSH channel refuse connect, fd=%d, host=%s, errno=%d"
                 , (int)client->client_sock, client->target_host, wolfSSH_get_error_code(client->ssh_session));
     } else {
-
+         client->last_retry_time = time_get_ms() + 500;
     }
     return false;
 }
@@ -586,8 +587,15 @@ static int ssh_channel_close_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
 static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
     XLOGI("ssh channel opened:%p", channel);
     xhash* hash = (xhash*)ctx;
+    BOOL miss = TRUE;
     if (hash)
-        xhash_foreach(hash, client_channel_confirm, channel);
+        miss = xhash_foreach(hash, client_channel_confirm, channel);
+    if (miss) {
+        XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
+        XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
+        XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
+        wolfSSH_ChannelExit(channel);
+    }
     return WS_SUCCESS;
 }
 
@@ -928,6 +936,44 @@ void socks5_server_update() {
             }
         }
         XLOGI("keepalive success %lld", time_get_ms());
+
+        if(!g_ssh_session) {
+            // Create shared SSH session
+            const Socks5ServerConfig* config = &g_server_config;
+            WOLFSSH *ssh_session = wolfSSH_session_open(
+                config->ssh_host,
+                config->ssh_port,
+                config->ssh_username,
+                config->ssh_password);
+
+            if (!ssh_session) {
+                XLOGE("ReCreating Failed to create shared SSH session");
+                return;
+            }
+            XLOGW("ReCreating Shared SSH session created successfully");
+
+            // Setup hash table for SSH socket
+            SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
+            xhash* hash_table = xhash_create(1024);
+            if (!hash_table) {
+                XLOGE("ReCreating Failed to create hash table");
+                wolfSSH_session_close(ssh_session);
+                return;
+            }
+
+            // Register SSH socket events
+            if (xpoll_add_event(g_xpoll, ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
+                                ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
+                XLOGE("ReCreating Failed to register SSH socket event");
+                xhash_destroy(hash_table, false);
+                wolfSSH_session_close(ssh_session);
+                return;
+            }
+            wolfSSH_channel_callback(ssh_session, ssh_channel_close_callback, ssh_channel_open_fini_callback, ssh_channel_open_fail_callback, hash_table);
+
+            // reset
+            g_ssh_session = ssh_session;
+        }
     }
 
     if (g_ssh_session) {
