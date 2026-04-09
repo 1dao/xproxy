@@ -14,6 +14,14 @@
 #define mkdir(dir) mkdir(dir, 0755)
 #endif
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#include <arpa/inet.h>
+#endif
+
 // ===================== 域名规则结构 =====================
 typedef struct DomainRule {
     char pattern[256];            // 域名匹配模式（如 "*.google.com"）
@@ -43,6 +51,7 @@ static int parse_proxy_type(const char* type_str);
 static const char* proxy_type_to_str(ProxyType type);
 static int xpac_load_config(const char* filename);
 static int xpac_save_config(const char* filename);
+static const char* get_pac_proxy_address(void);
 
 // ===================== 域名管理API =====================
 static int xpac_add_domain(const char* pattern, ProxyType proxy_type);
@@ -57,12 +66,10 @@ void xpac_init(const XpacConfig* config) {
     }
 
     if (config) {
-        // 复制配置
         g_config.http_proxy_port = config->http_proxy_port;
         g_config.socks5_proxy_port = config->socks5_proxy_port;
         g_config.enable_web_admin = config->enable_web_admin;
-
-        // 复制字符串（注意：这里简化处理，实际应分配内存）
+        g_config.bind_address = config->bind_address;
         g_config.config_file = config->config_file;
         g_config.admin_password = config->admin_password;
     }
@@ -421,6 +428,30 @@ static const char* proxy_type_to_str(ProxyType type) {
 }
 
 // ===================== PAC生成API =====================
+static const char* get_pac_proxy_address(void) {
+    static char address[INET_ADDRSTRLEN] = "127.0.0.1";
+
+    if (!g_config.bind_address || g_config.bind_address[0] == '\0')
+        return address;
+
+    if (strcmp(g_config.bind_address, "0.0.0.0") != 0) {
+        strncpy(address, g_config.bind_address, sizeof(address) - 1);
+        address[sizeof(address) - 1] = '\0';
+        return address;
+    }
+
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        struct hostent* he = gethostbyname(hostname);
+        if (he && he->h_addr_list[0]) {
+            char* result = inet_ntop(AF_INET, he->h_addr_list[0], address, sizeof(address));
+            if (result) return address;
+        }
+    }
+
+    return address;
+}
+
 // 生成PAC文件内容（根据类型）
 // 注意：返回的字符串需要调用者释放
 static char* xpac_generate_pac_content(int pac_type) {
@@ -437,6 +468,7 @@ static char* xpac_generate_pac_content(int pac_type) {
     char* pac_content = (char*)malloc(buffer_size);
     if (!pac_content) return NULL;
 
+    const char* ip = get_pac_proxy_address();
     int pos = 0;
 
     // PAC文件头部
@@ -480,18 +512,18 @@ static char* xpac_generate_pac_content(int pac_type) {
                 // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "        return \"%s %s:%d; DIRECT\";\n"
                     "    }\n"
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "        return \"%s %s:%d; DIRECT\";\n"
                     "    }\n",
-                    current->pattern, proxy_str, port, current->pattern+2, proxy_str, port);  // 跳过 '*' 字符
+                    current->pattern, proxy_str, ip, port, current->pattern+2, proxy_str, ip, port);  // 跳过 '*' 字符
             } else {
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s 127.0.0.1:%d; DIRECT\";\n"
+                    "        return \"%s %s:%d; DIRECT\";\n"
                     "    }\n",
-                    current->pattern, proxy_str, port);
+                    current->pattern, proxy_str, ip, port);
             }
             current = current->next;
         }
@@ -501,13 +533,13 @@ static char* xpac_generate_pac_content(int pac_type) {
     if (pac_type == 3) { // proxy.http.pac，强制所有流量走代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 所有流量走HTTP代理\n"
-            "    return \"PROXY 127.0.0.1:%d; DIRECT\";\n",
-            g_config.http_proxy_port);
+            "    return \"PROXY %s:%d; DIRECT\";\n",
+            ip, g_config.http_proxy_port);
     } else if (pac_type == 2) { // proxy.socks5.pac，默认SOCKS5
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 所有流量走SOCKS5代理\n"
-            "    return \"SOCKS5 127.0.0.1:%d; DIRECT\";\n",
-            g_config.socks5_proxy_port);
+            "    return \"SOCKS5 %s:%d; DIRECT\";\n",
+            ip, g_config.socks5_proxy_port);
     } else { // proxy.pac，默认HTTP代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
                     "\n    // 所有其他不走代理直接访问\n"
@@ -1225,6 +1257,8 @@ int xpac_handle_request(SOCKET_T client_sock, const char* req_buf, int req_len) 
     if (admin_type > 0) {
         printf("[PAC] 检测到管理请求 (类型: %d)\n", admin_type);
         return handle_admin_request(client_sock, req_buf, req_len, admin_type);
+    } else {
+        printf("[PAC] 未检测到pac请求\n");
     }
 
     // 非法请求

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,17 @@ extern "C" {
 #endif
 #ifndef TCP_KEEPCNT
 #define TCP_KEEPCNT 6
+#endif
+#endif
+#if defined(__linux__)
+#ifndef TCP_KEEPIDLE
+#define TCP_KEEPIDLE 21
+#endif
+#ifndef TCP_KEEPINTVL
+#define TCP_KEEPINTVL 25
+#endif
+#ifndef TCP_KEEPCNT
+#define TCP_KEEPCNT 19
 #endif
 #endif
 #ifndef INT_PTR

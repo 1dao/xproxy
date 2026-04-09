@@ -9,6 +9,32 @@
 #include "xlog.h"
 #include <stdint.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
+// Check if host is a local address (127.0.0.1, localhost, 0.0.0.0, or actual local IP)
+static int is_local_address(const char* host) {
+    if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0 || strcmp(host, "0.0.0.0") == 0)
+        return 1;
+
+    // Get local hostname and resolve to IP
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        struct hostent* he = gethostbyname(hostname);
+        if (he) {
+            for (int i = 0; he->h_addr_list[i] != NULL; i++) {
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, he->h_addr_list[i], ip, sizeof(ip));
+                if (strcmp(host, ip) == 0)
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // ===================== Connection State =====================
 typedef enum {
     CONN_STATE_NEW,
@@ -362,11 +388,8 @@ static int handle_client_request(int slot) {
     }
 
     // First check if it's a PAC request or management request
-    if (strcmp(conn->host, "127.0.0.1") == 0 || strcmp(conn->host, "localhost") == 0) {
-        if (conn->port == g_config.listen_port) {
-            // Handle management request
-            return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_size)==1?-2:-1;
-        }
+    if (is_local_address(conn->host) && conn->port == g_config.listen_port) {
+        return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_size)==1?-2:-1;
     }
 
     SOCKET_T socks5_sock = socket(AF_INET, SOCK_STREAM, 0);

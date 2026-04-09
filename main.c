@@ -415,6 +415,7 @@ int main(int argc, char *argv[]) {
         XpacConfig pac_config = {
             .http_proxy_port = http_config.listen_port,
             .socks5_proxy_port = http_config.socks5_server_port,
+            .bind_address = bind_addr[0] ? bind_addr : "127.0.0.1",
             .config_file = pac_file_path,
             .enable_web_admin = 1,
             .admin_password = NULL

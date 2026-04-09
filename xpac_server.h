@@ -17,7 +17,8 @@ typedef enum {
 // ===================== 配置结构 =====================
 typedef struct {
     int http_proxy_port;          // HTTP代理端口（如7890）
-    int socks5_proxy_port;        // SOCKS5代理端口（如1081）
+    int socks5_proxy_port;        // SOCKS5代理端口（如1080）
+    const char* bind_address;     // SOCKS5/HTTP bind address
     const char* config_file;      // 配置文件路径（可为NULL）
     int enable_web_admin;         // 是否启用Web管理界面
     const char* admin_password;   // 管理密码（可为NULL）
