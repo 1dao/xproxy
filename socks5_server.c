@@ -254,6 +254,7 @@ static int socks5_client_auth(Socks5Client* client) {
     pos += 2;
 
     strncpy(client->target_host, target_host, sizeof(client->target_host) - 1);
+    client->target_host[sizeof(client->target_host) - 1] = '\0';
     client->target_port = target_port;
 
     XLOGI("SOCKS5 CONNECT -> %s:%d, fd=%d",

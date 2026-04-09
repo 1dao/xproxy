@@ -43,7 +43,6 @@ static int g_domain_count = 0;            // 域名规则数量
 static int g_initialized = 0;             // 是否已初始化
 
 // ===================== 内部工具函数声明 =====================
-static void load_default_config(void);
 static int is_valid_domain_pattern(const char* pattern);
 static DomainRule* find_domain_rule(const char* pattern);
 static void free_domain_list(void);
@@ -95,15 +94,6 @@ void xpac_init(const XpacConfig* config) {
 // 释放资源
 void xpac_uninit(void) {
     xpac_clear_domains();
-}
-
-// 加载默认配置
-static void load_default_config(void) {
-    // 添加一些常用域名的默认规则
-    xpac_add_domain("*.google.com", PROXY_TYPE_SOCKS5);
-    xpac_add_domain("*.github.com", PROXY_TYPE_HTTP);
-    xpac_add_domain("*.youtube.com", PROXY_TYPE_SOCKS5);
-    printf("[PAC] 已加载默认域名规则\n");
 }
 
 // ===================== 配置文件管理 =====================
@@ -444,7 +434,7 @@ static const char* get_pac_proxy_address(void) {
     if (gethostname(hostname, sizeof(hostname)) == 0) {
         struct hostent* he = gethostbyname(hostname);
         if (he && he->h_addr_list[0]) {
-            char* result = inet_ntop(AF_INET, he->h_addr_list[0], address, sizeof(address));
+            const char* result = inet_ntop(AF_INET, he->h_addr_list[0], address, sizeof(address));
             if (result) return address;
         }
     }
@@ -732,8 +722,7 @@ static const char* get_query_param(const char* query_str, const char* key,
 
     char decoded[256];
     url_decode(buffer, decoded, sizeof(decoded));
-    strncpy(buffer, decoded, buf_len - 1);
-    buffer[buf_len - 1] = '\0';
+    snprintf(buffer, buf_len, "%s", decoded);
     return buffer;
 }
 

@@ -12,6 +12,10 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #endif
 
 // Check if host is a local address (127.0.0.1, localhost, 0.0.0.0, or actual local IP)
@@ -280,16 +284,6 @@ static int init_conn_list(void) {
 static int find_free_conn_slot(void) {
     for (int i = 0; i < g_config.max_conns; i++) {
         if (g_conn_list[i].state == CONN_STATE_CLOSED) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-// Find connection slot by socket
-static int find_conn_slot_by_sock(SOCKET_T sock) {
-    for (int i = 0; i < g_config.max_conns; i++) {
-        if (g_conn_list[i].client_sock == sock || g_conn_list[i].socks5_sock == sock) {
             return i;
         }
     }
