@@ -528,8 +528,8 @@ static char* xpac_generate_pac_content(int pac_type) {
     } else if (pac_type == 2) { // proxy.socks5.pac，默认SOCKS5
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 所有流量走SOCKS5代理\n"
-            "    return \"SOCKS5 %s:%d; DIRECT\";\n",
-            ip, g_config.socks5_proxy_port);
+            "    return \"SOCKS5 %s:%d; SOCKS %s:%d; DIRECT\";\n",
+            ip, g_config.socks5_proxy_port, ip, g_config.socks5_proxy_port);
     } else { // proxy.pac，默认HTTP代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
                     "\n    // 所有其他不走代理直接访问\n"
