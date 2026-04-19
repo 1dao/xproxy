@@ -335,10 +335,10 @@ static void socks5_client_cleanup(xPollState *loop, SOCKET_T fd, Socks5Client *c
     XLOGI("Active connections: %d (connection closed)", g_active_connections);
 }
 
-static bool ssh_read_each_client(xhashNode *node, void* ud) {
+static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
     xPollState *loop = (xPollState*)ud;
     // Get client from hash node
-    Socks5Client *client = (Socks5Client*)node->value;
+    Socks5Client *client = (Socks5Client*)value;
     if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel)
         return true;  // Continue to next client
 
@@ -453,9 +453,9 @@ static void ssh_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDat
     xhash_foreach(hash_table, ssh_read_each_client, loop);
 }
 
-static bool ssh_write_each_client(xhashNode *node, void * ctx) {
+static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
     // Get client from hash node
-    Socks5Client *client = (Socks5Client*)node->value;
+    Socks5Client *client = (Socks5Client*)value;
     if (!client || client->state != SOCKS5_STATE_CONNECTED ||
         !client->ssh_channel || client->wlen == 0) {
         return true;  // Continue to next client
@@ -515,8 +515,8 @@ static void ssh_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
         xpoll_del_event(loop, fd, XPOLL_WRITABLE);
 }
 
-static bool client_on_closed(xhashNode *node, void *ctx) {
-    Socks5Client *client = (Socks5Client*)node->value;
+static bool client_on_closed(xhashKey k, void* value, void *ctx) {
+    Socks5Client *client = (Socks5Client*)value;
     if (!client) return true;
     if(!ctx) {
         socks5_client_cleanup(g_xpoll, client->client_sock, client);
@@ -526,8 +526,8 @@ static bool client_on_closed(xhashNode *node, void *ctx) {
     return true;
 }
 
-static bool client_channel_confirm(xhashNode* node, void* channel_ptr) {
-    Socks5Client *client = (Socks5Client*)node->value;
+static bool client_channel_confirm(xhashKey k, void* value, void* channel_ptr) {
+    Socks5Client *client = (Socks5Client*)value;
     WOLFSSH_CHANNEL* channel = (WOLFSSH_CHANNEL*)channel_ptr;
     if (client->ssh_channel == channel) {
         client->state = SOCKS5_STATE_CONNECTED;
@@ -540,8 +540,8 @@ static bool client_channel_confirm(xhashNode* node, void* channel_ptr) {
     return true;
 }
 
-static bool client_channel_refuse(xhashNode* node, void* channel_ptr) {
-    Socks5Client *client = (Socks5Client*)node->value;
+static bool client_channel_refuse(xhashKey k, void* value, void* channel_ptr) {
+    Socks5Client *client = (Socks5Client*)value;
     WOLFSSH_CHANNEL* channel = (WOLFSSH_CHANNEL*)channel_ptr;
     if(client->ssh_channel != channel) return true;
 
@@ -564,8 +564,8 @@ static bool client_channel_refuse(xhashNode* node, void* channel_ptr) {
     return false;
 }
 
-static bool client_channel_closed(xhashNode* node, void* channel_ptr) {
-    Socks5Client *client = (Socks5Client*)node->value;
+static bool client_channel_closed(xhashKey k, void* value, void* channel_ptr) {
+    Socks5Client *client = (Socks5Client*)value;
     WOLFSSH_CHANNEL* channel = (WOLFSSH_CHANNEL*)channel_ptr;
     if (client->ssh_channel == channel) {
         client->ssh_channel = NULL;
@@ -644,7 +644,7 @@ static void ssh_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientDa
 
     // Setup hash table for SSH socket
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-    hash_table = xhash_create(1024);
+    hash_table = xhash_create(512, XHASH_KEY_INT);
     if (!hash_table) {
         XLOGE("ReCreating Failed to create hash table");
         wolfSSH_session_close(ssh_session);
@@ -905,9 +905,9 @@ static void accept_cb_single(xPollState *loop, SOCKET_T listen_fd, int mask, voi
     XLOGD("New client registered, active connections: %d", g_active_connections);
 }
 
-static bool socks5_channel_each_reopen(xhashNode *node, void* ud) {
+static bool socks5_channel_each_reopen(xhashKey k, void* value, void* ud) {
     (void)ud;
-    Socks5Client *client = (Socks5Client*)node->value;
+    Socks5Client *client = (Socks5Client*)value;
     socks5_channel_retry_open(client);
     return true;
 }
@@ -955,7 +955,7 @@ void socks5_server_update() {
 
             // Setup hash table for SSH socket
             SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-            xhash* hash_table = xhash_create(1024);
+            xhash* hash_table = xhash_create(512, XHASH_KEY_INT);
             if (!hash_table) {
                 XLOGE("ReCreating Failed to create hash table");
                 wolfSSH_session_close(ssh_session);
@@ -1008,7 +1008,7 @@ int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll) {
 
     // Setup hash table for SSH socket
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-    xhash *hash_table = xhash_create(1024);
+    xhash *hash_table = xhash_create(512, XHASH_KEY_INT);
     if (!hash_table) {
         XLOGE("Failed to create hash table");
         wolfSSH_session_close(ssh_session);

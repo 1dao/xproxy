@@ -61,8 +61,8 @@ set "DEFS=%DEFS% /Dstrdup=_strdup /Dstrcasecmp=_stricmp
 
 set "INCS=/I. /I./3rd/wolfssl /I./3rd/wolfssl/wolfssl /I./3rd/wolfssh /I./3rd/wolfssh/wolfssh"
 
-:: CFLAGS (mirroring Makefile flags)
-set "BASE_CFLAGS=/nologo /TC /W3 /utf-8 /wd4005 /wd4996 %DEFS% %INCS%"
+:: CFLAGS (mirroring Makefile flags) - enable C11 standard for MSVC
+set "BASE_CFLAGS=/nologo /TC /W3 /utf-8 /std:c11 /wd4005 /wd4996 %DEFS% %INCS%"
 
 if "%1"=="debug" (
     set "CFLAGS=%BASE_CFLAGS% /Od /Zi /MDd /DDEBUG"
@@ -233,6 +233,6 @@ REM 编译完成后删除.obj目录
 echo %GREEN%[INFO]%RESET% Cleaning up .obj directory...
 rd /S /Q !OBJDIR! 2>nul
 
-echo %GREEN%[INFO]%RESET% %EXE% build success.
+echo %GREEN%[INFO]%RESET% %EXE% build success with C11 standard.
 pause
 exit /b 0
