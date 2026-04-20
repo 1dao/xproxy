@@ -52,7 +52,7 @@ C-based multi-protocol proxy server supporting SOCKS5, HTTPS proxy, SSH tunnelin
 | socks5_server_loop | func | socks5_server.c | Event loop |
 | https_proxy_handler | func | https_proxy.c | CONNECT handling |
 | ssh_tunnel_connect | func | ssh_tunnel.c | SSH session |
-| xpoll_create | func | xpoll.c | Poll init |
+| xpoll_init | func | xpoll.c | Poll init |
 | xpoll_poll | func | xpoll.c | Event wait |
 | xargs_init | func | xargs.c | Arg parsing |
 

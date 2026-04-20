@@ -84,9 +84,7 @@ int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_h
 static HttpProxyConfig g_config;
 static ProxyConn* g_conn_list = NULL;
 static int g_conn_count = 0;
-static int g_running = 1;
 static SOCKET_T g_listen_sock = INVALID_SOCKET;  // 监听套接字
-static xPollState* g_xpoll = NULL;
 
 // ===================== HTTP Parsing Functions =====================
 // Parse CONNECT request, extract target_host and target_port
@@ -311,18 +309,12 @@ static int add_new_client_conn(SOCKET_T client_sock) {
 // Close and clean connection
 static void close_conn_slot(int slot) {
     if (slot < 0 || slot >= g_config.max_conns) return;
-
     if (g_conn_list[slot].client_sock != INVALID_SOCKET) {
-        if (g_xpoll) {
-            xpoll_del_event(g_xpoll, g_conn_list[slot].client_sock, XPOLL_ALL);
-        }
+        xpoll_del_event(g_conn_list[slot].client_sock, XPOLL_ALL);
         CLOSE_SOCKET(g_conn_list[slot].client_sock);
     }
-
     if (g_conn_list[slot].socks5_sock != INVALID_SOCKET) {
-        if (g_xpoll) {
-            xpoll_del_event(g_xpoll, g_conn_list[slot].socks5_sock, XPOLL_ALL);
-        }
+        xpoll_del_event(g_conn_list[slot].socks5_sock, XPOLL_ALL);
         CLOSE_SOCKET(g_conn_list[slot].socks5_sock);
     }
 
@@ -354,13 +346,13 @@ static void cleanup_conn_list(void) {
 }
 
 // ===================== Forward Declare Callback Functions =====================
-static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
-static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
-static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
-static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
-static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
-static void client_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
-static void socks5_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
+static void accept_cb(SOCKET_T fd, int mask, void *clientData);
+static void client_read_cb(SOCKET_T fd, int mask, void *clientData);
+static void client_write_cb(SOCKET_T fd, int mask, void *clientData);
+static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData);
+static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData);
+static void client_error_cb(SOCKET_T fd, int mask, void *clientData);
+static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData);
 
 // ===================== Core Processing Functions =====================
 // Handle client request (parse + establish Socks5 connection)
@@ -423,7 +415,7 @@ static int handle_client_request(int slot) {
         conn->is_https = is_https;
 
         // ✅ reg WRITABLE ev，wait connect fini
-        if (xpoll_add_event(g_xpoll, socks5_sock,
+        if (xpoll_add_event(socks5_sock,
                             XPOLL_WRITABLE | XPOLL_ERROR,
                             NULL,
                             socks5_write_cb,
@@ -447,7 +439,7 @@ static int handle_client_request(int slot) {
         conn->state = CONN_STATE_AUTHING;
         conn->is_https = is_https;
 
-        if (xpoll_add_event(g_xpoll, socks5_sock,
+        if (xpoll_add_event(socks5_sock,
                             XPOLL_READABLE | XPOLL_ERROR,
                             socks5_read_cb, NULL, socks5_error_cb,
                             (void*)(INT_PTR)slot) != 0) {
@@ -532,7 +524,7 @@ static int forward2socks5(ProxyConn* conn) {
                           &conn->req_head, &conn->req_size);
         if (ret < 0 && !socket_check_eagain()) return -1;
         if (conn->req_size > 0)
-            xpoll_add_event(g_xpoll, conn->socks5_sock, XPOLL_WRITABLE,
+            xpoll_add_event(conn->socks5_sock, XPOLL_WRITABLE,
                 NULL, socks5_write_cb, socks5_error_cb,(void*)(INT_PTR)(conn - g_conn_list));
     }
 
@@ -559,7 +551,7 @@ static int forward2client(ProxyConn* conn) {
                           &conn->rep_head, &conn->rep_size);
         if (ret < 0 && !socket_check_eagain()) return -1;
         if (conn->rep_size > 0)
-            xpoll_add_event(g_xpoll, conn->client_sock, XPOLL_WRITABLE,
+            xpoll_add_event(conn->client_sock, XPOLL_WRITABLE,
                             NULL, client_write_cb, client_error_cb,
                             (void*)(INT_PTR)(conn - g_conn_list));
     }
@@ -567,7 +559,7 @@ static int forward2client(ProxyConn* conn) {
     return 0;
 }
 
-static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void accept_cb(SOCKET_T fd, int mask, void *clientData) {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     SOCKET_T client_sock = accept(fd, (struct sockaddr*)&client_addr, &client_addr_len);
@@ -585,7 +577,7 @@ static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData)
         }
 
         socket_set_nonblocking(client_sock);
-        if (xpoll_add_event(g_xpoll, client_sock, XPOLL_READABLE,
+        if (xpoll_add_event(client_sock, XPOLL_READABLE,
                             client_read_cb, NULL, client_error_cb, (void*)(INT_PTR)slot) != 0) {
             XLOGE("[http] Connection list full, rejecting new connection");
             close_conn_slot(slot);
@@ -594,7 +586,7 @@ static void accept_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData)
 }
 
 // Client read callback
-static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
     if (slot < 0 || slot >= g_config.max_conns) return;
 
@@ -624,9 +616,10 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
         // Try to parse request (complete request received)
         if (strstr(conn->req_buf, "\r\n\r\n") != NULL) {
             int ret = handle_client_request(slot);
-            if(ret==-2)
+            if(ret==-2){
                 XLOGI("[http] PAC request handled, closing connection");
-            else if (ret != 0) {
+                close_conn_slot(slot);
+            } else if (ret != 0) {
                 XLOGE("[http] PAC request handling exception, closing connection");
                 close_conn_slot(slot);
             }
@@ -644,7 +637,7 @@ static void client_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
     }
 }
 
-static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void client_write_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
     ProxyConn* conn = &g_conn_list[slot];
 
@@ -656,7 +649,7 @@ static void client_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clien
         }
     }
     if (conn->rep_size == 0)
-        xpoll_del_event(loop, fd, XPOLL_WRITABLE);
+        xpoll_del_event(fd, XPOLL_WRITABLE);
 }
 
 static inline int socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
@@ -695,7 +688,7 @@ static inline int socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
 }
 
 // SOCKS5 server read callback
-static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
     if (slot < 0 || slot >= g_config.max_conns) return;
 
@@ -762,12 +755,11 @@ static void socks5_read_cb(xPollState *loop, SOCKET_T fd, int mask, void *client
     }
 }
 
-static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
     if (slot < 0 || slot >= g_config.max_conns) return;
 
     ProxyConn* conn = &g_conn_list[slot];
-
     if (conn->state == CONN_STATE_TCP_CONNECTING) {
         // ✅ using getsockopt(SO_ERROR) confirm connect ok
         int err = 0;
@@ -791,10 +783,10 @@ static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clien
         conn->state = CONN_STATE_AUTHING;
 
         // remove write ev,add read ev
-        xpoll_add_event(loop, fd, XPOLL_READABLE,
+        xpoll_add_event(fd, XPOLL_READABLE,
                         socks5_read_cb, NULL, socks5_error_cb,
                         (void*)(INT_PTR)slot);
-        xpoll_del_event(loop, fd, XPOLL_WRITABLE);
+        xpoll_del_event(fd, XPOLL_WRITABLE);
     } else if (conn->state == CONN_STATE_SOCKS5_OK) {
         // drain req_buf → socks5
         if (conn->req_size > 0) {
@@ -807,17 +799,17 @@ static void socks5_write_cb(xPollState *loop, SOCKET_T fd, int mask, void *clien
 
         // send fini & del write event
         if (conn->req_size == 0)
-            xpoll_del_event(loop, fd, XPOLL_WRITABLE);
+            xpoll_del_event(fd, XPOLL_WRITABLE);
     }
 }
 
-static void client_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void client_error_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
     XLOGE("[http] Client socket %d error, closing connection", (int)fd);
     close_conn_slot(slot);
 }
 
-static void socks5_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clientData) {
+static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
     XLOGE("[http] SOCKS5 socket %d error, closing connection", (int)fd);
     close_conn_slot(slot);
@@ -825,15 +817,14 @@ static void socks5_error_cb(xPollState *loop, SOCKET_T fd, int mask, void *clien
 
 // ===================== Exported Interface Functions =====================
 // Start HTTP/HTTPS proxy service
-int https_proxy_start(const HttpProxyConfig* config, xPollState *xpoll) {
-    if (!config || !xpoll) {
+int https_proxy_start(const HttpProxyConfig* config) {
+    if (!config) {
         XLOGE("[http] Config or xpoll is null");
         return -1;
     }
 
     // Save configuration
     memcpy(&g_config, config, sizeof(HttpProxyConfig));
-    g_xpoll = xpoll;
 
     // Initialize connection list
     if (init_conn_list() != 0) {
@@ -878,7 +869,7 @@ int https_proxy_start(const HttpProxyConfig* config, xPollState *xpoll) {
     socket_set_nonblocking(g_listen_sock);
 
     // Register listening socket to xpoll
-    if (xpoll_add_event(g_xpoll, g_listen_sock, XPOLL_READABLE,
+    if (xpoll_add_event(g_listen_sock, XPOLL_READABLE,
                         accept_cb, NULL, NULL, NULL) != 0) {
         XLOGE("[http] Failed to register listening socket event");
         CLOSE_SOCKET(g_listen_sock);
@@ -896,13 +887,9 @@ void https_proxy_update(void) {
 // Stop proxy service
 void https_proxy_stop(void) {
     XLOGW("[http] try stop HTTP/HTTPS service...");
-    g_running = 0;
-
     // Close listening socket
     if (g_listen_sock != INVALID_SOCKET) {
-        if (g_xpoll) {
-            xpoll_del_event(g_xpoll, g_listen_sock, XPOLL_ALL);
-        }
+        xpoll_del_event(g_listen_sock, XPOLL_ALL);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
     }

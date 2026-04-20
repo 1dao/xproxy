@@ -47,7 +47,7 @@ typedef struct {
 } Socks5ServerConfig;
 
 /* Start socks5v service */
-int socks5_server_start(const Socks5ServerConfig* config, xPollState *xpoll);
+int socks5_server_start(const Socks5ServerConfig* config);
 
 /* Keepalive for SSH session */
 void socks5_server_update();

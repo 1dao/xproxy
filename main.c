@@ -329,8 +329,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     // Create global xpoll instance
-    xPollState *xpoll = xpoll_create();
-    if (!xpoll) {
+    if (xpoll_init()!=0) {
         XLOGE("Failed to create xpoll loop");
         socket_cleanup();
         xargs_cleanup();
@@ -360,9 +359,9 @@ int main(int argc, char *argv[]) {
         printf("SSH Username: %s\n", socks5_config.ssh_username);
         printf("========================================\n\n");
 
-        if (socks5_server_start(&socks5_config, xpoll) != 0) {
+        if (socks5_server_start(&socks5_config) != 0) {
             XLOGE("Failed to start SOCKS5 server\n");
-            xpoll_free(xpoll);
+            xpoll_uninit();
             socket_cleanup();
             xargs_cleanup();
             return EXIT_FAILURE;
@@ -394,12 +393,12 @@ int main(int argc, char *argv[]) {
         XLOGI("Max Connections:    %d", http_config.max_conns);
         XLOGI("========================================");
 
-        if (https_proxy_start(&http_config, xpoll) != 0) {
+        if (https_proxy_start(&http_config) != 0) {
             XLOGE("Failed to start HTTP/HTTPS proxy");
             if (socks5_started) {
                 socks5_server_stop();
             }
-            xpoll_free(xpoll);
+            xpoll_uninit();
             socket_cleanup();
             xargs_cleanup();
             return EXIT_FAILURE;
@@ -438,7 +437,7 @@ int main(int argc, char *argv[]) {
 
     // Main event loop
     while (g_running) {
-        int ret = xpoll_poll(xpoll, 100);  // 100 ms timeout
+        int ret = xpoll_poll(100);  // 100 ms timeout
         if (ret < 0) {
 #ifdef _WIN32
             fprintf(stderr, "xpoll_poll error: %d\n", WSAGetLastError());
@@ -468,7 +467,7 @@ int main(int argc, char *argv[]) {
         xpac_uninit();
     }
 
-    xpoll_free(xpoll);
+    xpoll_uninit();
     xargs_cleanup();
     socket_cleanup();
 

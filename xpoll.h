@@ -2,6 +2,9 @@
 #define XPOLL_H
 
 #include "socket_util.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* ── Backend selection ─────────────────────────────────────────────────────
  * Priority: epoll (Linux) > kqueue (macOS/BSD) > WSAPoll (Win32) > poll
@@ -35,27 +38,30 @@
 typedef struct xPollState xPollState;
 
 /* File event callback function type */
-typedef void (*xFileProc)(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
+typedef void (*xFileProc)(SOCKET_T fd, int mask, void *clientData);
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
-xPollState* xpoll_create(void);
-void        xpoll_free(xPollState *loop);
+int         xpoll_init(void);
+void        xpoll_uninit(void);
 xPollState* xpoll_get_default(void);
 
-int  xpoll_resize(xPollState *loop, int setsize);
+int  xpoll_resize(int setsize);
 
-int  xpoll_add_event(xPollState *loop, SOCKET_T fd, int mask,
+int  xpoll_add_event(SOCKET_T fd, int mask,
                      xFileProc rfileProc, xFileProc wfileProc,
                      xFileProc efileProc, void *clientData);
 
-void xpoll_del_event(xPollState *loop, SOCKET_T fd, int mask);
+void xpoll_del_event(SOCKET_T fd, int mask);
 
-int  xpoll_poll(xPollState *loop, int timeout_ms);
+int  xpoll_poll(int timeout_ms);
 
-int   xpoll_get_fd(xPollState *loop, SOCKET_T fd);
-void  xpoll_set_client_data(xPollState *loop, SOCKET_T fd, void *clientData);
-void* xpoll_get_client_data(xPollState *loop, SOCKET_T fd);
+int   xpoll_get_fd(SOCKET_T fd);
+void  xpoll_set_client_data(SOCKET_T fd, void *clientData);
+void* xpoll_get_client_data(SOCKET_T fd);
 
 const char* xpoll_name(void);
 
+#ifdef __cplusplus
+}
+#endif
 #endif /* XPOLL_H */

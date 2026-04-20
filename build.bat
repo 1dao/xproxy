@@ -53,7 +53,7 @@ set "OBJDIR=.obj"
 set "EXE=xproxy.exe"
 
 :: Define flags similar to Makefile
-set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_CRT_SECURE_NO_WARNINGS /DWOLFSSL_USER_SETTINGS /DWOLFSSH_USER_SETTINGS /DWOLFSSH_FWD /DWIN32 /D_CONSOLE /D_LIB"
+set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_CRT_SECURE_NO_WARNINGS /DWOLFSSL_USER_SETTINGS /DWOLFSSH_USER_SETTINGS /DWOLFSSH_FWD /DWIN32 /D_CONSOLE /D_LIB /DWOLFSSL_SP_NO_DYN_STACK"
 
 :: Add macro to replace strcpy with strcpy_s for security
 :: set "DEFS=%DEFS% /Dstrcpy=strcpy_s /Dstrcat=strcat_s /Dsprintf=sprintf_s"

@@ -17,7 +17,7 @@ typedef struct {
 
 // ===================== 接口函数 =====================
 // 启动 HTTP/HTTPS 代理服务
-int https_proxy_start(const HttpProxyConfig* config, xPollState *xpoll);
+int https_proxy_start(const HttpProxyConfig* config);
 
 // 更新状态（用于主循环）
 void https_proxy_update(void);
