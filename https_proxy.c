@@ -309,13 +309,22 @@ static int add_new_client_conn(SOCKET_T client_sock) {
 // Close and clean connection
 static void close_conn_slot(int slot) {
     if (slot < 0 || slot >= g_config.max_conns) return;
-    if (g_conn_list[slot].client_sock != INVALID_SOCKET) {
-        xpoll_del_event(g_conn_list[slot].client_sock, XPOLL_ALL);
-        CLOSE_SOCKET(g_conn_list[slot].client_sock);
+    SOCKET_T client_sock = g_conn_list[slot].client_sock;
+    SOCKET_T socks5_sock = g_conn_list[slot].socks5_sock;
+    ConnState state = g_conn_list[slot].state;
+
+    XLOGD("[http] Closing slot %d, client_sock=%d, socks5_sock=%d, current_state=%d",
+          slot, (int)client_sock, (int)socks5_sock, (int)state);
+
+    if (client_sock != INVALID_SOCKET) {
+        xpoll_del_event(client_sock, XPOLL_ALL);
+        CLOSE_SOCKET(client_sock);
+        XLOGD("[http] Locally closed client socket %d in slot %d", (int)client_sock, slot);
     }
-    if (g_conn_list[slot].socks5_sock != INVALID_SOCKET) {
-        xpoll_del_event(g_conn_list[slot].socks5_sock, XPOLL_ALL);
-        CLOSE_SOCKET(g_conn_list[slot].socks5_sock);
+    if (socks5_sock != INVALID_SOCKET) {
+        xpoll_del_event(socks5_sock, XPOLL_ALL);
+        CLOSE_SOCKET(socks5_sock);
+        XLOGD("[http] Locally closed SOCKS5 socket %d in slot %d", (int)socks5_sock, slot);
     }
 
     // Reset connection structure
@@ -328,7 +337,7 @@ static void close_conn_slot(int slot) {
 
     if (g_conn_count > 0) g_conn_count--;
 
-    XLOGI("[http] Slot %d connection closed, current connections: %d", slot, g_conn_count);
+    XLOGI("[http] Slot %d connection fully closed, current connections: %d", slot, g_conn_count);
 }
 
 // Clean connection list
@@ -510,10 +519,10 @@ static int forward2socks5(ProxyConn* conn) {
         int ret = rb_recv(conn->client_sock, conn->req_buf, sizeof(conn->req_buf),
                           &conn->req_head, &conn->req_size);
         if (ret == 0) {
-            XLOGE("[http] forward2socks5, client closed");
+            XLOGE("[http] forward2socks5: client closed connection (EOF)");
             return -1; // peer closed
         } else if (ret < 0 && !socket_check_eagain()) {
-            XLOGE("[http] forward2socks5 recv failed");
+            XLOGE("[http] forward2socks5 recv from client failed, error=%d", GET_ERRNO());
             return -1;
         }
     }
@@ -542,8 +551,14 @@ static int forward2client(ProxyConn* conn) {
     if (conn->rep_size < sizeof(conn->rep_buf)) {
         int ret = rb_recv(conn->socks5_sock, conn->rep_buf, sizeof(conn->rep_buf),
                           &conn->rep_head, &conn->rep_size);
-        if (ret == 0) return -1;
-        if (ret < 0 && !socket_check_eagain()) return -1;
+        if (ret == 0) {
+            XLOGE("[http] forward2client: SOCKS5 server closed connection (EOF)");
+            return -1;
+        }
+        if (ret < 0 && !socket_check_eagain()) {
+            XLOGE("[http] forward2client recv from SOCKS5 failed, error=%d", GET_ERRNO());
+            return -1;
+        }
     }
 
     if (conn->rep_size > 0) {
@@ -600,10 +615,10 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
 
         if (recv_len <= 0) {
             if(recv_len==0) {
-                XLOGE("[http] Client socket %d peer closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
+                XLOGE("[http] Client socket %d closed by client (EOF)", (int)conn->client_sock);
                 close_conn_slot(slot);
             }else if(!socket_check_eagain()) {
-                XLOGE("[http] Client socket %d closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
+                XLOGE("[http] Client socket %d error on read, locally closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
                 close_conn_slot(slot);
             }
             return;
@@ -697,8 +712,13 @@ static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData) {
     case CONN_STATE_AUTHING:{
         // Receive handshake response
         uint8_t handshake_resp[2];
-        if (recv(fd, (char*)handshake_resp, sizeof(handshake_resp), 0) <= 0) {
-            XLOGE("socks5 domain handshake recv failed");
+        int ret = recv(fd, (char*)handshake_resp, sizeof(handshake_resp), 0);
+        if (ret <= 0) {
+            if (ret == 0) {
+                XLOGE("[http] SOCKS5 socket %d closed by SOCKS5 server during handshake (EOF)", (int)fd);
+            } else {
+                XLOGE("[http] SOCKS5 socket %d handshake recv failed, locally closed, ERRNO=%d", (int)fd, GET_ERRNO());
+            }
             close_conn_slot(slot);
             return;
         }
@@ -717,8 +737,13 @@ static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData) {
     }
     case CONN_STATE_CONNECTING: {
         uint8_t connect_resp[10]; // Response fixed 10 bytes (regardless of ATYP)
-        if (recv(conn->socks5_sock, (char*)connect_resp, sizeof(connect_resp), 0) <= 0) {
-            XLOGE("socks5 domain connect recv failed");
+        int ret = recv(conn->socks5_sock, (char*)connect_resp, sizeof(connect_resp), 0);
+        if (ret <= 0) {
+            if (ret == 0) {
+                XLOGE("[http] SOCKS5 socket %d closed by SOCKS5 server during connect response (EOF)", (int)conn->socks5_sock);
+            } else {
+                XLOGE("[http] SOCKS5 socket %d connect response recv failed, locally closed, ERRNO=%d", (int)conn->socks5_sock, GET_ERRNO());
+            }
             close_conn_slot(slot);
             return;
         }
@@ -805,13 +830,13 @@ static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData) {
 
 static void client_error_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
-    XLOGE("[http] Client socket %d error, closing connection", (int)fd);
+    XLOGE("[http] Client socket %d error detected, locally closing connection, mask=%d", (int)fd, mask);
     close_conn_slot(slot);
 }
 
 static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData) {
     int slot = (int)(intptr_t)clientData;
-    XLOGE("[http] SOCKS5 socket %d error, closing connection", (int)fd);
+    XLOGE("[http] SOCKS5 socket %d error detected, locally closing connection, mask=%d", (int)fd, mask);
     close_conn_slot(slot);
 }
 
@@ -822,9 +847,18 @@ int https_proxy_start(const HttpProxyConfig* config) {
         XLOGE("[http] Config or xpoll is null");
         return -1;
     }
+    XLOGD("SOCKET5 SERVER ADDRESS:%s", config->socks5_server_ip);
 
     // Save configuration
     memcpy(&g_config, config, sizeof(HttpProxyConfig));
+
+    // If SOCKS5 server address is 0.0.0.0 (listening on all interfaces),
+    // replace with 127.0.0.1 for local connection since 0.0.0.0 can't be used as target address
+    if (strcmp(g_config.socks5_server_ip, "0.0.0.0") == 0) {
+        XLOGI("[http] SOCKS5 server address is 0.0.0.0, replacing with 127.0.0.1 for local connection");
+        strncpy(g_config.socks5_server_ip, "127.0.0.1", sizeof(g_config.socks5_server_ip) - 1);
+        g_config.socks5_server_ip[sizeof(g_config.socks5_server_ip) - 1] = '\0';
+    }
 
     // Initialize connection list
     if (init_conn_list() != 0) {
