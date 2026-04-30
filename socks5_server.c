@@ -12,6 +12,10 @@
 
 #define MAX_CONCURRENT_CONNECTIONS 8192
 #define MAX_REOPEN_COUNT 10 // wait for 3min
+#define SOCKS5_WRITE_BUFFER_SIZE (256 * 1024)
+#define SOCKS5_WRITE_HIGH_WATERMARK (SOCKS5_WRITE_BUFFER_SIZE * 3 / 4)
+#define SOCKS5_WRITE_LOW_WATERMARK  (SOCKS5_WRITE_BUFFER_SIZE / 4)
+
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
@@ -34,13 +38,17 @@ typedef struct {
     // IO buffers and state
     char rbuf[131072]; // ssh read
     int rlen;
-    char wbuf[65536];// ssh write
+    char wbuf[SOCKS5_WRITE_BUFFER_SIZE];// ssh write
     int wlen;
+    int read_paused;
 
     // reopen cd
     long64 last_retry_time;  // retry time
     int retry_error_count;
+    int close_pending;
 } Socks5Client;
+
+static Socks5Client *g_channel_open_client = NULL;
 
 static void socks5_send_reply(Socks5Client* client, uint8_t rep) {
     uint8_t response[256];
@@ -92,7 +100,78 @@ UNUSED_FUNCTION static int socks5_accout_auth(Socks5Client* client) {
 static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData);
 static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData);
 static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData);
+static void client_state_cb(SOCKET_T fd, int mask, void *clientData);
+static void client_error_cb(SOCKET_T fd, int mask, void *clientData);
 static void client_write_cb(SOCKET_T fd, int mask, void *clientData);
+static void socks5_channel_connected(Socks5Client* client);
+static bool socks5_channel_retry_open(Socks5Client *client);
+static void socks5_channel_tick(xhash *hash_table);
+
+static void client_pause_read(Socks5Client *client) {
+    if (!client || client->read_paused || client->client_sock == INVALID_SOCKET)
+        return;
+
+    xpoll_del_event(client->client_sock, XPOLL_READABLE);
+    client->read_paused = 1;
+    XLOGD("Paused client read, fd=%d, buffered=%d, host=%s",
+          (int)client->client_sock, client->wlen, client->target_host);
+}
+
+static void client_resume_read(Socks5Client *client) {
+    if (!client || !client->read_paused || client->client_sock == INVALID_SOCKET)
+        return;
+    if (client->state != SOCKS5_STATE_CONNECTED)
+        return;
+
+    if (xpoll_add_event(client->client_sock,
+                        XPOLL_READABLE | XPOLL_ERROR | XPOLL_CLOSE,
+                        client_state_cb, NULL, client_error_cb, client) == 0) {
+        client->read_paused = 0;
+        XLOGD("Resumed client read, fd=%d, buffered=%d, host=%s",
+              (int)client->client_sock, client->wlen, client->target_host);
+    } else {
+        XLOGE("Failed to resume client read, fd=%d, host=%s",
+              (int)client->client_sock, client->target_host);
+    }
+}
+
+static void client_update_read_backpressure(Socks5Client *client) {
+    if (!client || client->state != SOCKS5_STATE_CONNECTED)
+        return;
+
+    if (!client->read_paused && client->wlen >= SOCKS5_WRITE_HIGH_WATERMARK)
+        client_pause_read(client);
+    else if (client->read_paused && client->wlen <= SOCKS5_WRITE_LOW_WATERMARK)
+        client_resume_read(client);
+}
+
+static uint8_t socks5_open_error_reply(int err) {
+    switch (err) {
+        case WS_CHANOPEN_FAILED:
+        case WS_INVALID_CHANID:
+            return SOCKS5_REP_HOST_UNREACHABLE;
+        default:
+            return SOCKS5_REP_GENERAL_FAILURE;
+    }
+}
+
+static void ssh_schedule_channel_open(WOLFSSH* session) {
+    if (!session)
+        return;
+
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(session);
+    xhash* hash_table = xpoll_get_client_data(ssh_socket);
+    if (!hash_table)
+        return;
+
+    int mask = XPOLL_READABLE | XPOLL_ERROR | XPOLL_CLOSE;
+    if (wolfSSH_session_want_write(session))
+        mask |= XPOLL_WRITABLE;
+
+    xpoll_add_event(ssh_socket, mask, ssh_read_cb, ssh_write_cb,
+                    ssh_error_cb, hash_table);
+}
+
 static void socks5_client_stage(Socks5Client* client) {
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
     void* ud = xpoll_get_client_data(ssh_socket);
@@ -269,29 +348,16 @@ static int socks5_client_auth(Socks5Client* client) {
     client->rlen = 0;
 
     client->state = SOCKS5_STATE_OPENING;
-    client->ssh_channel = wolfSSH_channel_open(
-        client->ssh_session,
-        client->target_host, client->target_port,
-        client->client_host, client->client_port);
-    if (!client->ssh_channel) {
-        if (!wolfSSH_check_fatal(wolfSSH_get_error(client->ssh_session))) {
-            SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
-            xhash* hash_table = xpoll_get_client_data(ssh_socket);
-            if (hash_table) {
-                xpoll_add_event(ssh_socket, XPOLL_WRITABLE,
-                                NULL, ssh_write_cb, NULL, hash_table);
-            }
-            client->last_retry_time = time_get_ms() + 200;
-            return 0;
-        } else {
-            socks5_send_reply(client, SOCKS5_REP_GENERAL_FAILURE);
-            return -1;
-        }
-    }
-    return 1;
+    if (!socks5_channel_retry_open(client))
+        return client->state == SOCKS5_STATE_ERROR ? -1 : 0;
+
+    return client->state == SOCKS5_STATE_CONNECTED ? 1 : 0;
 }
 
 void socks5_client_free(Socks5Client* client) {
+    if (g_channel_open_client == client)
+        g_channel_open_client = NULL;
+
     if (client->client_sock != INVALID_SOCKET) {
         CLOSE_SOCKET(client->client_sock);
         client->client_sock = INVALID_SOCKET;
@@ -449,6 +515,8 @@ static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData) {
         }
     }
 
+    socks5_channel_tick(hash_table);
+
     xhash_foreach(hash_table, ssh_read_each_client, NULL);
 }
 
@@ -480,12 +548,14 @@ static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
     } else if (written >= remaining) {
         // All data has been written
         client->wlen = 0;
+        client_update_read_backpressure(client);
         XLOGE("All buffered data (%d bytes) written for fd=%d",
                written, (int)client->client_sock);
     } else if(written != 0) {
         // Partial write
         memmove(client->wbuf, client->wbuf + written, remaining - written);
         client->wlen = remaining - written;
+        client_update_read_backpressure(client);
         XLOGE("Partially buffered data written: %d/%d bytes for fd=%d",
                written, remaining - written, (int)client->client_sock);
          *(int*)ctx = 1;
@@ -509,7 +579,14 @@ static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData) {
     }
 
     int has_data = 0;
+    socks5_channel_tick(hash_table);
+    if (g_channel_open_client && wolfSSH_session_want_write(g_ssh_session))
+        has_data = 1;
+
     xhash_foreach(hash_table, ssh_write_each_client, &has_data);
+    if (g_channel_open_client && wolfSSH_session_want_write(g_ssh_session))
+        has_data = 1;
+
     if( has_data==0 )
         xpoll_del_event(fd, XPOLL_WRITABLE);
 }
@@ -525,15 +602,22 @@ static bool client_on_closed(xhashKey k, void* value, void *ctx) {
     return true;
 }
 
+static void socks5_channel_connected(Socks5Client* client) {
+    if (!client || client->state == SOCKS5_STATE_CONNECTED)
+        return;
+
+    client->state = SOCKS5_STATE_CONNECTED;
+    socks5_send_reply(client, SOCKS5_REP_SUCCESS);
+    XLOGE("SSH channel confirm connect, fd=%d, host=%s, trycount=%d"
+            , (int)client->client_sock, client->target_host, client->retry_error_count);
+    client->retry_error_count = 0;
+}
+
 static bool client_channel_confirm(xhashKey k, void* value, void* channel_ptr) {
     Socks5Client *client = (Socks5Client*)value;
     WOLFSSH_CHANNEL* channel = (WOLFSSH_CHANNEL*)channel_ptr;
     if (client->ssh_channel == channel) {
-        client->state = SOCKS5_STATE_CONNECTED;
-        socks5_send_reply(client, SOCKS5_REP_SUCCESS);
-        XLOGE("SSH channel confirm connect, fd=%d, host=%s, trycount=%d"
-                , (int)client->client_sock, client->target_host, client->retry_error_count);
-        client->retry_error_count = 0;
+        socks5_channel_connected(client);
         return false;
     }
     return true;
@@ -626,6 +710,7 @@ static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData) {
     wolfSSH_session_close(g_ssh_session);
     xhash_destroy(hash_table, false);
     g_ssh_session = NULL;
+    g_channel_open_client = NULL;
 
     // Create shared SSH session
     const Socks5ServerConfig* config = &g_server_config;
@@ -666,8 +751,11 @@ static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData) {
 
 static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
     Socks5Client *client = (Socks5Client*)clientData;
-    if( client->wlen > (sizeof(client->wbuf) * 3 / 4) )
-        return;// wait send
+    if (client->wlen >= SOCKS5_WRITE_HIGH_WATERMARK) {
+        client_update_read_backpressure(client);
+        return;
+    }
+
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
     xhash* hash_table = xpoll_get_client_data(ssh_socket);
     char client_rbuf[8192];
@@ -697,6 +785,7 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
         }
         memcpy(client->wbuf + client->wlen, client_rbuf, n);
         client->wlen += n;
+        client_update_read_backpressure(client);
 
         XLOGE("Appended %d bytes to write buffer, total buffered: %d bytes, %s",
                n, client->wlen, client->target_host);
@@ -714,6 +803,7 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
             } else {
                 memcpy(client->wbuf, client_rbuf, n);
                 client->wlen = n;
+                client_update_read_backpressure(client);
                 XLOGD("Buffered %d bytes, will retry writing:%s", n, client->target_host);
                 xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
             }
@@ -732,6 +822,7 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
                 } else {
                     memcpy(client->wbuf, client_rbuf + written, remaining);
                     client->wlen = remaining;
+                    client_update_read_backpressure(client);
                     XLOGE("Buffered remaining %d bytes:%s", remaining, client->target_host);
                     xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
                 }
@@ -775,6 +866,18 @@ static void client_error_cb(SOCKET_T fd, int mask, void *clientData) {
     Socks5Client *client = (Socks5Client*)clientData;
     XLOGE("client try close:%s, mask=%d", client->target_host, mask);
 
+    if (g_channel_open_client == client &&
+        client->state == SOCKS5_STATE_OPENING &&
+        !client->ssh_channel) {
+        client->close_pending = 1;
+        client->last_retry_time = 0;
+        xpoll_del_event(client->client_sock, XPOLL_ALL);
+        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+        XLOGE("client close delayed while SSH channel open is pending, fd=%d, host=%s",
+              (int)fd, client->target_host);
+        return;
+    }
+
     if (client->state != SOCKS5_STATE_ERROR) {
         client->state = SOCKS5_STATE_ERROR;
         XLOGE("client closed %d-%d", (int)fd, (int)client->client_sock);
@@ -786,31 +889,85 @@ static void client_error_cb(SOCKET_T fd, int mask, void *clientData) {
 }
 
 static bool socks5_channel_retry_open(Socks5Client *client) {
-    if (SOCKS5_STATE_OPENING != client->state) return false;
-    if (time_get_ms() < client->last_retry_time) return false;
-    if (client->ssh_channel) return true;
+    if (!client || SOCKS5_STATE_OPENING != client->state)
+        return false;
+    if (client->ssh_channel) {
+        if (g_channel_open_client == client)
+            g_channel_open_client = NULL;
+        if (client->close_pending) {
+            wolfSSH_channel_close(client->ssh_channel);
+            client->ssh_channel = NULL;
+            client->state = SOCKS5_STATE_ERROR;
+            socks5_client_cleanup(client->client_sock, client);
+            return false;
+        }
+        socks5_channel_connected(client);
+        return true;
+    }
+
+    /*
+     * libssh2 keeps a single pending direct-tcpip open request inside the
+     * session. A later call must resume that same request, so only one SOCKS
+     * client may drive channel open at a time.
+     */
+    if (g_channel_open_client && g_channel_open_client != client)
+        return true;
+    if (time_get_ms() < client->last_retry_time)
+        return true;
+
+    g_channel_open_client = client;
 
     client->ssh_channel = wolfSSH_channel_open(client->ssh_session,
                                                client->target_host, client->target_port,
                                                client->client_host, client->client_port);
-    client->last_retry_time = time_get_ms() + 50;
-    client->retry_error_count++;
 
     if (client->ssh_channel == NULL) {
-        if (client->retry_error_count > MAX_REOPEN_COUNT
-            || wolfSSH_check_fatal(wolfSSH_get_error(client->ssh_session))) {
+        int err = wolfSSH_get_error(client->ssh_session);
+        if (wolfSSH_is_temporary_state(client->ssh_session)) {
+            client->last_retry_time = time_get_ms() + 10;
+            ssh_schedule_channel_open(client->ssh_session);
+            return true;
+        }
+
+        g_channel_open_client = NULL;
+
+        if (client->close_pending) {
+            client->state = SOCKS5_STATE_ERROR;
+            socks5_client_cleanup(client->client_sock, client);
+            return false;
+        }
+
+        if (err == WS_CHANOPEN_FAILED || err == WS_INVALID_CHANID ||
+            wolfSSH_check_fatal(err)) {
+            socks5_send_reply(client, socks5_open_error_reply(err));
+            client->state = SOCKS5_STATE_ERROR;
+            SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+            XLOGE("SSH channel open failed, fd=%d, host=%s, err=%d:%s %s",
+                  (int)client->client_sock, client->target_host, err,
+                  wolfSSH_ErrorToName(err),
+                  wolfSSH_get_error_message(client->ssh_session));
+            return false;
+        }
+
+        client->last_retry_time = time_get_ms() + 250;
+        client->retry_error_count++;
+        if (client->retry_error_count > MAX_REOPEN_COUNT) {
             socks5_send_reply(client, SOCKS5_REP_TTL_EXPIRED);
             client->state = SOCKS5_STATE_ERROR;
             SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s",
-                  (int)client->client_sock, client->target_host);
+            XLOGE("socks5_channel_retry_open retries reached, fd=%d, host=%s, err=%d:%s",
+                  (int)client->client_sock, client->target_host, err,
+                  wolfSSH_ErrorToName(err));
             return false;
         }
+    } else {
+        g_channel_open_client = NULL;
+        socks5_channel_connected(client);
     }
     return true;
 }
 
-void client_state_cb(SOCKET_T fd, int mask, void *clientData) {
+static void client_state_cb(SOCKET_T fd, int mask, void *clientData) {
     Socks5Client *client = (Socks5Client*)clientData;
     if (!client || client->state == SOCKS5_STATE_ERROR)
         return;
@@ -904,11 +1061,31 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData) {
     XLOGD("New client registered, active connections: %d", g_active_connections);
 }
 
-static bool socks5_channel_each_reopen(xhashKey k, void* value, void* ud) {
-    (void)ud;
+static bool socks5_channel_find_opening(xhashKey k, void* value, void* ud) {
+    (void)k;
     Socks5Client *client = (Socks5Client*)value;
-    socks5_channel_retry_open(client);
+    Socks5Client **out = (Socks5Client**)ud;
+    if (client && client->state == SOCKS5_STATE_OPENING) {
+        *out = client;
+        return false;
+    }
     return true;
+}
+
+static void socks5_channel_tick(xhash *hash_table) {
+    Socks5Client *client = NULL;
+
+    if (g_channel_open_client) {
+        socks5_channel_retry_open(g_channel_open_client);
+        return;
+    }
+
+    if (!hash_table)
+        return;
+
+    xhash_foreach(hash_table, socks5_channel_find_opening, &client);
+    if (client)
+        socks5_channel_retry_open(client);
 }
 
 static void handle_ssh_session_error() {
@@ -980,7 +1157,7 @@ void socks5_server_update() {
         SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_session);
         xhash* hash = (xhash*)xpoll_get_client_data(ssh_sock);
         if(hash)
-            xhash_foreach(hash, socks5_channel_each_reopen, NULL);
+            socks5_channel_tick(hash);
     }
 }
 
@@ -1108,6 +1285,7 @@ void socks5_server_stop(void) {
             xhash_foreach(hash, client_on_closed, NULL);
             xhash_destroy(hash, false);
         }
+        wolfSSH_session_close(g_ssh_session);
     }
 
     g_server_running = 0;
