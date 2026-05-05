@@ -40,6 +40,7 @@
 *.googleearth.com socks5
 *.panoramio.com socks5
 *.googlevideo.com socks5
+*antigravity.google socks5
 *.googleusercontent.com socks5
 *.1e100.net socks5
 *.ggpht.com socks5

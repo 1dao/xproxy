@@ -1,10 +1,16 @@
 # Makefile for SOCKS5 Proxy Server using libssh2
 # All sources compiled from source
 
+BUILD ?= release
+
 CC = gcc
-#CFLAGS = -Wall -g3 -O0 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
-CFLAGS = -Wall -Os -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
+ifeq ($(BUILD),release)
+	CFLAGS = -Wall -Os -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
+else
+	CFLAGS = -Wall -g3 -O0 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
+endif
 CPPFLAGS = -I. -I./3rd/libssh2/include -I./3rd/libssh2/src
+
 UNAME_S := $(shell uname -s 2>/dev/null)
 SIZE_CFLAGS = -ffunction-sections -fdata-sections -flto
 GNU_SIZE_LDFLAGS = -flto -Wl,--gc-sections -s
@@ -89,9 +95,14 @@ LIBSSH2_OBJECTS = $(addprefix $(OBJDIR)/libssh2/, $(notdir $(LIBSSH2_SOURCES:.c=
 
 ALL_OBJECTS = $(APP_OBJECTS) $(LIBSSH2_OBJECTS)
 
-.PHONY: all clean run
+#.PHONY: all clean run
+.PHONY: all release debug clean run
+all: release
+release: clean
+	$(MAKE) BUILD=release $(EXE)
 
-all: $(EXE)
+debug: clean
+	$(MAKE) BUILD=debug $(EXE)
 
 # Create required directories
 $(OBJDIR):
