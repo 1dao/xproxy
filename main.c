@@ -98,6 +98,7 @@ void get_hidden_input(const char* prompt, char* buffer, int size) {
 
 void interactive_config(Socks5ServerConfig *config) {
     static char bind_addr[256], ssh_host[256], ssh_user[256], ssh_pass[256];
+    static char proxy_user[256], proxy_pass[256];
     char buffer[256];
 
     printf("Enter SOCKS5 bind address [default: 127.0.0.1]: ");
@@ -130,6 +131,19 @@ void interactive_config(Socks5ServerConfig *config) {
 
     get_hidden_input("Enter SSH password: ", ssh_pass, sizeof(ssh_pass));
     config->ssh_password = ssh_pass;
+
+    printf("Enter SOCKS5 auth username (optional, empty = no auth): ");
+    fgets(buffer, sizeof(buffer), stdin);
+    buffer[strcspn(buffer, "\n")] = 0;
+    strcpy(proxy_user, buffer);
+    config->proxy_username = proxy_user;
+
+    if (proxy_user[0]) {
+        get_hidden_input("Enter SOCKS5 auth password: ", proxy_pass, sizeof(proxy_pass));
+    } else {
+        proxy_pass[0] = '\0';
+    }
+    config->proxy_password = proxy_pass;
 }
 
 void show_help(const char *prog_name) {
@@ -142,6 +156,8 @@ void show_help(const char *prog_name) {
     printf("  -P, --pass <password>   SSH password\n");
     printf("  -b, --bind <address>   SOCKS5/HTTP proxy bind address (default: 127.0.0.1)\n");
     printf("  -l, --listen <port>    SOCKS5/HTTP proxy listen port (default: 1080)\n");
+    printf("  --socks-user <user>    SOCKS5 username auth (optional)\n");
+    printf("  --socks-pass <pass>    SOCKS5 password auth (optional)\n");
     printf("  -t, --http_port <port>  HTTP proxy listen port (default: 7890)\n");
     printf("  --disable-http          Disable HTTP/HTTPS proxy (default: enabled)\n");
     printf("  --max-http-conns <num>  Max HTTP proxy connections (default: 1024)\n");
@@ -183,6 +199,7 @@ int main(int argc, char *argv[]) {
 
     // Configuration variables
     static char bind_addr[256], ssh_host[256], ssh_user[256], ssh_pass[256];
+    static char socks_user[256], socks_pass[256];
     static char http_port_str[16];
     static char max_http_conns_str[16], pac_file[256];
 
@@ -190,6 +207,8 @@ int main(int argc, char *argv[]) {
     strcpy(ssh_host, "");
     strcpy(ssh_user, "");
     strcpy(ssh_pass, "");
+    strcpy(socks_user, "");
+    strcpy(socks_pass, "");
     strcpy(http_port_str, "7890");
     strcpy(max_http_conns_str, "1024");
     strcpy(pac_file, "pac_config.txt");
@@ -202,6 +221,8 @@ int main(int argc, char *argv[]) {
         {'P', "pass", ssh_pass, 0},
         {'b', "bind", "127.0.0.1", 0},
         {'l', "listen", "1080", 0},
+        {0, "socks-user", socks_user, 0},
+        {0, "socks-pass", socks_pass, 0},
         // HTTP proxy options
         {'t', "http_port", http_port_str, 0},
         {0, "disable-http", NULL, 1},
@@ -222,6 +243,8 @@ int main(int argc, char *argv[]) {
     strcpy(ssh_host, xargs_get("h"));
     strcpy(ssh_user, xargs_get("u"));
     strcpy(ssh_pass, xargs_get("P"));
+    strcpy(socks_user, xargs_get("socks-user"));
+    strcpy(socks_pass, xargs_get("socks-pass"));
 
     int has_ssh_args = strlen(ssh_host) > 0;
     int disable_http = (xargs_get("disable-http") != NULL);
@@ -245,7 +268,9 @@ int main(int argc, char *argv[]) {
                 .ssh_host = ssh_host,
                 .ssh_port = atoi(xargs_get("p")),
                 .ssh_username = ssh_user,
-                .ssh_password = ssh_pass
+                .ssh_password = ssh_pass,
+                .proxy_username = socks_user,
+                .proxy_password = socks_pass
             };
             interactive_config(&config);
 
@@ -347,7 +372,9 @@ int main(int argc, char *argv[]) {
             .ssh_host = ssh_host,
             .ssh_port = atoi(xargs_get("p")),
             .ssh_username = ssh_user,
-            .ssh_password = ssh_pass
+            .ssh_password = ssh_pass,
+            .proxy_username = socks_user,
+            .proxy_password = socks_pass
         };
 
         printf("\n========================================\n");

@@ -31,6 +31,7 @@
 typedef enum {
     SOCKS5_STATE_INIT,
     SOCKS5_STATE_AUTH,
+    SOCKS5_STATE_AUTH_PASSWORD,
     SOCKS5_STATE_REQUEST,
     SOCKS5_STATE_OPENING,
     SOCKS5_STATE_CONNECTED,
@@ -44,6 +45,8 @@ typedef struct {
     const char* ssh_password;
     const char* bind_address;
     uint16_t bind_port;
+    const char* proxy_username; /* optional SOCKS5 auth user (RFC1929) */
+    const char* proxy_password; /* optional SOCKS5 auth pass (RFC1929) */
 } Socks5ServerConfig;
 
 /* Start socks5v service */

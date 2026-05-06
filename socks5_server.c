@@ -19,9 +19,35 @@
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
-static int g_active_connections = 0;
 static WOLFSSH *g_ssh_session = NULL;
 static SOCKET_T g_listen_sock = INVALID_SOCKET;
+
+static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData);
+static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData);
+static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData);
+static int ssh_channel_close_callback(WOLFSSH_CHANNEL* channel, void* ctx);
+static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx);
+static int ssh_channel_open_fail_callback(WOLFSSH_CHANNEL* channel, void* ctx);
+
+static int socks5_active_connections(void) {
+    if (!g_ssh_session) return 0;
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
+    xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
+    return hash_table ? (int)xhash_size(hash_table) : 0;
+}
+
+static bool socks5_userpass_configured(void) {
+    const char* u = g_server_config.proxy_username;
+    const char* p = g_server_config.proxy_password;
+    return u && p && u[0] != '\0' && p[0] != '\0';
+}
+
+static bool socks5_equal_token(const char* a, size_t alen, const char* b) {
+    if (!a || !b) return false;
+    size_t blen = strlen(b);
+    if (alen != blen) return false;
+    return memcmp(a, b, alen) == 0;
+}
 
 typedef struct {
     SOCKET_T client_sock;
@@ -29,7 +55,6 @@ typedef struct {
     uint8_t auth_method;
     char target_host[256];
     uint16_t target_port;
-    uint8_t cmd;
     WOLFSSH *ssh_session;
     WOLFSSH_CHANNEL *ssh_channel;
     char client_host[256];
@@ -45,6 +70,51 @@ typedef struct {
     long64 last_retry_time;  // retry time
     int retry_error_count;
 } Socks5Client;
+
+static void socks5_destroy_shared_session(WOLFSSH* session) {
+    if (!session) return;
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(session);
+    xhash *hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
+    xpoll_del_event(ssh_socket, XPOLL_ALL);
+    if (hash_table) {
+        xhash_destroy(hash_table, false);
+    }
+    wolfSSH_session_close(session);
+}
+
+static WOLFSSH* socks5_create_shared_session(const Socks5ServerConfig* config) {
+    if (!config) return NULL;
+
+    WOLFSSH *ssh_session = wolfSSH_session_open(
+        config->ssh_host,
+        config->ssh_port,
+        config->ssh_username,
+        config->ssh_password);
+    if (!ssh_session) {
+        return NULL;
+    }
+
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
+    xhash *hash_table = xhash_create(512, XHASH_KEY_INT);
+    if (!hash_table) {
+        wolfSSH_session_close(ssh_session);
+        return NULL;
+    }
+
+    if (xpoll_add_event(ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
+                        ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
+        xhash_destroy(hash_table, false);
+        wolfSSH_session_close(ssh_session);
+        return NULL;
+    }
+
+    wolfSSH_channel_callback(ssh_session,
+                             ssh_channel_close_callback,
+                             ssh_channel_open_fini_callback,
+                             ssh_channel_open_fail_callback,
+                             hash_table);
+    return ssh_session;
+}
 
 static void socks5_client_wbuf_reset(Socks5Client* client) {
     if (!client) return;
@@ -141,24 +211,35 @@ UNUSED_FUNCTION static int socks5_accout_auth(Socks5Client* client) {
     return -1;
 }
 
-static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData);
-static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData);
-static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData);
 static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
 static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud);
-static void socks5_client_stage(Socks5Client* client) {
+static int socks5_client_stage(Socks5Client* client) {
+    if (!client || !g_ssh_session) return -1;
+
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
-    void* ud = xpoll_get_client_data(ssh_socket);
-    if (ud) {
-        xhash *hash_table = (xhash*)ud;
-        xhash_set_int(hash_table, (long)client->client_sock, client);
-        XLOGI("Client fd=%d added to SSH socket hash table", (int)client->client_sock);
-        if (xhash_size(hash_table) == 1) {
-            xpoll_add_event(ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
-                            ssh_read_cb, NULL, ssh_error_cb, hash_table);
-            XLOGD("SSH socket fd=%d added to XPOLL_ALL event", (int)ssh_socket);
-        }
+    xhash *hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
+    if (!hash_table) {
+        XLOGE("SSH hash table missing, cannot stage client fd=%d", (int)client->client_sock);
+        return -1;
     }
+
+    if (!xhash_set_int(hash_table, (long)client->client_sock, client)) {
+        XLOGE("Failed to stage client fd=%d into SSH hash table", (int)client->client_sock);
+        return -1;
+    }
+
+    XLOGI("Client fd=%d added to SSH socket hash table", (int)client->client_sock);
+    if (xhash_size(hash_table) == 1) {
+        if (xpoll_add_event(ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
+                            ssh_read_cb, NULL, ssh_error_cb, hash_table) != 0) {
+            xhash_remove_int(hash_table, (long)client->client_sock, false);
+            XLOGE("Failed to register SSH readable/error events for fd=%d", (int)ssh_socket);
+            return -1;
+        }
+        XLOGD("SSH socket fd=%d added to XPOLL_ALL event", (int)ssh_socket);
+    }
+
+    return 0;
 }
 
 static int socks5_client_open_channel(Socks5Client* client) {
@@ -203,10 +284,19 @@ static int socks5_consume_auth(Socks5Client* client, const uint8_t* buf,
     }
 
     uint8_t selected = 0xFF;
+    const bool need_userpass = socks5_userpass_configured();
     for (size_t i = 0; i < (size_t)nmethods; i++) {
-        if (buf[2 + i] == SOCKS5_AUTH_NONE) {
-            selected = SOCKS5_AUTH_NONE;
-            break;
+        uint8_t method = buf[2 + i];
+        if (need_userpass) {
+            if (method == SOCKS5_AUTH_PASSWORD) {
+                selected = SOCKS5_AUTH_PASSWORD;
+                break;
+            }
+        } else {
+            if (method == SOCKS5_AUTH_NONE) {
+                selected = SOCKS5_AUTH_NONE;
+                break;
+            }
         }
     }
 
@@ -229,6 +319,48 @@ static int socks5_consume_auth(Socks5Client* client, const uint8_t* buf,
     }
 
     client->auth_method = selected;
+    client->state = (selected == SOCKS5_AUTH_PASSWORD)
+        ? SOCKS5_STATE_AUTH_PASSWORD
+        : SOCKS5_STATE_REQUEST;
+    return 1;
+}
+
+static int socks5_consume_userpass_auth(Socks5Client* client, const uint8_t* buf,
+                                        size_t len, size_t* consumed) {
+    if (!client || !buf || !consumed) return -1;
+    *consumed = 0;
+    if (len < 2) return 0;
+
+    if (buf[0] != 0x01) {
+        XLOGE("Invalid RFC1929 auth version=0x%02X, fd=%d",
+              buf[0], (int)client->client_sock);
+        return -1;
+    }
+
+    size_t ulen = (size_t)buf[1];
+    size_t pos = 2;
+    if (len < pos + ulen + 1) return 0;
+
+    const char* uname = (const char*)&buf[pos];
+    pos += ulen;
+
+    size_t plen = (size_t)buf[pos++];
+    if (len < pos + plen) return 0;
+
+    const char* passwd = (const char*)&buf[pos];
+    pos += plen;
+    *consumed = pos;
+
+    bool ok = socks5_equal_token(uname, ulen, g_server_config.proxy_username) &&
+              socks5_equal_token(passwd, plen, g_server_config.proxy_password);
+    uint8_t resp[2] = {0x01, ok ? 0x00 : 0x01};
+    send(client->client_sock, (const char*)resp, 2, 0);
+
+    if (!ok) {
+        XLOGE("SOCKS5 username/password auth failed, fd=%d", (int)client->client_sock);
+        return -1;
+    }
+
     client->state = SOCKS5_STATE_REQUEST;
     return 1;
 }
@@ -350,7 +482,7 @@ static void socks5_client_cleanup(SOCKET_T fd, Socks5Client *client) {
         xpoll_del_event(key_fd, XPOLL_ALL);
     }
 
-    if (g_ssh_session) {
+    if (g_ssh_session && key_fd != INVALID_SOCKET) {
         SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
         xhash* hash = xpoll_get_client_data(ssh_socket);
 
@@ -367,8 +499,7 @@ static void socks5_client_cleanup(SOCKET_T fd, Socks5Client *client) {
     socks5_client_free(client);
     free(client);
 
-    g_active_connections--;
-    XLOGI("Active connections: %d (connection closed)", g_active_connections);
+    XLOGI("Active connections: %d (connection closed)", socks5_active_connections());
 }
 
 static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
@@ -521,13 +652,11 @@ static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData) {
 }
 
 static bool client_on_closed(xhashKey k, void* value, void *ctx) {
+    (void)k;
+    (void)ctx;
     Socks5Client *client = (Socks5Client*)value;
     if (!client) return true;
-    if(!ctx) {
-        socks5_client_cleanup(client->client_sock, client);
-    } else if(client->state==SOCKS5_STATE_ERROR) {
-        socks5_client_cleanup(client->client_sock, client);
-    }
+    socks5_client_cleanup(client->client_sock, client);
     return true;
 }
 
@@ -612,8 +741,6 @@ static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
         miss = xhash_foreach(hash, client_channel_confirm, channel);
     if (miss) {
         XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
-        XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
-        XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
         wolfSSH_ChannelExit(channel);
     }
     return WS_SUCCESS;
@@ -631,57 +758,22 @@ static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData) {
     if (!hash_table)
         return;
     if(xpoll_get_client_data(fd)!=clientData) {
-        XLOGE("ssh_error_cb: clientData mismatch for fd=%d, ", (int)fd);
-        XLOGE("ssh_error_cb: clientData mismatch for fd=%d", (int)fd);
         XLOGE("ssh_error_cb: clientData mismatch for fd=%d", (int)fd);
         return;
     }
 
-    XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
-    XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
     XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
 
     xhash_foreach(hash_table, client_on_closed, NULL);
-    xpoll_del_event(fd, XPOLL_ALL);
-    wolfSSH_session_close(g_ssh_session);
-    xhash_destroy(hash_table, false);
+    socks5_destroy_shared_session(g_ssh_session);
     g_ssh_session = NULL;
 
-    // Create shared SSH session
-    const Socks5ServerConfig* config = &g_server_config;
-    WOLFSSH *ssh_session = wolfSSH_session_open(
-        config->ssh_host,
-        config->ssh_port,
-        config->ssh_username,
-        config->ssh_password);
-
-    if (!ssh_session) {
-        XLOGE("ReCreating Failed to create shared SSH session");
+    g_ssh_session = socks5_create_shared_session(&g_server_config);
+    if (!g_ssh_session) {
+        XLOGE("ReCreating failed to create shared SSH session");
         return;
     }
-    XLOGW("ReCreating Shared SSH session created successfully");
-
-    // Setup hash table for SSH socket
-    SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-    hash_table = xhash_create(512, XHASH_KEY_INT);
-    if (!hash_table) {
-        XLOGE("ReCreating Failed to create hash table");
-        wolfSSH_session_close(ssh_session);
-        return;
-    }
-
-    // Register SSH socket events
-    if (xpoll_add_event(ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
-                        ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
-        XLOGE("ReCreating Failed to register SSH socket event");
-        xhash_destroy(hash_table, false);
-        wolfSSH_session_close(ssh_session);
-        return;
-    }
-    wolfSSH_channel_callback(ssh_session, ssh_channel_close_callback, ssh_channel_open_fini_callback, ssh_channel_open_fail_callback, hash_table);
-
-    // reset
-    g_ssh_session = ssh_session;
+    XLOGW("ReCreating shared SSH session created successfully");
 }
 
 static int socks5_forward_client_data_to_ssh(Socks5Client* client,
@@ -747,6 +839,19 @@ static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t le
             }
             if (rc == 0) break;
             off += used;
+            continue;
+        }
+
+        if (client->state == SOCKS5_STATE_AUTH_PASSWORD) {
+            size_t used = 0;
+            int rc = socks5_consume_userpass_auth(client, (const uint8_t*)data + off, len - off, &used);
+            if (rc < 0) {
+                client->state = SOCKS5_STATE_ERROR;
+                if (client->io_ch) xchannel_close(client->io_ch, "auth_userpass_error");
+                return len;
+            }
+            if (used > 0) off += used;
+            if (rc == 0 && used == 0) break;
             continue;
         }
 
@@ -852,8 +957,9 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData) {
         return;
     }
 
-    if (g_active_connections >= MAX_CONCURRENT_CONNECTIONS) {
-        XLOGE("Too many connections (%d), rejecting new connection", g_active_connections);
+    int active_connections = socks5_active_connections();
+    if (active_connections >= MAX_CONCURRENT_CONNECTIONS) {
+        XLOGE("Too many connections (%d), rejecting new connection", active_connections);
         CLOSE_SOCKET(client_sock);
         return;
     }
@@ -878,12 +984,10 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData) {
         return;
     }
 
-    if (true) {
-        inet_ntop(AF_INET, &client_addr.sin_addr, client->client_host, sizeof(client->client_host));
-        client->client_port = ntohs(client_addr.sin_port);
-        XLOGW("New client connection from %s:%d, socket=%d",
-                client->client_host, client->client_port, (int)client_sock);
-    }
+    inet_ntop(AF_INET, &client_addr.sin_addr, client->client_host, sizeof(client->client_host));
+    client->client_port = ntohs(client_addr.sin_port);
+    XLOGW("New client connection from %s:%d, socket=%d",
+            client->client_host, client->client_port, (int)client_sock);
 
     xChannelConfig chcfg = XCHANNEL_CONFIG_INIT;
     chcfg.frame = XCHANNEL_FRAME_RAW;
@@ -908,10 +1012,14 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData) {
     }
 
     client->state = SOCKS5_STATE_AUTH;
-    socks5_client_stage(client);
+    if (socks5_client_stage(client) != 0) {
+        XLOGE("Failed to stage new client fd=%d", (int)client_sock);
+        socks5_client_free(client);
+        free(client);
+        return;
+    }
 
-    g_active_connections++;
-    XLOGD("New client registered, active connections: %d", g_active_connections);
+    XLOGD("New client registered, active connections: %d", socks5_active_connections());
 }
 
 static bool socks5_channel_each_reopen(xhashKey k, void* value, void* ud) {
@@ -939,8 +1047,6 @@ void socks5_server_update() {
             int rc = wolfSSH_session_keepalive(g_ssh_session);
             if (rc < 0) {
                 XLOGE("keepalive error: %d", rc);
-                XLOGE("keepalive error: %d", rc);
-                XLOGE("keepalive error: %d", rc);
                 handle_ssh_session_error();
                 return;
             }
@@ -948,41 +1054,12 @@ void socks5_server_update() {
         XLOGI("keepalive success %lld", time_get_ms());
 
         if(!g_ssh_session) {
-            // Create shared SSH session
-            const Socks5ServerConfig* config = &g_server_config;
-            WOLFSSH *ssh_session = wolfSSH_session_open(
-                config->ssh_host,
-                config->ssh_port,
-                config->ssh_username,
-                config->ssh_password);
-
-            if (!ssh_session) {
-                XLOGE("ReCreating Failed to create shared SSH session");
+            g_ssh_session = socks5_create_shared_session(&g_server_config);
+            if (!g_ssh_session) {
+                XLOGE("ReCreating failed to create shared SSH session");
                 return;
             }
-            XLOGW("ReCreating Shared SSH session created successfully");
-
-            // Setup hash table for SSH socket
-            SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-            xhash* hash_table = xhash_create(512, XHASH_KEY_INT);
-            if (!hash_table) {
-                XLOGE("ReCreating Failed to create hash table");
-                wolfSSH_session_close(ssh_session);
-                return;
-            }
-
-            // Register SSH socket events
-            if (xpoll_add_event(ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
-                                ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
-                XLOGE("ReCreating Failed to register SSH socket event");
-                xhash_destroy(hash_table, false);
-                wolfSSH_session_close(ssh_session);
-                return;
-            }
-            wolfSSH_channel_callback(ssh_session, ssh_channel_close_callback, ssh_channel_open_fini_callback, ssh_channel_open_fail_callback, hash_table);
-
-            // reset
-            g_ssh_session = ssh_session;
+            XLOGW("ReCreating shared SSH session created successfully");
         }
     }
 
@@ -1001,44 +1078,28 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     // Initialize server configuration
     memcpy(&g_server_config, config, sizeof(Socks5ServerConfig));
 
-    // Create shared SSH session
-    XLOGI("Creating shared SSH session to %s:%d...", config->ssh_host, config->ssh_port);
-    WOLFSSH *ssh_session = wolfSSH_session_open(
-        config->ssh_host,
-        config->ssh_port,
-        config->ssh_username,
-        config->ssh_password);
+    {
+        const bool has_user = config->proxy_username && config->proxy_username[0] != '\0';
+        const bool has_pass = config->proxy_password && config->proxy_password[0] != '\0';
+        if (has_user != has_pass) {
+            XLOGE("Invalid SOCKS5 auth config: both --socks-user and --socks-pass are required");
+            return -1;
+        }
+    }
 
+    XLOGI("Creating shared SSH session to %s:%d...", config->ssh_host, config->ssh_port);
+    WOLFSSH *ssh_session = socks5_create_shared_session(config);
     if (!ssh_session) {
         XLOGE("Failed to create shared SSH session");
         return -1;
     }
     XLOGI("Shared SSH session created successfully");
 
-    // Setup hash table for SSH socket
-    SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
-    xhash *hash_table = xhash_create(512, XHASH_KEY_INT);
-    if (!hash_table) {
-        XLOGE("Failed to create hash table");
-        wolfSSH_session_close(ssh_session);
-        return -1;
-    }
-
-    // Register SSH socket events
-    if (xpoll_add_event(ssh_socket, XPOLL_READABLE|XPOLL_ERROR|XPOLL_CLOSE,
-                        ssh_read_cb, ssh_write_cb, ssh_error_cb, hash_table) != 0) {
-        XLOGE("Failed to register SSH socket event");
-        xhash_destroy(hash_table, false);
-        wolfSSH_session_close(ssh_session);
-        return -1;
-    }
-
     // Create listening socket
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listen_sock == INVALID_SOCKET) {
         XLOGE("listen socket creation failed");
-        xhash_destroy(hash_table, false);
-        wolfSSH_session_close(ssh_session);
+        socks5_destroy_shared_session(ssh_session);
         return -1;
     }
 
@@ -1056,8 +1117,7 @@ int socks5_server_start(const Socks5ServerConfig* config) {
 
     if (bind(g_listen_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         XLOGE("bind failed");
-        xhash_destroy(hash_table, false);
-        wolfSSH_session_close(ssh_session);
+        socks5_destroy_shared_session(ssh_session);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
         return -1;
@@ -1066,8 +1126,7 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     // Listen
     if (listen(g_listen_sock, SOMAXCONN) < 0) {
         XLOGE("listen failed");
-        xhash_destroy(hash_table, false);
-        wolfSSH_session_close(ssh_session);
+        socks5_destroy_shared_session(ssh_session);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
         return -1;
@@ -1077,13 +1136,11 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     if (xpoll_add_event(g_listen_sock, XPOLL_READABLE,
                         (xFileProc)accept_cb_single, NULL, NULL, NULL) != 0) {
         XLOGE("Failed to register listen socket event");
-        xhash_destroy(hash_table, false);
-        wolfSSH_session_close(ssh_session);
+        socks5_destroy_shared_session(ssh_session);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
         return -1;
     }
-    wolfSSH_channel_callback(ssh_session, ssh_channel_close_callback, ssh_channel_open_fini_callback, ssh_channel_open_fail_callback, hash_table);
 
     // Set shared SSH session
     g_ssh_session = ssh_session;
@@ -1094,6 +1151,7 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     XLOGI("SOCKS5 proxy is running...");
     XLOGI("Listen address: %s:%d", config->bind_address, config->bind_port);
     XLOGI("SSH tunnel: %s:%d (user: %s)", config->ssh_host, config->ssh_port, config->ssh_username);
+    XLOGI("SOCKS5 auth: %s", socks5_userpass_configured() ? "username/password" : "none");
     XLOGI("Using %s for I/O multiplexing", xpoll_name());
 
     return 0;
@@ -1116,8 +1174,8 @@ void socks5_server_stop(void) {
         xhash* hash = (xhash*)xpoll_get_client_data(ssh_sock);
         if(hash) {
             xhash_foreach(hash, client_on_closed, NULL);
-            xhash_destroy(hash, false);
         }
+        socks5_destroy_shared_session(g_ssh_session);
     }
 
     g_server_running = 0;
