@@ -1,6 +1,12 @@
 #ifndef XSOCK_H
 #define XSOCK_H
 
+#ifndef _WIN32
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

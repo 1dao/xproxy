@@ -572,7 +572,6 @@ int xpoll_add_event(SOCKET_T fd, int mask,
 
     int old_mask = fe->mask;
     int new_mask = old_mask | mask;
-    if (new_mask == old_mask && !is_new) return 0;
 
     /* Save originals for rollback. */
     xFileProc old_rp = fe->rfileProc;
@@ -584,6 +583,9 @@ int xpoll_add_event(SOCKET_T fd, int mask,
     if (wfileProc) fe->wfileProc = wfileProc;
     if (efileProc) fe->efileProc = efileProc;
     fe->clientData = clientData;
+
+    if (new_mask == old_mask && !is_new) return 0;
+
     fe->mask       = new_mask;
 
     struct epoll_event ee;
@@ -626,7 +628,13 @@ int xpoll_add_event(SOCKET_T fd, int mask,
 
     int old_mask = fe->mask;
     int new_mask = old_mask | mask;
-    if (new_mask == old_mask && !is_new) return 0;
+    if (new_mask == old_mask && !is_new) {
+        if (rfileProc) fe->rfileProc = rfileProc;
+        if (wfileProc) fe->wfileProc = wfileProc;
+        if (efileProc) fe->efileProc = efileProc;
+        fe->clientData = clientData;
+        return 0;
+    }
 
     struct kevent changes[2];
     int nchanges = 0;
@@ -672,6 +680,10 @@ int xpoll_add_event(SOCKET_T fd, int mask,
         loop->poll_fes[idx]    = fe;
         loop->nfds++;
     } else if ((fe->mask & mask) == mask) {
+        if (rfileProc) fe->rfileProc = rfileProc;
+        if (wfileProc) fe->wfileProc = wfileProc;
+        if (efileProc) fe->efileProc = efileProc;
+        fe->clientData = clientData;
         return 0;
     }
 

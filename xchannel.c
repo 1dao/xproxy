@@ -428,7 +428,8 @@ static int xchannel_uring_arm_read(xChannel* ch) {
 
     xchannel_retain(ch);
     ch->read_pending = true;
-    ch->read_req = xpoll_submit_poll(ch->fd, XPOLL_READABLE | XPOLL_CLOSE,
+    ch->read_req = xpoll_submit_poll(ch->fd,
+                                     XPOLL_READABLE | XPOLL_ERROR | XPOLL_CLOSE,
                                      xchannel_uring_read_done, ch);
     if (!ch->read_req) {
         ch->read_pending = false;
@@ -447,7 +448,8 @@ static int xchannel_uring_arm_write(xChannel* ch) {
 
     xchannel_retain(ch);
     ch->write_pending = true;
-    ch->write_req = xpoll_submit_poll(ch->fd, XPOLL_WRITABLE | XPOLL_CLOSE,
+    ch->write_req = xpoll_submit_poll(ch->fd,
+                                      XPOLL_WRITABLE | XPOLL_ERROR | XPOLL_CLOSE,
                                       xchannel_uring_write_done, ch);
     if (!ch->write_req) {
         ch->write_pending = false;

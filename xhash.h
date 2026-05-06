@@ -321,28 +321,35 @@ XHASH_INLINE size_t xhash_size(const xhash *h) {
  *
  * Visits only non-empty buckets — O(count), not O(size).
  * Return false from cb to stop early.
- * Do not modify the table inside cb.
+ * The callback may remove the current key. Do not insert entries or remove
+ * unrelated keys from inside cb.
  */
 XHASH_INLINE bool xhash_foreach(xhash *h, xhashForeachCb cb, void *ctx) {
     if (!h || !cb) return false;
 
     if (h->key_type == XHASH_KEY_INT) {
-        for (size_t i = 0; i < h->active.count; i++) {
-            xhashNode *n = h->buckets[h->active.indices[i]];
+        for (size_t i = 0; i < h->active.count;) {
+            size_t idx = h->active.indices[i];
+            xhashNode *n = h->buckets[idx];
             while (n) {
                 xhashNode *next = n->next;
                 if (!cb((xhashKey){ .i = n->key.i }, n->value, ctx)) return false;
                 n = next;
             }
+            if (i < h->active.count && h->active.indices[i] == idx)
+                i++;
         }
     } else {
-        for (size_t i = 0; i < h->active.count; i++) {
-            xhashNode *n = h->buckets[h->active.indices[i]];
+        for (size_t i = 0; i < h->active.count;) {
+            size_t idx = h->active.indices[i];
+            xhashNode *n = h->buckets[idx];
             while (n) {
                 xhashNode *next = n->next;
                 if (!cb((xhashKey){ .s = n->key.s }, n->value, ctx)) return false;
                 n = next;
             }
+            if (i < h->active.count && h->active.indices[i] == idx)
+                i++;
         }
     }
     return true;

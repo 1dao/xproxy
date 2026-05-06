@@ -1,9 +1,3 @@
-#ifndef _WIN32
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE
-#endif
-#endif
-
 #include "https_proxy.h"
 #include "xsock.h"
 #include "xchannel.h"
