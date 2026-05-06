@@ -22,9 +22,9 @@ static int g_server_running = 0;
 static WOLFSSH *g_ssh_session = NULL;
 static SOCKET_T g_listen_sock = INVALID_SOCKET;
 
-static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData);
-static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData);
-static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData);
+static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
 static int ssh_channel_close_callback(WOLFSSH_CHANNEL* channel, void* ctx);
 static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx);
 static int ssh_channel_open_fail_callback(WOLFSSH_CHANNEL* channel, void* ctx);
@@ -566,7 +566,8 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
     return true;
 }
 
-static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData) {
+static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)submit_arg;
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table) {
         XLOGE("ERROR: ssh_read_cb called with NULL hash table!");
@@ -579,7 +580,7 @@ static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData) {
         int error = wolfSSH_get_error(g_ssh_session);
         if (wolfSSH_check_fatal(error)) {
             XLOGE("wolfSSH_worker fatal error: %d:%s", error, wolfSSH_ErrorToName(error));
-            ssh_error_cb(fd, XPOLL_ERROR, clientData);
+            ssh_error_cb(fd, XPOLL_ERROR, clientData, NULL);
             return;
         } else if(error != WS_CHANOPEN_FAILED && WS_INVALID_CHANID != error) {
             XLOGE("wolfSSH_worker error: %d:%s", error, wolfSSH_ErrorToName(error));
@@ -633,7 +634,8 @@ static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
     return true;  // Continue to next client
 }
 
-static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData) {
+static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)submit_arg;
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table)
         return;
@@ -753,7 +755,8 @@ static int ssh_channel_open_fail_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
     return WS_SUCCESS;
 }
 
-static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData) {
+static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)submit_arg;
     xhash *hash_table = (xhash*)clientData;
     if (!hash_table)
         return;
@@ -943,9 +946,10 @@ static bool socks5_channel_retry_open(Socks5Client *client) {
     return true;
 }
 
-static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData) {
+static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData, xPollRequest *submit_arg) {
     (void)mask;
     (void)clientData;
+    (void)submit_arg;
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
@@ -1033,7 +1037,7 @@ static void handle_ssh_session_error() {
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
     xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
     if (hash_table) {
-        ssh_error_cb(ssh_socket, XPOLL_ERROR | XPOLL_CLOSE, hash_table);
+        ssh_error_cb(ssh_socket, XPOLL_ERROR | XPOLL_CLOSE, hash_table, NULL);
     }
 }
 
@@ -1134,7 +1138,7 @@ int socks5_server_start(const Socks5ServerConfig* config) {
 
     // Register listening socket event
     if (xpoll_add_event(g_listen_sock, XPOLL_READABLE,
-                        (xFileProc)accept_cb_single, NULL, NULL, NULL) != 0) {
+                        accept_cb_single, NULL, NULL, NULL) != 0) {
         XLOGE("Failed to register listen socket event");
         socks5_destroy_shared_session(ssh_session);
         CLOSE_SOCKET(g_listen_sock);

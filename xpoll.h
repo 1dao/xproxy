@@ -42,11 +42,26 @@ extern "C" {
 #define XPOLL_CLOSE     8
 #define XPOLL_ALL       (XPOLL_READABLE | XPOLL_WRITABLE | XPOLL_ERROR | XPOLL_CLOSE)
 
-/* Forward declaration - opaque structure */
-typedef struct xPollState xPollState;
+/* Forward declarations - opaque structures
+ *
+ * xPollRequest is always forward-declared so the unified callback signature
+ * carries a `submit_arg` slot regardless of whether io_uring is compiled in.
+ * In non-uring builds the type is incomplete and `submit_arg` is always NULL
+ * (no submission API exists to produce one).
+ */
+typedef struct xPollState   xPollState;
+typedef struct xPollRequest xPollRequest;
 
-/* File event callback function type */
-typedef void (*xFileProc)(SOCKET_T fd, int mask, void *clientData);
+/* File event callback function type.
+ *
+ * `submit_arg` is the submission this event belongs to:
+ *   - NULL for readiness events (epoll/kqueue/poll/wsapoll dispatch).
+ *   - non-NULL when the event is the completion of an xpoll_submit_* call;
+ *     the pointer identifies the original submission and is valid only
+ *     during the callback. Use the xpoll_req_* accessors to read fields.
+ */
+typedef void (*xFileProc)(SOCKET_T fd, int mask,
+                          void *clientData, xPollRequest *submit_arg);
 
 #if defined(XPOLL_WITH_IO_URING)
 #define XPOLL_OP_RECV    1
@@ -54,21 +69,11 @@ typedef void (*xFileProc)(SOCKET_T fd, int mask, void *clientData);
 #define XPOLL_OP_POLL    3
 #define XPOLL_OP_CANCEL  4
 
-typedef struct xPollRequest xPollRequest;
-
-typedef struct xPollCompletion {
-    SOCKET_T      fd;
-    int           op;
-    int           res;       /* cqe->res: bytes, poll revents, or -errno */
-    unsigned      flags;     /* cqe->flags */
-    int           mask;      /* XPOLL_* view derived from res */
-    void         *buffer;
-    size_t        length;
-    xPollRequest *request;   /* valid only during the callback */
-} xPollCompletion;
-
-typedef void (*xPollCompleteProc)(const xPollCompletion *completion,
-                                  void *clientData);
+/* Completion accessors — valid only during the completion callback. */
+int      xpoll_req_op   (const xPollRequest *r);
+int      xpoll_req_res  (const xPollRequest *r);  /* cqe->res */
+unsigned xpoll_req_flags(const xPollRequest *r);  /* cqe->flags */
+SOCKET_T xpoll_req_fd   (const xPollRequest *r);
 #endif
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
@@ -98,14 +103,14 @@ const char* xpoll_name(void);
 int xpoll_uring_enabled(void);
 
 xPollRequest* xpoll_submit_recv(SOCKET_T fd, void *buf, size_t len, int flags,
-                                xPollCompleteProc completeProc,
+                                xFileProc completeProc,
                                 void *clientData);
 xPollRequest* xpoll_submit_send(SOCKET_T fd, const void *buf, size_t len,
                                 int flags,
-                                xPollCompleteProc completeProc,
+                                xFileProc completeProc,
                                 void *clientData);
 xPollRequest* xpoll_submit_poll(SOCKET_T fd, int mask,
-                                xPollCompleteProc completeProc,
+                                xFileProc completeProc,
                                 void *clientData);
 
 int xpoll_cancel_request(xPollRequest *request);

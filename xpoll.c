@@ -58,14 +58,18 @@ typedef struct xPoolFD {
 
 #if defined(XPOLL_WITH_IO_URING)
 struct xPollRequest {
+    /* submission inputs */
     SOCKET_T          fd;
     int               op;
-    int               mask;
-    int               flags;
+    int               submit_mask;   /* mask for OP_POLL */
+    int               submit_flags;  /* syscall flags for SEND/RECV */
     void             *buffer;
     size_t            length;
-    xPollCompleteProc completeProc;
+    xFileProc         completeProc;
     void             *clientData;
+    /* completion state — written by _uring_drain right before the callback */
+    int               cqe_res;
+    unsigned          cqe_flags;
 };
 #endif
 
@@ -160,20 +164,16 @@ static int _uring_drain(xPollState *loop) {
     while (io_uring_peek_cqe(&loop->uring, &cqe) == 0 && cqe) {
         xPollRequest *req = (xPollRequest*)(uintptr_t)cqe->user_data;
         if (req) {
-            xPollCompletion completion;
-            memset(&completion, 0, sizeof(completion));
-            completion.fd      = req->fd;
-            completion.op      = req->op;
-            completion.res     = cqe->res;
-            completion.flags   = cqe->flags;
-            completion.mask    = _uring_mask_from_completion(req, cqe->res);
-            completion.buffer  = req->buffer;
-            completion.length  = req->length;
-            completion.request = req;
+            /* Stamp completion state into the request so accessors work. */
+            req->cqe_res   = cqe->res;
+            req->cqe_flags = cqe->flags;
 
-            xPollCompleteProc proc = req->completeProc;
-            void *clientData = req->clientData;
-            if (proc) proc(&completion, clientData);
+            int mask = _uring_mask_from_completion(req, cqe->res);
+            xFileProc proc       = req->completeProc;
+            void     *clientData = req->clientData;
+            SOCKET_T  fd         = req->fd;
+
+            if (proc) proc(fd, mask, clientData, req);
             free(req);
             processed++;
         }
@@ -225,14 +225,14 @@ static void _uring_loop_uninit(xPollState *loop) {
 
 static xPollRequest* _uring_request_new(SOCKET_T fd, int op, int mask,
                                         int flags, void *buffer, size_t length,
-                                        xPollCompleteProc completeProc,
+                                        xFileProc completeProc,
                                         void *clientData) {
     xPollRequest *req = (xPollRequest*)calloc(1, sizeof(*req));
     if (!req) return NULL;
     req->fd = fd;
     req->op = op;
-    req->mask = mask;
-    req->flags = flags;
+    req->submit_mask = mask;
+    req->submit_flags = flags;
     req->buffer = buffer;
     req->length = length;
     req->completeProc = completeProc;
@@ -270,13 +270,13 @@ static xPollRequest* _uring_submit_request(xPollRequest *req) {
 
     if (req->op == XPOLL_OP_RECV) {
         io_uring_prep_recv(sqe, (int)req->fd, req->buffer,
-                           (unsigned)req->length, req->flags);
+                           (unsigned)req->length, req->submit_flags);
     } else if (req->op == XPOLL_OP_SEND) {
         io_uring_prep_send(sqe, (int)req->fd, req->buffer,
-                           (unsigned)req->length, req->flags);
+                           (unsigned)req->length, req->submit_flags);
     } else if (req->op == XPOLL_OP_POLL) {
         io_uring_prep_poll_add(sqe, (int)req->fd,
-                               _uring_poll_events_from_mask(req->mask));
+                               _uring_poll_events_from_mask(req->submit_mask));
     } else {
         free(req);
         errno = EINVAL;
@@ -842,13 +842,13 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         SOCKET_T fd = fe->fd;
 
         if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
-            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData);
+            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData, NULL);
 
         fe = _fe_get_same(loop, sfd, fe);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & XPOLL_READABLE) && fe->rfileProc)
-            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData);
+            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData, NULL);
 
         fe = _fe_get_same(loop, sfd, fe);
         if (!fe) { num_processed++; continue; }
@@ -857,7 +857,8 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
             fprintf(stderr,
                 "[xpoll] epoll close/error fd=%d events=0x%x\n",
                 (int)sfd, e->events);
-            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), fe->clientData);
+            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
+                          fe->clientData, NULL);
         }
         num_processed++;
     }
@@ -898,13 +899,13 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         SOCKET_T fd = fe->fd;
 
         if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
-            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData);
+            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData, NULL);
 
         fe = _fe_get_same(loop, sfd, fe);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & XPOLL_READABLE) && fe->rfileProc)
-            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData);
+            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData, NULL);
 
         fe = _fe_get_same(loop, sfd, fe);
         if (!fe) { num_processed++; continue; }
@@ -913,7 +914,8 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
             fprintf(stderr,
                 "[xpoll] kqueue close/error fd=%d flags=0x%x\n",
                 (int)sfd, ke->flags);
-            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), fe->clientData);
+            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
+                          fe->clientData, NULL);
         }
         num_processed++;
     }
@@ -961,13 +963,13 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         SOCKET_T  fd = fe->fd;
 
         if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
-            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData);
+            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData, NULL);
 
         fe = _fe_get_same(loop, fd, fe);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & XPOLL_READABLE) && fe->rfileProc)
-            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData);
+            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData, NULL);
 
         fe = _fe_get_same(loop, fd, fe);
         if (!fe) { num_processed++; continue; }
@@ -976,7 +978,8 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
             fprintf(stderr,
                 "[xpoll] poll close/error fd=%d revents=0x%x\n",
                 (int)fd, (unsigned)revents);
-            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), fe->clientData);
+            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
+                          fe->clientData, NULL);
         }
         num_processed++;
     }
@@ -1024,7 +1027,7 @@ int xpoll_uring_enabled(void) {
 }
 
 xPollRequest* xpoll_submit_recv(SOCKET_T fd, void *buf, size_t len, int flags,
-                                xPollCompleteProc completeProc,
+                                xFileProc completeProc,
                                 void *clientData) {
     if (!buf || len == 0) {
         errno = EINVAL;
@@ -1037,7 +1040,7 @@ xPollRequest* xpoll_submit_recv(SOCKET_T fd, void *buf, size_t len, int flags,
 
 xPollRequest* xpoll_submit_send(SOCKET_T fd, const void *buf, size_t len,
                                 int flags,
-                                xPollCompleteProc completeProc,
+                                xFileProc completeProc,
                                 void *clientData) {
     if (!buf || len == 0) {
         errno = EINVAL;
@@ -1049,7 +1052,7 @@ xPollRequest* xpoll_submit_send(SOCKET_T fd, const void *buf, size_t len,
 }
 
 xPollRequest* xpoll_submit_poll(SOCKET_T fd, int mask,
-                                xPollCompleteProc completeProc,
+                                xFileProc completeProc,
                                 void *clientData) {
     if ((mask & XPOLL_ALL) == 0) {
         errno = EINVAL;
@@ -1058,6 +1061,20 @@ xPollRequest* xpoll_submit_poll(SOCKET_T fd, int mask,
     return _uring_submit_request(
         _uring_request_new(fd, XPOLL_OP_POLL, mask, 0,
                            NULL, 0, completeProc, clientData));
+}
+
+/* ── Completion accessors ─────────────────────────────────────────────── */
+int xpoll_req_op(const xPollRequest *r) {
+    return r ? r->op : 0;
+}
+int xpoll_req_res(const xPollRequest *r) {
+    return r ? r->cqe_res : 0;
+}
+unsigned xpoll_req_flags(const xPollRequest *r) {
+    return r ? r->cqe_flags : 0u;
+}
+SOCKET_T xpoll_req_fd(const xPollRequest *r) {
+    return r ? r->fd : (SOCKET_T)-1;
 }
 
 int xpoll_cancel_request(xPollRequest *request) {

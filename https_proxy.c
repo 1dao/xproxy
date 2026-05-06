@@ -378,12 +378,12 @@ static void cleanup_conn_list(void) {
 }
 
 // ===================== Forward Declare Callback Functions =====================
-static void accept_cb(SOCKET_T fd, int mask, void *clientData);
-static void client_read_cb(SOCKET_T fd, int mask, void *clientData);
-static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData);
-static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData);
-static void client_error_cb(SOCKET_T fd, int mask, void *clientData);
-static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData);
+static void accept_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void client_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void client_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
+static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
 static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
 static size_t socks5_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
 static void tunnel_channel_close_cb(xChannel* ch, const char* reason, void* ud);
@@ -593,7 +593,10 @@ static int handle_client_request(int slot) {
     return 0;
 }
 
-static void accept_cb(SOCKET_T fd, int mask, void *clientData) {
+static void accept_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)mask;
+    (void)clientData;
+    (void)submit_arg;
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     SOCKET_T client_sock = accept(fd, (struct sockaddr*)&client_addr, &client_addr_len);
@@ -620,7 +623,8 @@ static void accept_cb(SOCKET_T fd, int mask, void *clientData) {
 }
 
 // Client read callback
-static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
+static void client_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)submit_arg;
     int slot = (int)(intptr_t)clientData;
     if (slot < 0 || slot >= g_config.max_conns) return;
 
@@ -705,7 +709,9 @@ static inline int socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
 }
 
 // SOCKS5 server read callback
-static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData) {
+static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)mask;
+    (void)submit_arg;
     int slot = (int)(intptr_t)clientData;
     if (slot < 0 || slot >= g_config.max_conns) return;
 
@@ -800,7 +806,9 @@ static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData) {
     }
 }
 
-static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData) {
+static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)mask;
+    (void)submit_arg;
     int slot = (int)(intptr_t)clientData;
     if (slot < 0 || slot >= g_config.max_conns) return;
 
@@ -837,13 +845,15 @@ static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData) {
     }
 }
 
-static void client_error_cb(SOCKET_T fd, int mask, void *clientData) {
+static void client_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)submit_arg;
     int slot = (int)(intptr_t)clientData;
     XLOGE("[http] Client socket %d error detected, locally closing connection, mask=%d", (int)fd, mask);
     close_conn_slot(slot);
 }
 
-static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData) {
+static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
+    (void)submit_arg;
     int slot = (int)(intptr_t)clientData;
     XLOGE("[http] SOCKS5 socket %d error detected, locally closing connection, mask=%d", (int)fd, mask);
     close_conn_slot(slot);

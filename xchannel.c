@@ -83,15 +83,21 @@ struct xChannel {
     void* userdata;
 };
 
-static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData);
-static void xchannel_write_event(SOCKET_T fd, int mask, void* clientData);
-static void xchannel_connect_event(SOCKET_T fd, int mask, void* clientData);
-static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData);
+static void xchannel_read_event(SOCKET_T fd, int mask,
+                                void* clientData, xPollRequest* submit_arg);
+static void xchannel_write_event(SOCKET_T fd, int mask,
+                                 void* clientData, xPollRequest* submit_arg);
+static void xchannel_connect_event(SOCKET_T fd, int mask,
+                                   void* clientData, xPollRequest* submit_arg);
+static void xchannel_error_event(SOCKET_T fd, int mask,
+                                 void* clientData, xPollRequest* submit_arg);
 #if defined(XCHANNEL_WITH_IO_URING)
 static int xchannel_uring_arm_read(xChannel* ch);
 static int xchannel_uring_arm_write(xChannel* ch);
-static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData);
-static void xchannel_uring_write_done(const xPollCompletion* ev, void* clientData);
+static void xchannel_uring_read_done(SOCKET_T fd, int mask,
+                                     void* clientData, xPollRequest* submit_arg);
+static void xchannel_uring_write_done(SOCKET_T fd, int mask,
+                                      void* clientData, xPollRequest* submit_arg);
 #endif
 
 static inline size_t xbuf_size(const xBuffer* b) {
@@ -638,9 +644,11 @@ static bool finish_connect(xChannel* ch) {
     return !ch->closed;
 }
 
-static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData) {
+static void xchannel_read_event(SOCKET_T fd, int mask,
+                                void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     xChannel* ch = (xChannel*)clientData;
     if (!ch || ch->closed) return;
 
@@ -705,9 +713,11 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData) {
     xchannel_release(ch);
 }
 
-static void xchannel_write_event(SOCKET_T fd, int mask, void* clientData) {
+static void xchannel_write_event(SOCKET_T fd, int mask,
+                                 void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     xChannel* ch = (xChannel*)clientData;
     if (!ch || ch->closed) return;
     xchannel_retain(ch);
@@ -715,9 +725,11 @@ static void xchannel_write_event(SOCKET_T fd, int mask, void* clientData) {
     xchannel_release(ch);
 }
 
-static void xchannel_connect_event(SOCKET_T fd, int mask, void* clientData) {
+static void xchannel_connect_event(SOCKET_T fd, int mask,
+                                   void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     xChannel* ch = (xChannel*)clientData;
     if (!ch || ch->closed) return;
     xchannel_retain(ch);
@@ -725,9 +737,11 @@ static void xchannel_connect_event(SOCKET_T fd, int mask, void* clientData) {
     xchannel_release(ch);
 }
 
-static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData) {
+static void xchannel_error_event(SOCKET_T fd, int mask,
+                                 void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     xChannel* ch = (xChannel*)clientData;
     if (!ch || ch->closed) return;
     xchannel_retain(ch);
@@ -736,11 +750,13 @@ static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData) {
 }
 
 #if defined(XCHANNEL_WITH_IO_URING)
-static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData) {
+static void xchannel_uring_read_done(SOCKET_T fd, int mask,
+                                     void* clientData, xPollRequest* submit_arg) {
+    (void)fd;
     xChannel* ch = (xChannel*)clientData;
     if (!ch) return;
 
-    if (!ev || ev->request != ch->read_req) {
+    if (!submit_arg || submit_arg != ch->read_req) {
         xchannel_release(ch);
         return;
     }
@@ -749,10 +765,10 @@ static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData
     ch->read_req = NULL;
 
     if (!ch->closed && ch->attached) {
-        if (ev->res < 0 || (ev->mask & XPOLL_ERROR)) {
-            xchannel_error_event(ch->fd, XPOLL_ERROR, ch);
-        } else if (ev->mask & (XPOLL_READABLE | XPOLL_CLOSE)) {
-            xchannel_read_event(ch->fd, ev->mask, ch);
+        if (xpoll_req_res(submit_arg) < 0 || (mask & XPOLL_ERROR)) {
+            xchannel_error_event(ch->fd, XPOLL_ERROR, ch, NULL);
+        } else if (mask & (XPOLL_READABLE | XPOLL_CLOSE)) {
+            xchannel_read_event(ch->fd, mask, ch, NULL);
         }
 
         if (!ch->closed && ch->attached &&
@@ -764,11 +780,13 @@ static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData
     xchannel_release(ch);
 }
 
-static void xchannel_uring_write_done(const xPollCompletion* ev, void* clientData) {
+static void xchannel_uring_write_done(SOCKET_T fd, int mask,
+                                      void* clientData, xPollRequest* submit_arg) {
+    (void)fd;
     xChannel* ch = (xChannel*)clientData;
     if (!ch) return;
 
-    if (!ev || ev->request != ch->write_req) {
+    if (!submit_arg || submit_arg != ch->write_req) {
         xchannel_release(ch);
         return;
     }
@@ -777,12 +795,12 @@ static void xchannel_uring_write_done(const xPollCompletion* ev, void* clientDat
     ch->write_req = NULL;
 
     if (!ch->closed && ch->attached) {
-        if (ev->res < 0 || (ev->mask & XPOLL_ERROR)) {
-            xchannel_error_event(ch->fd, XPOLL_ERROR, ch);
+        if (xpoll_req_res(submit_arg) < 0 || (mask & XPOLL_ERROR)) {
+            xchannel_error_event(ch->fd, XPOLL_ERROR, ch, NULL);
         } else if (ch->connect_pending) {
-            xchannel_connect_event(ch->fd, ev->mask, ch);
-        } else if (ev->mask & (XPOLL_WRITABLE | XPOLL_CLOSE)) {
-            xchannel_write_event(ch->fd, ev->mask, ch);
+            xchannel_connect_event(ch->fd, mask, ch, NULL);
+        } else if (mask & (XPOLL_WRITABLE | XPOLL_CLOSE)) {
+            xchannel_write_event(ch->fd, mask, ch, NULL);
         }
 
         if (!ch->closed && ch->attached &&
