@@ -326,6 +326,15 @@ static xPoolFD* _fe_get(xPollState *loop, SOCKET_T fd) {
     return (xPoolFD*)xhash_get_int(loop->fd_map, _fd_key(fd));
 }
 
+/* During callback dispatch, handlers may delete/recreate the same fd.
+ * Ensure we only continue dispatching if the exact same entry is still alive.
+ */
+static xPoolFD* _fe_get_same(xPollState *loop, SOCKET_T fd, xPoolFD *expect) {
+    xPoolFD *fe = _fe_get(loop, fd);
+    if (!fe || fe != expect || fe->mask == XPOLL_NONE) return NULL;
+    return fe;
+}
+
 static xPoolFD* _fe_create(xPollState *loop, SOCKET_T fd) {
     xPoolFD *fe = (xPoolFD*)malloc(sizeof(xPoolFD));
     if (!fe) return NULL;
@@ -818,22 +827,25 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (e->events & EPOLLOUT)                 mask |= XPOLL_WRITABLE;
         if (e->events & (EPOLLERR | EPOLLHUP))    mask |= XPOLL_ERROR | XPOLL_CLOSE;
 
-        /* Snapshot — handler may modify or destroy fe. */
-        xFileProc rp = fe->rfileProc;
-        xFileProc wp = fe->wfileProc;
-        xFileProc ep = fe->efileProc;
-        void     *ud = fe->clientData;
-        SOCKET_T  fd = fe->fd;
+        SOCKET_T fd = fe->fd;
 
-        if ((mask & XPOLL_WRITABLE) && wp)
-            wp(fd, XPOLL_WRITABLE, ud);
-        if ((mask & XPOLL_READABLE) && rp)
-            rp(fd, XPOLL_READABLE, ud);
-        if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && ep) {
+        if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
+            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData);
+
+        fe = _fe_get_same(loop, sfd, fe);
+        if (!fe) { num_processed++; continue; }
+
+        if ((mask & XPOLL_READABLE) && fe->rfileProc)
+            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData);
+
+        fe = _fe_get_same(loop, sfd, fe);
+        if (!fe) { num_processed++; continue; }
+
+        if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
             fprintf(stderr,
                 "[xpoll] epoll close/error fd=%d events=0x%x\n",
                 (int)sfd, e->events);
-            ep(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
+            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), fe->clientData);
         }
         num_processed++;
     }
@@ -871,21 +883,25 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (ke->flags  & EV_EOF)         mask |= XPOLL_CLOSE;
         if (ke->flags  & EV_ERROR)       mask |= XPOLL_ERROR;
 
-        xFileProc rp = fe->rfileProc;
-        xFileProc wp = fe->wfileProc;
-        xFileProc ep = fe->efileProc;
-        void     *ud = fe->clientData;
-        SOCKET_T  fd = fe->fd;
+        SOCKET_T fd = fe->fd;
 
-        if ((mask & XPOLL_WRITABLE) && wp)
-            wp(fd, XPOLL_WRITABLE, ud);
-        if ((mask & XPOLL_READABLE) && rp)
-            rp(fd, XPOLL_READABLE, ud);
-        if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && ep) {
+        if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
+            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData);
+
+        fe = _fe_get_same(loop, sfd, fe);
+        if (!fe) { num_processed++; continue; }
+
+        if ((mask & XPOLL_READABLE) && fe->rfileProc)
+            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData);
+
+        fe = _fe_get_same(loop, sfd, fe);
+        if (!fe) { num_processed++; continue; }
+
+        if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
             fprintf(stderr,
                 "[xpoll] kqueue close/error fd=%d flags=0x%x\n",
                 (int)sfd, ke->flags);
-            ep(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
+            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), fe->clientData);
         }
         num_processed++;
     }
@@ -930,21 +946,25 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         xPoolFD *fe = loop->poll_fes[i];
         if (!fe) continue;
 
-        xFileProc rp = fe->rfileProc;
-        xFileProc wp = fe->wfileProc;
-        xFileProc ep = fe->efileProc;
-        void     *ud = fe->clientData;
         SOCKET_T  fd = fe->fd;
 
-        if ((mask & XPOLL_WRITABLE) && wp)
-            wp(fd, XPOLL_WRITABLE, ud);
-        if ((mask & XPOLL_READABLE) && rp)
-            rp(fd, XPOLL_READABLE, ud);
-        if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && ep) {
+        if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
+            fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData);
+
+        fe = _fe_get_same(loop, fd, fe);
+        if (!fe) { num_processed++; continue; }
+
+        if ((mask & XPOLL_READABLE) && fe->rfileProc)
+            fe->rfileProc(fd, XPOLL_READABLE, fe->clientData);
+
+        fe = _fe_get_same(loop, fd, fe);
+        if (!fe) { num_processed++; continue; }
+
+        if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
             fprintf(stderr,
                 "[xpoll] poll close/error fd=%d revents=0x%x\n",
                 (int)fd, (unsigned)revents);
-            ep(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
+            fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), fe->clientData);
         }
         num_processed++;
     }

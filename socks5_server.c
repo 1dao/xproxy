@@ -1,5 +1,6 @@
 #include "socks5_server.h"
 #include "xsock.h"
+#include "xchannel.h"
 #include "ssh_tunnel.h"
 
 #include "xpoll.h"
@@ -36,6 +37,7 @@ typedef struct {
     int rlen;
     char wbuf[65536];// ssh write
     int wlen;
+    xChannel *io_ch;
 
     // reopen cd
     long64 last_retry_time;  // retry time
@@ -92,7 +94,8 @@ UNUSED_FUNCTION static int socks5_accout_auth(Socks5Client* client) {
 static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData);
 static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData);
 static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData);
-static void client_write_cb(SOCKET_T fd, int mask, void *clientData);
+static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
+static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud);
 static void socks5_client_stage(Socks5Client* client) {
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
     void* ud = xpoll_get_client_data(ssh_socket);
@@ -292,6 +295,13 @@ static int socks5_client_auth(Socks5Client* client) {
 }
 
 void socks5_client_free(Socks5Client* client) {
+    if (client->io_ch) {
+        xChannel *ch = client->io_ch;
+        client->io_ch = NULL;
+        xchannel_destroy(ch);
+        client->client_sock = INVALID_SOCKET;
+    }
+
     if (client->client_sock != INVALID_SOCKET) {
         CLOSE_SOCKET(client->client_sock);
         client->client_sock = INVALID_SOCKET;
@@ -310,15 +320,18 @@ void socks5_client_free(Socks5Client* client) {
 
 static void socks5_client_cleanup(SOCKET_T fd, Socks5Client *client) {
     if (!client) return;
+    SOCKET_T key_fd = (fd != INVALID_SOCKET) ? fd : client->client_sock;
     // unreg ev
-    xpoll_del_event(client->client_sock, XPOLL_ALL);
+    if (key_fd != INVALID_SOCKET) {
+        xpoll_del_event(key_fd, XPOLL_ALL);
+    }
 
     if (g_ssh_session) {
         SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
         xhash* hash = xpoll_get_client_data(ssh_socket);
 
         if (hash) {
-            xhash_remove_int(hash, (long)client->client_sock, false);
+            xhash_remove_int(hash, (long)key_fd, false);
 
             if (xhash_size(hash) <= 0) {
                 xpoll_del_event(ssh_socket, XPOLL_READABLE);
@@ -341,15 +354,6 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
     if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel)
         return true;  // Continue to next client
 
-    if (client->rlen < 0 || client->rlen >= sizeof(client->rbuf)) {
-        XLOGE("Warning: Invalid rlen=%d, resetting to 0 for fd=%d",
-                   client->rlen, (int)client->client_sock);
-        client->rlen = 0;
-        client->state = SOCKS5_STATE_ERROR;
-        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-        return true;
-    }
-
     if (client->wlen < 0 || client->wlen >= sizeof(client->wbuf)) {
         XLOGE("Warning: Invalid wlen=%d, resetting to 0 for fd=%d",
                    client->wlen, (int)client->client_sock);
@@ -367,46 +371,24 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
         }
     }
 
-    // Try to read this channel
-    int n = wolfSSH_channel_read(client->ssh_channel,
-                                client->rbuf+client->rlen,
-                                sizeof(client->rbuf)-client->rlen);
+    char ssh_rbuf[8192];
+    int n = wolfSSH_channel_read(client->ssh_channel, ssh_rbuf, sizeof(ssh_rbuf));
     if (n > 0) {
-        // Successfully read, send to client
-        int total = n + client->rlen;
-        int sent = send(client->client_sock, client->rbuf, total, 0);
-        if (sent != total) {
-            if (sent <= 0 ){
-                if(socket_check_eagain()) {
-                    XLOGI("Channel send failed %d bytes to client fd=%d (sent=%d), eagain got",
-                           n, (int)client->client_sock, sent);
-                    xpoll_add_event(client->client_sock, XPOLL_WRITABLE,
-                                    NULL, client_write_cb, NULL, client);
-                } else {
-                    client->state = SOCKS5_STATE_ERROR;
-                    XLOGE("Channel send failed %d bytes to client fd=%d (sent=%d), close got",
-                           n, (int)client->client_sock, sent);
-                }
-            } else {
-                if (sent > 0 && sent < total) {
-                    memmove(client->rbuf, client->rbuf + sent, total - sent);
-                    client->rlen = total - sent;
-                    XLOGI("Channel data send %d bytes to client fd=%d (sent=%d)",
-                           n, (int)client->client_sock, sent);
-                    xpoll_add_event(client->client_sock, XPOLL_WRITABLE,
-                                    NULL, client_write_cb, NULL, client);
-                } else {
-                    XLOGE("Invalid sent value %d, resetting buffer", sent);
-                    client->rlen = 0;
-                }
-            }
-        } else {
-            // Check if channel is EOF
-            client->rlen = 0;
-            if (wolfSSH_channel_eof(client->ssh_channel)!=0) {
-                XLOGE("Channel read finished && EOF for fd=%d", (int)client->client_sock);
-                client->state = SOCKS5_STATE_ERROR;
-            }
+        if (!client->io_ch) {
+            XLOGE("Client channel missing for fd=%d", (int)client->client_sock);
+            client->state = SOCKS5_STATE_ERROR;
+            SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+            return true;
+        }
+        int rc = xchannel_send_raw(client->io_ch, ssh_rbuf, (size_t)n);
+        if (rc != 0) {
+            client->state = SOCKS5_STATE_ERROR;
+            XLOGE("Channel send failed %d bytes to client fd=%d, rc=%d",
+                  n, (int)client->client_sock, rc);
+            xchannel_close(client->io_ch, "client_send_error");
+        } else if (wolfSSH_channel_eof(client->ssh_channel)!=0) {
+            XLOGE("Channel read finished && EOF for fd=%d", (int)client->client_sock);
+            client->state = SOCKS5_STATE_ERROR;
         }
     } else if (n < 0) {
         if (wolfSSH_channel_eof(client->ssh_channel)!=0) {
@@ -529,6 +511,36 @@ static bool client_channel_confirm(xhashKey k, void* value, void* channel_ptr) {
     Socks5Client *client = (Socks5Client*)value;
     WOLFSSH_CHANNEL* channel = (WOLFSSH_CHANNEL*)channel_ptr;
     if (client->ssh_channel == channel) {
+        xChannelConfig chcfg = XCHANNEL_CONFIG_INIT;
+        chcfg.frame = XCHANNEL_FRAME_RAW;
+        chcfg.packet_cb = client_channel_packet_cb;
+        chcfg.close_cb = client_channel_close_cb;
+        chcfg.userdata = client;
+
+        if (client->io_ch) {
+            xchannel_destroy(client->io_ch);
+            client->io_ch = NULL;
+        }
+
+        xpoll_del_event(client->client_sock, XPOLL_ALL);
+        client->io_ch = xchannel_create(client->client_sock, &chcfg);
+        if (!client->io_ch) {
+            XLOGE("Failed to create client xchannel for fd=%d", (int)client->client_sock);
+            client->state = SOCKS5_STATE_ERROR;
+            SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+            return false;
+        }
+        xchannel_set_max_send(client->io_ch, 16 * 1024 * 1024);
+        xchannel_set_max_recv(client->io_ch, 16 * 1024 * 1024);
+        if (xchannel_attach(client->io_ch) != 0) {
+            xchannel_destroy(client->io_ch);
+            client->io_ch = NULL;
+            XLOGE("Failed to attach client xchannel for fd=%d", (int)client->client_sock);
+            client->state = SOCKS5_STATE_ERROR;
+            SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+            return false;
+        }
+
         client->state = SOCKS5_STATE_CONNECTED;
         socks5_send_reply(client, SOCKS5_REP_SUCCESS);
         XLOGE("SSH channel confirm connect, fd=%d, host=%s, trycount=%d"
@@ -664,111 +676,75 @@ static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData) {
     g_ssh_session = ssh_session;
 }
 
-static void client_read_cb(SOCKET_T fd, int mask, void *clientData) {
-    Socks5Client *client = (Socks5Client*)clientData;
-    if( client->wlen > (sizeof(client->wbuf) * 3 / 4) )
-        return;// wait send
+static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud) {
+    (void)ch;
+    Socks5Client *client = (Socks5Client*)ud;
+    if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel) {
+        return len;
+    }
+    if (len == 0) return 0;
+
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
-    xhash* hash_table = xpoll_get_client_data(ssh_socket);
-    char client_rbuf[8192];
-    int n = recv(client->client_sock, client_rbuf, sizeof(client_rbuf), 0);
-    if (n <= 0) {
-        if(n < 0 && socket_check_eagain()) return;
-        XLOGE("Client disconnected, fd=%d, err=%d", (int)client->client_sock, GET_ERRNO());
-        client->state = SOCKS5_STATE_ERROR;
-        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-        return;
-    }
-    if (!client->ssh_channel){
-        XLOGE("ERROR: No SSH channel available");
-        client->state = SOCKS5_STATE_ERROR;
-        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-        return;
-    }
+    xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
 
     if (client->wlen > 0) {
-        int buffer_space = sizeof(client->wbuf) - client->wlen;
-        if (n > buffer_space) {
-            XLOGE("ERROR: Buffer overflow. Available: %d, needed: %d, %s",
-                   buffer_space, n, client->target_host);
+        size_t buffer_space = sizeof(client->wbuf) - (size_t)client->wlen;
+        if (len > buffer_space) {
+            XLOGE("ERROR: Buffer overflow. Available: %zu, needed: %zu, %s",
+                  buffer_space, len, client->target_host);
             client->state = SOCKS5_STATE_ERROR;
-            SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-            return;
+            if (client->io_ch) xchannel_close(client->io_ch, "buffer_overflow");
+            return len;
         }
-        memcpy(client->wbuf + client->wlen, client_rbuf, n);
-        client->wlen += n;
-
-        XLOGE("Appended %d bytes to write buffer, total buffered: %d bytes, %s",
-               n, client->wlen, client->target_host);
+        memcpy(client->wbuf + client->wlen, data, len);
+        client->wlen += (int)len;
     } else {
-        int written = wolfSSH_channel_write(client->ssh_channel, client_rbuf, n);
+        int written = wolfSSH_channel_write(client->ssh_channel, data, len);
         if (written < 0) {
             client->retry_error_count++;
-            XLOGE("Failed to write to SSH channel: error count=%d, host=%s, errno=%d", client->retry_error_count, client->target_host, written);
+            XLOGE("Failed to write to SSH channel: error count=%d, host=%s, errno=%d",
+                  client->retry_error_count, client->target_host, written);
             client->state = SOCKS5_STATE_ERROR;
-        } else if (written == 0) {
-            XLOGE("SSH channel not ready for write (EAGAIN), buffering %d bytes:%s...", n, client->target_host);
-            if (n > sizeof(client->wbuf)) {
-                XLOGE("ERROR: Buffer too small for %d bytes, dropping data:%s", n, client->target_host);
+            if (client->io_ch) xchannel_close(client->io_ch, "ssh_write_error");
+            return len;
+        }
+        if (written < (int)len) {
+            size_t remaining = len - (size_t)written;
+            if (remaining > sizeof(client->wbuf)) {
+                XLOGE("ERROR: Buffer too small for %zu bytes, dropping data,%s",
+                      remaining, client->target_host);
                 client->state = SOCKS5_STATE_ERROR;
-            } else {
-                memcpy(client->wbuf, client_rbuf, n);
-                client->wlen = n;
-                XLOGD("Buffered %d bytes, will retry writing:%s", n, client->target_host);
-                xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
+                if (client->io_ch) xchannel_close(client->io_ch, "buffer_too_small");
+                return len;
             }
+            memcpy(client->wbuf, data + written, remaining);
+            client->wlen = (int)remaining;
         } else {
             client->retry_error_count = 0;
-            XLOGD("SSH channel wrote %d bytes to %s", written, client->target_host);
-
-            if (written < n) {
-                int remaining = n - written;
-                XLOGD("Partially written: %d/%d bytes, buffering remaining %d bytes:%s...",
-                       written, n, remaining, client->target_host);
-
-                if (remaining > sizeof(client->wbuf)) {
-                    XLOGE("ERROR: Buffer too small for %d bytes, dropping data,%s", remaining, client->target_host);
-                    client->state = SOCKS5_STATE_ERROR;
-                } else {
-                    memcpy(client->wbuf, client_rbuf + written, remaining);
-                    client->wlen = remaining;
-                    XLOGE("Buffered remaining %d bytes:%s", remaining, client->target_host);
-                    xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
-                }
-            }
         }
     }
 
-    if( client->state == SOCKS5_STATE_ERROR )
-        SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
+    if (client->wlen > 0 && hash_table) {
+        xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
+    }
+    return len;
 }
 
-static void client_write_cb(SOCKET_T fd, int mask, void *clientData) {
-    Socks5Client *client = (Socks5Client*)clientData;
-    if (!client || client->state != SOCKS5_STATE_CONNECTED) {
-        xpoll_del_event(fd, XPOLL_WRITABLE);
-        return;
+static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud) {
+    Socks5Client *client = (Socks5Client*)ud;
+    XLOGW("client channel closed: reason=%s", reason ? reason : "unknown");
+
+    if (client) {
+        SOCKET_T old_fd = client->client_sock;
+        if (client->io_ch == ch) {
+            client->io_ch = NULL;
+        }
+        client->client_sock = INVALID_SOCKET;
+        client->state = SOCKS5_STATE_ERROR;
+        socks5_client_cleanup(old_fd, client);
     }
 
-    if (client->rlen > 0) {
-        int sent = send(fd, client->rbuf, client->rlen, 0);
-        if (sent < 0) {
-            if (!socket_check_eagain()) {
-                XLOGE("client_write_cb: send error on fd=%d, err=%d", (int)fd, GET_ERRNO());
-                client->state = SOCKS5_STATE_ERROR;
-                SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
-                xpoll_del_event(fd, XPOLL_WRITABLE);
-            }
-        } else if (sent < client->rlen) {
-            memmove(client->rbuf, client->rbuf + sent, client->rlen - sent);
-            client->rlen -= sent;
-        } else {
-            client->rlen = 0;
-            xpoll_del_event(fd, XPOLL_WRITABLE);
-        }
-    } else {
-        xpoll_del_event(fd, XPOLL_WRITABLE);
-    }
+    xchannel_destroy(ch);
 }
 
 static void client_error_cb(SOCKET_T fd, int mask, void *clientData) {
@@ -839,7 +815,6 @@ void client_state_cb(SOCKET_T fd, int mask, void *clientData) {
             socks5_channel_retry_open(client);
             break;
         case SOCKS5_STATE_CONNECTED:
-            client_read_cb(fd, mask, clientData);
             break;
         default:
             break;
