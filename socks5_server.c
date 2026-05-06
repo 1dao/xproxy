@@ -10,9 +10,12 @@
 #endif
 #define LOG_TAG "xsocks5"
 #include "xlog.h"
+#include <limits.h>
 
 #define MAX_CONCURRENT_CONNECTIONS 8192
 #define MAX_REOPEN_COUNT 10 // wait for 3min
+#define SOCKS5_WRITE_BUFFER_INITIAL 65536u
+#define SOCKS5_WRITE_BUFFER_MAX (16u * 1024u * 1024u)
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
@@ -35,14 +38,63 @@ typedef struct {
     // IO buffers and state
     char rbuf[131072]; // ssh read
     int rlen;
-    char wbuf[65536];// ssh write
-    int wlen;
+    char *wbuf; // ssh write backlog
+    size_t wlen;
+    size_t wcap;
     xChannel *io_ch;
 
     // reopen cd
     long64 last_retry_time;  // retry time
     int retry_error_count;
 } Socks5Client;
+
+static void socks5_client_wbuf_reset(Socks5Client* client) {
+    if (!client) return;
+    free(client->wbuf);
+    client->wbuf = NULL;
+    client->wlen = 0;
+    client->wcap = 0;
+}
+
+static int socks5_client_wbuf_append(Socks5Client* client, const char* data, size_t len) {
+    if (!client || (!data && len > 0)) return -1;
+    if (len == 0) return 0;
+    if (client->wlen > SOCKS5_WRITE_BUFFER_MAX ||
+        len > SOCKS5_WRITE_BUFFER_MAX - client->wlen) {
+        return -1;
+    }
+
+    size_t need = client->wlen + len;
+    if (need > client->wcap) {
+        size_t ncap = client->wcap ? client->wcap : SOCKS5_WRITE_BUFFER_INITIAL;
+        while (ncap < need) {
+            if (ncap > SOCKS5_WRITE_BUFFER_MAX / 2) {
+                ncap = SOCKS5_WRITE_BUFFER_MAX;
+                break;
+            }
+            ncap *= 2;
+        }
+        if (ncap < need) return -1;
+        char *nbuf = (char*)realloc(client->wbuf, ncap);
+        if (!nbuf) return -1;
+        client->wbuf = nbuf;
+        client->wcap = ncap;
+    }
+
+    memcpy(client->wbuf + client->wlen, data, len);
+    client->wlen += len;
+    return 0;
+}
+
+static void socks5_client_wbuf_consume(Socks5Client* client, size_t len) {
+    if (!client || len == 0) return;
+    if (len >= client->wlen) {
+        socks5_client_wbuf_reset(client);
+        return;
+    }
+    memmove(client->wbuf, client->wbuf + len, client->wlen - len);
+    client->wlen -= len;
+}
 
 static void socks5_send_reply(Socks5Client* client, uint8_t rep) {
     uint8_t response[256];
@@ -315,6 +367,7 @@ void socks5_client_free(Socks5Client* client) {
 
     client->ssh_channel = NULL;
     client->ssh_session = NULL;
+    socks5_client_wbuf_reset(client);
     client->state = SOCKS5_STATE_ERROR;
 }
 
@@ -354,10 +407,10 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
     if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel)
         return true;  // Continue to next client
 
-    if (client->wlen < 0 || client->wlen >= sizeof(client->wbuf)) {
-        XLOGE("Warning: Invalid wlen=%d, resetting to 0 for fd=%d",
+    if (client->wlen > SOCKS5_WRITE_BUFFER_MAX) {
+        XLOGE("Warning: Invalid wlen=%zu for fd=%d",
                    client->wlen, (int)client->client_sock);
-        client->wlen = 0;
+        socks5_client_wbuf_reset(client);
         client->state = SOCKS5_STATE_ERROR;
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
         return true;
@@ -450,26 +503,26 @@ static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
         }
     }
 
-    int remaining = client->wlen;
+    size_t remaining = client->wlen;
+    int chunk = (remaining > (size_t)INT_MAX) ? INT_MAX : (int)remaining;
     int written = wolfSSH_channel_write(client->ssh_channel,
                                     client->wbuf,
-                                    remaining);
+                                    chunk);
     if (written < 0) {
         client->state = SOCKS5_STATE_ERROR;
         SHUTDOWN_SOCKET(client->client_sock, SHUTDOWN_WR);
         XLOGE("Channel write failed, fd=%d, host=%s, err=%d",
                (int)client->client_sock, client->target_host, GET_ERRNO());
-    } else if (written >= remaining) {
+    } else if ((size_t)written >= remaining) {
         // All data has been written
-        client->wlen = 0;
+        socks5_client_wbuf_reset(client);
         XLOGE("All buffered data (%d bytes) written for fd=%d",
                written, (int)client->client_sock);
     } else if(written != 0) {
         // Partial write
-        memmove(client->wbuf, client->wbuf + written, remaining - written);
-        client->wlen = remaining - written;
-        XLOGE("Partially buffered data written: %d/%d bytes for fd=%d",
-               written, remaining - written, (int)client->client_sock);
+        socks5_client_wbuf_consume(client, (size_t)written);
+        XLOGE("Partially buffered data written: %d/%zu bytes for fd=%d",
+               written, client->wlen, (int)client->client_sock);
          *(int*)ctx = 1;
     } else {
         *(int*)ctx = 1;
@@ -688,18 +741,23 @@ static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t le
     xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
 
     if (client->wlen > 0) {
-        size_t buffer_space = sizeof(client->wbuf) - (size_t)client->wlen;
-        if (len > buffer_space) {
-            XLOGE("ERROR: Buffer overflow. Available: %zu, needed: %zu, %s",
-                  buffer_space, len, client->target_host);
+        if (socks5_client_wbuf_append(client, data, len) != 0) {
+            XLOGE("ERROR: Write buffer full. buffered=%zu, needed=%zu, %s",
+                  client->wlen, len, client->target_host);
             client->state = SOCKS5_STATE_ERROR;
-            if (client->io_ch) xchannel_close(client->io_ch, "buffer_overflow");
+            if (client->io_ch) xchannel_close(client->io_ch, "buffer_full");
             return len;
         }
-        memcpy(client->wbuf + client->wlen, data, len);
-        client->wlen += (int)len;
     } else {
-        int written = wolfSSH_channel_write(client->ssh_channel, data, len);
+        if (len > (size_t)INT_MAX) {
+            XLOGE("ERROR: Packet too large for SSH write: %zu, %s",
+                  len, client->target_host);
+            client->state = SOCKS5_STATE_ERROR;
+            if (client->io_ch) xchannel_close(client->io_ch, "packet_too_large");
+            return len;
+        }
+
+        int written = wolfSSH_channel_write(client->ssh_channel, data, (int)len);
         if (written < 0) {
             client->retry_error_count++;
             XLOGE("Failed to write to SSH channel: error count=%d, host=%s, errno=%d",
@@ -710,15 +768,13 @@ static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t le
         }
         if (written < (int)len) {
             size_t remaining = len - (size_t)written;
-            if (remaining > sizeof(client->wbuf)) {
-                XLOGE("ERROR: Buffer too small for %zu bytes, dropping data,%s",
+            if (socks5_client_wbuf_append(client, data + written, remaining) != 0) {
+                XLOGE("ERROR: Write buffer full for %zu bytes, %s",
                       remaining, client->target_host);
                 client->state = SOCKS5_STATE_ERROR;
-                if (client->io_ch) xchannel_close(client->io_ch, "buffer_too_small");
+                if (client->io_ch) xchannel_close(client->io_ch, "buffer_full");
                 return len;
             }
-            memcpy(client->wbuf, data + written, remaining);
-            client->wlen = (int)remaining;
         } else {
             client->retry_error_count = 0;
         }
