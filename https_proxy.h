@@ -1,7 +1,7 @@
 #ifndef HTTPS_PROXY_H
 #define HTTPS_PROXY_H
 
-#include "socket_util.h"
+#include "xsock.h"
 #include <stdint.h>
 
 // Forward declaration

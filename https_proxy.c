@@ -1,5 +1,5 @@
 #include "https_proxy.h"
-#include "socket_util.h"
+#include "xsock.h"
 #include "xpoll.h"
 #include "xpac_server.h"
 #ifdef LOG_TAG

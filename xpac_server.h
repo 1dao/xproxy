@@ -1,7 +1,7 @@
 #ifndef XPAC_SERVER_H
 #define XPAC_SERVER_H
 
-#include "socket_util.h"
+#include "xsock.h"
 
 #ifdef __cplusplus
 extern "C" {

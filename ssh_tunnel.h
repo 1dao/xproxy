@@ -5,7 +5,7 @@
 #include <wolfssh/internal.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "socket_util.h"
+#include "xsock.h"
 
 /* Forward declaration */
 typedef struct WOLFSSH WOLFSSH;

@@ -1,7 +1,7 @@
 #ifndef SOCKS5_SERVER_H
 #define SOCKS5_SERVER_H
 
-#include "socket_util.h"
+#include "xsock.h"
 #include "xpoll.h"
 #include <stdint.h>
 

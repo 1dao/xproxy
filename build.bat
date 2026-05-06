@@ -80,7 +80,7 @@ set "LIBS=ws2_32.lib crypt32.lib bcrypt.lib advapi32.lib"
 :: ======================================
 
 :: Application sources
-set "APP_SOURCES=main.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c https_proxy.c xpac_server.c"
+set "APP_SOURCES=main.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c https_proxy.c xpac_server.c xsock.c"
 
 :: WolfCrypt sources (from Makefile)
 set "WOLFCRYPT_SOURCES=3rd/wolfssl/wolfcrypt/src/asn.c 3rd/wolfssl/wolfcrypt/src/error.c 3rd/wolfssl/wolfcrypt/src/rsa.c 3rd/wolfssl/wolfcrypt/src/aes.c 3rd/wolfssl/wolfcrypt/src/des3.c 3rd/wolfssl/wolfcrypt/src/sha.c 3rd/wolfssl/wolfcrypt/src/sha256.c 3rd/wolfssl/wolfcrypt/src/sha512.c 3rd/wolfssl/wolfcrypt/src/md5.c 3rd/wolfssl/wolfcrypt/src/hmac.c 3rd/wolfssl/wolfcrypt/src/hash.c 3rd/wolfssl/wolfcrypt/src/coding.c 3rd/wolfssl/wolfcrypt/src/random.c 3rd/wolfssl/wolfcrypt/src/memory.c 3rd/wolfssl/wolfcrypt/src/ecc.c 3rd/wolfssl/wolfcrypt/src/dh.c 3rd/wolfssl/wolfcrypt/src/integer.c 3rd/wolfssl/wolfcrypt/src/tfm.c 3rd/wolfssl/wolfcrypt/src/wolfmath.c 3rd/wolfssl/wolfcrypt/src/signature.c 3rd/wolfssl/wolfcrypt/src/logging.c 3rd/wolfssl/wolfcrypt/src/sp_int.c 3rd/wolfssl/wolfcrypt/src/wc_port.c 3rd/wolfssl/wolfcrypt/src/kdf.c 3rd/wolfssl/wolfcrypt/src/wc_encrypt.c 3rd/wolfssl/wolfcrypt/src/pwdbased.c 3rd/wolfssl/wolfcrypt/src/pkcs12.c"

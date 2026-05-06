@@ -1,5 +1,5 @@
 #include "socks5_server.h"
-#include "socket_util.h"
+#include "xsock.h"
 #include "ssh_tunnel.h"
 
 #include "xpoll.h"
