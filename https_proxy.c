@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#endif
+
 #include "https_proxy.h"
 #include "xsock.h"
 #include "xchannel.h"
@@ -562,7 +568,7 @@ static int handle_client_request(int slot) {
                             NULL,
                             socks5_write_cb,
                             socks5_error_cb,
-                            (void*)(INT_PTR)slot) != 0) {
+                            (void*)(intptr_t)slot) != 0) {
             XLOGE("[http] Failed to register SOCKS5 connect event");
             CLOSE_SOCKET(socks5_sock);
             return -1;
@@ -584,7 +590,7 @@ static int handle_client_request(int slot) {
         if (xpoll_add_event(socks5_sock,
                             XPOLL_READABLE | XPOLL_ERROR,
                             socks5_read_cb, NULL, socks5_error_cb,
-                            (void*)(INT_PTR)slot) != 0) {
+                            (void*)(intptr_t)slot) != 0) {
             XLOGE("[http] Failed to register SOCKS5 read event");
             CLOSE_SOCKET(socks5_sock);
             return -1;
@@ -612,7 +618,7 @@ static void accept_cb(SOCKET_T fd, int mask, void *clientData) {
 
         socket_set_nonblocking(client_sock);
         if (xpoll_add_event(client_sock, XPOLL_READABLE,
-                            client_read_cb, NULL, client_error_cb, (void*)(INT_PTR)slot) != 0) {
+                            client_read_cb, NULL, client_error_cb, (void*)(intptr_t)slot) != 0) {
             XLOGE("[http] Connection list full, rejecting new connection");
             close_conn_slot(slot);
         }
@@ -829,7 +835,7 @@ static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData) {
         // remove write ev,add read ev
         xpoll_add_event(fd, XPOLL_READABLE,
                         socks5_read_cb, NULL, socks5_error_cb,
-                        (void*)(INT_PTR)slot);
+                        (void*)(intptr_t)slot);
         xpoll_del_event(fd, XPOLL_WRITABLE);
     } else if (conn->state == CONN_STATE_SOCKS5_OK) {
         // handled by xchannel tunnel callbacks
