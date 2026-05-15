@@ -80,6 +80,7 @@ int       xchannel_send_file_raw(xChannel* ch,
                                   const char* path,
                                   long long offset, long long length);
 void      xchannel_close(xChannel* ch, const char* reason);
+int       xchannel_close_after_flush(xChannel* ch, const char* reason);
 
 #ifdef __cplusplus
 }

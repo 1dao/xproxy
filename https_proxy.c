@@ -9,6 +9,7 @@
 #define LOG_TAG "xhttp"
 #include "xlog.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -57,6 +58,7 @@ typedef struct {
     xChannel* client_ch;
     xChannel* socks5_ch;
     ConnState state;
+    bool closing;
 
     // request buf
     char req_buf[32767];
@@ -76,9 +78,6 @@ typedef struct {
 // ===================== HTTP Parsing Functions =====================
 // Parse CONNECT request, extract target host and port
 int https_parse_connect(const char* req_buf, int req_len, char* target_host, int host_len, uint16_t* target_port);
-
-// Send 200 Connection Established response to client
-int https_send_200(SOCKET_T client_sock);
 
 // Parse normal HTTP request (GET/POST etc.), extract target host and port
 int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_host, int host_len, uint16_t* target_port);
@@ -114,16 +113,6 @@ int https_parse_connect(const char* req_buf, int req_len, char* target_host, int
     }
 
     return 0;
-}
-
-// Send 200 Connection Established response to client
-int https_send_200(SOCKET_T client_sock) {
-    // const char* resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
-    // return send(client_sock, resp, strlen(resp), 0);
-    const char* resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
-    int len = strlen(resp);
-    int sent = send(client_sock, resp, len, 0);
-    return sent == len ? 0 : -1;
 }
 
 // Convert proxy-formatted HTTP request to direct server format
@@ -273,6 +262,7 @@ static int init_conn_list(void) {
         g_conn_list[i].client_ch = NULL;
         g_conn_list[i].socks5_ch = NULL;
         g_conn_list[i].state = CONN_STATE_CLOSED;
+        g_conn_list[i].closing = false;
         g_conn_list[i].is_https = 0;
         g_conn_list[i].req_size = 0; g_conn_list[i].req_head = 0;
         g_conn_list[i].rep_size = 0; g_conn_list[i].rep_head = 0;
@@ -302,6 +292,7 @@ static int add_new_client_conn(SOCKET_T client_sock) {
     g_conn_list[slot].client_ch = NULL;
     g_conn_list[slot].socks5_ch = NULL;
     g_conn_list[slot].state = CONN_STATE_NEW;
+    g_conn_list[slot].closing = false;
     g_conn_list[slot].req_size = 0; g_conn_list[slot].req_head = 0;
     g_conn_list[slot].rep_size = 0; g_conn_list[slot].rep_head = 0;
     memset(g_conn_list[slot].req_buf, 0, sizeof(g_conn_list[slot].req_buf));
@@ -315,6 +306,7 @@ static int add_new_client_conn(SOCKET_T client_sock) {
 // Close and clean connection
 static void close_conn_slot(int slot) {
     if (slot < 0 || slot >= g_config.max_conns) return;
+    if (g_conn_list[slot].state == CONN_STATE_CLOSED) return;
     SOCKET_T client_sock = g_conn_list[slot].client_sock;
     SOCKET_T socks5_sock = g_conn_list[slot].socks5_sock;
     ConnState state = g_conn_list[slot].state;
@@ -354,6 +346,7 @@ static void close_conn_slot(int slot) {
     g_conn_list[slot].client_ch = NULL;
     g_conn_list[slot].socks5_ch = NULL;
     g_conn_list[slot].state = CONN_STATE_CLOSED;
+    g_conn_list[slot].closing = false;
     g_conn_list[slot].req_size = 0; g_conn_list[slot].req_head = 0;
     g_conn_list[slot].rep_size = 0; g_conn_list[slot].rep_head = 0;
     memset(g_conn_list[slot].req_buf, 0, sizeof(g_conn_list[slot].req_buf));
@@ -397,9 +390,210 @@ static int proxy_conn_slot(ProxyConn* conn) {
     return slot;
 }
 
+static void shutdown_conn_slot(int slot, const char* reason) {
+    if (slot < 0 || slot >= g_config.max_conns) return;
+
+    ProxyConn* conn = &g_conn_list[slot];
+    if (conn->state == CONN_STATE_CLOSED || conn->closing) return;
+
+    conn->closing = true;
+    XLOGW("[http] shutdown slot %d, reason=%s", slot,
+          reason ? reason : "unknown");
+
+    /* Tunnel state has xchannels with their own send buffer that we want to
+     * drain. Closing the xchannel triggers tunnel_channel_close_cb, which in
+     * turn calls close_conn_slot to finish teardown.
+     *
+     * Pre-tunnel state is raw-socket I/O with nothing user-side to drain;
+     * SHUTDOWN_WR alone would leave the slot stuck because the new xpoll
+     * semantics suppress HUP-as-CLOSE while POLLIN(EOF) is asserted, so
+     * close it directly. */
+    if (conn->state == CONN_STATE_SOCKS5_OK) {
+        xChannel* c = conn->client_ch;
+        xChannel* s = conn->socks5_ch;
+        if (c) xchannel_close(c, reason);
+        if (s && conn->state != CONN_STATE_CLOSED) {
+            xchannel_close(s, reason);
+        }
+        return;
+    }
+
+    close_conn_slot(slot);
+}
+
+static void shutdown_conn_from_ptr(ProxyConn* conn, const char* reason) {
+    int slot = proxy_conn_slot(conn);
+    if (slot >= 0) shutdown_conn_slot(slot, reason);
+}
+
 static void close_conn_from_ptr(ProxyConn* conn) {
     int slot = proxy_conn_slot(conn);
     if (slot >= 0) close_conn_slot(slot);
+}
+
+static int socks5_arm_read(int slot) {
+    if (slot < 0 || slot >= g_config.max_conns) return -1;
+    ProxyConn* conn = &g_conn_list[slot];
+    SOCKET_T fd = conn->socks5_sock;
+    if (fd == INVALID_SOCKET) return -1;
+
+    if (xpoll_add_event(fd, XPOLL_READABLE | XPOLL_ERROR,
+                        socks5_read_cb, NULL, socks5_error_cb,
+                        (void*)(intptr_t)slot) != 0) {
+        return -1;
+    }
+    xpoll_del_event(fd, XPOLL_WRITABLE);
+    return 0;
+}
+
+static int socks5_arm_write(int slot) {
+    if (slot < 0 || slot >= g_config.max_conns) return -1;
+    ProxyConn* conn = &g_conn_list[slot];
+    SOCKET_T fd = conn->socks5_sock;
+    if (fd == INVALID_SOCKET) return -1;
+
+    if (xpoll_add_event(fd, XPOLL_WRITABLE | XPOLL_ERROR,
+                        NULL, socks5_write_cb, socks5_error_cb,
+                        (void*)(intptr_t)slot) != 0) {
+        return -1;
+    }
+    xpoll_del_event(fd, XPOLL_READABLE);
+    return 0;
+}
+
+static size_t socks5_pending_write_len(const ProxyConn* conn) {
+    if (!conn || conn->rep_head < 0 || conn->rep_size <= conn->rep_head) {
+        return 0;
+    }
+    return (size_t)(conn->rep_size - conn->rep_head);
+}
+
+static int socks5_append_pending_write(ProxyConn* conn, const void* data, size_t len) {
+    if (!conn || (!data && len > 0) || len > sizeof(conn->rep_buf)) {
+        return -1;
+    }
+
+    size_t pending = socks5_pending_write_len(conn);
+    if (len > sizeof(conn->rep_buf) - pending) {
+        return -1;
+    }
+
+    /* Use memmove on both copies: data may alias the region being shifted
+     * (current callers don't, but it's a one-instruction safety belt). */
+    if (pending > 0 && conn->rep_head > 0) {
+        memmove(conn->rep_buf, conn->rep_buf + conn->rep_head, pending);
+    }
+    if (len > 0) {
+        memmove(conn->rep_buf + pending, data, len);
+    }
+
+    conn->rep_head = 0;
+    conn->rep_size = (int)(pending + len);
+    return 0;
+}
+
+static int socks5_send_or_queue(ProxyConn* conn, const void* data, size_t len) {
+    if (!conn || (!data && len > 0) || len > sizeof(conn->rep_buf)) {
+        return -1;
+    }
+    if (socks5_pending_write_len(conn) > 0) {
+        return socks5_append_pending_write(conn, data, len) == 0 ? 0 : -1;
+    }
+
+    const char* p = (const char*)data;
+    size_t off = 0;
+    conn->rep_head = 0;
+    conn->rep_size = 0;
+
+    while (off < len) {
+        int n = send(conn->socks5_sock, p + off, (int)(len - off), 0);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && socket_check_eagain()) {
+            break;
+        }
+        return -1;
+    }
+
+    if (off == len) {
+        return 1;
+    }
+
+    memmove(conn->rep_buf, p + off, len - off);
+    conn->rep_head = 0;
+    conn->rep_size = (int)(len - off);
+    return 0;
+}
+
+static int socks5_send_handshake(ProxyConn* conn) {
+    static const uint8_t handshake_req[] = {0x05, 0x01, 0x00};
+    return socks5_send_or_queue(conn, handshake_req, sizeof(handshake_req));
+}
+
+static int socks5_build_connect_request(ProxyConn* conn, size_t* len_out) {
+    if (!conn || !len_out) return -1;
+
+    size_t domain_len = strlen(conn->host);
+    size_t req_total_len = 5 + domain_len + 2;
+    if (domain_len == 0 || domain_len > 255 ||
+        req_total_len > sizeof(conn->rep_buf)) {
+        return -1;
+    }
+
+    uint8_t* connect_req = (uint8_t*)conn->rep_buf;
+    connect_req[0] = 0x05;
+    connect_req[1] = 0x01;
+    connect_req[2] = 0x00;
+    connect_req[3] = 0x03;
+    connect_req[4] = (uint8_t)domain_len;
+    memcpy(connect_req + 5, conn->host, domain_len);
+
+    uint16_t target_port_nbo = htons(conn->port);
+    memcpy(connect_req + 5 + domain_len, &target_port_nbo, 2);
+
+    *len_out = req_total_len;
+    return 0;
+}
+
+static int socks5_flush_pending_write(ProxyConn* conn) {
+    if (!conn || conn->socks5_sock == INVALID_SOCKET) return -1;
+
+    while (conn->rep_head < conn->rep_size) {
+        int remaining = conn->rep_size - conn->rep_head;
+        int n = send(conn->socks5_sock,
+                     conn->rep_buf + conn->rep_head,
+                     remaining, 0);
+        if (n > 0) {
+            conn->rep_head += n;
+            continue;
+        }
+        if (n < 0 && socket_check_eagain()) {
+            return 0;
+        }
+        return -1;
+    }
+
+    conn->rep_head = 0;
+    conn->rep_size = 0;
+    return 1;
+}
+
+static int socks5_reply_expected_len(const uint8_t* buf, int len) {
+    if (!buf || len < 4) return 0;
+
+    switch (buf[3]) {
+    case 0x01:
+        return 10;
+    case 0x03:
+        if (len < 5) return 0;
+        return 5 + buf[4] + 2;
+    case 0x04:
+        return 22;
+    default:
+        return -1;
+    }
 }
 
 static int enable_tunnel_channels(ProxyConn* conn) {
@@ -422,9 +616,6 @@ static int enable_tunnel_channels(ProxyConn* conn) {
     s_cfg.close_cb = tunnel_channel_close_cb;
     s_cfg.userdata = conn;
 
-    xpoll_del_event(conn->client_sock, XPOLL_ALL);
-    xpoll_del_event(conn->socks5_sock, XPOLL_ALL);
-
     conn->client_ch = xchannel_create(conn->client_sock, &c_cfg);
     conn->socks5_ch = xchannel_create(conn->socks5_sock, &s_cfg);
     if (!conn->client_ch || !conn->socks5_ch) {
@@ -444,10 +635,12 @@ fail:
     if (conn->client_ch) {
         xchannel_destroy(conn->client_ch);
         conn->client_ch = NULL;
+        conn->client_sock = INVALID_SOCKET;
     }
     if (conn->socks5_ch) {
         xchannel_destroy(conn->socks5_ch);
         conn->socks5_ch = NULL;
+        conn->socks5_sock = INVALID_SOCKET;
     }
     return -1;
 }
@@ -459,7 +652,7 @@ static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t le
     if (len == 0) return 0;
     if (xchannel_send_raw(conn->socks5_ch, data, len) != 0) {
         XLOGE("[http] tunnel client->socks5 send failed");
-        close_conn_from_ptr(conn);
+        shutdown_conn_from_ptr(conn, "tunnel_client_send_failed");
     }
     return len;
 }
@@ -471,7 +664,7 @@ static size_t socks5_channel_packet_cb(xChannel* ch, const char* data, size_t le
     if (len == 0) return 0;
     if (xchannel_send_raw(conn->client_ch, data, len) != 0) {
         XLOGE("[http] tunnel socks5->client send failed");
-        close_conn_from_ptr(conn);
+        shutdown_conn_from_ptr(conn, "tunnel_socks5_send_failed");
     }
     return len;
 }
@@ -523,7 +716,6 @@ static int handle_client_request(int slot) {
     SOCKET_T socks5_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (socks5_sock == INVALID_SOCKET) {
         XLOGE("[http] create socks5 socket failed");
-        CLOSE_SOCKET(socks5_sock);
         return -1;
     }
 
@@ -538,13 +730,7 @@ static int handle_client_request(int slot) {
 
     int ret = connect(socks5_sock, (struct sockaddr*)&socks5_addr, sizeof(socks5_addr));
     if (ret != 0) {
-#ifdef _WIN32
-        int err = WSAGetLastError();
-        int in_progress = (err == WSAEWOULDBLOCK);
-#else
-        int in_progress = (errno == EINPROGRESS);
-#endif
-        if (!in_progress) {
+        if (!socket_check_eagain()) {
             // connect failed
             XLOGE("[http] connect() failed immediately, host=%s", conn->host);
             CLOSE_SOCKET(socks5_sock);
@@ -565,28 +751,35 @@ static int handle_client_request(int slot) {
                             (void*)(intptr_t)slot) != 0) {
             XLOGE("[http] Failed to register SOCKS5 connect event");
             CLOSE_SOCKET(socks5_sock);
+            conn->socks5_sock = INVALID_SOCKET;
             return -1;
         }
     } else {
-        // ret == 0: connected, send handshake
+        // ret == 0: connected, send handshake immediately if possible.
         XLOGD("[http] connect() succeeded immediately, host=%s", conn->host);
-        uint8_t handshake_req[] = {0x05, 0x01, 0x00};
-        if (send(socks5_sock, (const char*)handshake_req, sizeof(handshake_req), 0) <= 0) {
-            XLOGE("[http] socks5 handshake send failed");
-            CLOSE_SOCKET(socks5_sock);
-            return -1;
-        }
 
         conn->socks5_sock = socks5_sock;
         conn->state = CONN_STATE_AUTHING;
         conn->is_https = is_https;
 
-        if (xpoll_add_event(socks5_sock,
-                            XPOLL_READABLE | XPOLL_ERROR,
-                            socks5_read_cb, NULL, socks5_error_cb,
-                            (void*)(intptr_t)slot) != 0) {
-            XLOGE("[http] Failed to register SOCKS5 read event");
+        int send_rc = socks5_send_handshake(conn);
+        if (send_rc < 0) {
+            XLOGE("[http] Failed to send SOCKS5 handshake");
             CLOSE_SOCKET(socks5_sock);
+            conn->socks5_sock = INVALID_SOCKET;
+            return -1;
+        }
+        if (send_rc == 0) {
+            if (socks5_arm_write(slot) != 0) {
+                XLOGE("[http] Failed to register SOCKS5 handshake write");
+                CLOSE_SOCKET(socks5_sock);
+                conn->socks5_sock = INVALID_SOCKET;
+                return -1;
+            }
+        } else if (socks5_arm_read(slot) != 0) {
+            XLOGE("[http] Failed to register SOCKS5 handshake read");
+            CLOSE_SOCKET(socks5_sock);
+            conn->socks5_sock = INVALID_SOCKET;
             return -1;
         }
     }
@@ -619,6 +812,8 @@ static void accept_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *sub
             XLOGE("[http] Connection list full, rejecting new connection");
             close_conn_slot(slot);
         }
+    } else if (!socket_check_eagain()) {
+        XLOGE("[http] accept failed, ERRNO=%d", GET_ERRNO());
     }
 }
 
@@ -629,7 +824,7 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest
     if (slot < 0 || slot >= g_config.max_conns) return;
 
     ProxyConn* conn = &g_conn_list[slot];
-    if (conn->state == CONN_STATE_CLOSED) return;
+    if (conn->state == CONN_STATE_CLOSED || conn->closing) return;
 
     if (conn->state == CONN_STATE_NEW) {
         // New connection: read client request (unparsed)
@@ -639,10 +834,10 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest
         if (recv_len <= 0) {
             if(recv_len==0) {
                 XLOGE("[http] Client socket %d closed by client (EOF)", (int)conn->client_sock);
-                close_conn_slot(slot);
+                shutdown_conn_slot(slot, "client_eof");
             }else if(!socket_check_eagain()) {
                 XLOGE("[http] Client socket %d error on read, locally closed, ERRNO=%d", (int)conn->client_sock, GET_ERRNO());
-                close_conn_slot(slot);
+                shutdown_conn_slot(slot, "client_read_error");
             }
             return;
         }
@@ -656,56 +851,21 @@ static void client_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest
             int ret = handle_client_request(slot);
             if(ret==-2){
                 XLOGI("[http] PAC request handled, closing connection");
-                close_conn_slot(slot);
+                shutdown_conn_slot(slot, "pac_handled");
             } else if (ret != 0) {
                 XLOGE("[http] PAC request handling exception, closing connection");
-                close_conn_slot(slot);
+                shutdown_conn_slot(slot, "request_error");
             }
         } else if (conn->req_size >= sizeof(conn->req_buf) - 1) {
             // Request too large
             XLOGE("[http] Request too large, closing connection");
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "request_too_large");
         }
     } else if (conn->state == CONN_STATE_SOCKS5_OK) {
         // handled by xchannel tunnel callbacks
         (void)fd;
         (void)mask;
     }
-}
-
-static inline int socks5_send_connect(SOCKET_T fd, char* host, uint16_t port) {
-    // 2. Second step: construct domain name mode connection request (variable length, need dynamic memory allocation)
-    int domain_len = strlen(host);
-    // Total message length: fixed header (5 bytes) + domain name length (domain_len) + port (2 bytes)
-    int req_total_len = 5 + domain_len + 2;
-    uint8_t* connect_req = (uint8_t*)malloc(req_total_len);
-    if (connect_req == NULL) {
-        XLOGE("socks5 domain req malloc failed");
-        return -1;
-    }
-
-    // Fill fixed header fields
-    connect_req[0] = 0x05; // ver: Socks5 protocol version
-    connect_req[1] = 0x01; // cmd: TCP connection request
-    connect_req[2] = 0x00; // rsv: reserved field, must be 0
-    connect_req[3] = 0x03; // atyp: domain name type (0x03)
-    connect_req[4] = (uint8_t)domain_len; // domain name length (1 byte, max 255)
-
-    // Fill variable length: domain name content
-    memcpy(connect_req + 5, host, domain_len);
-
-    // Fill port (network byte order, placed after domain name)
-    uint16_t target_port_nbo = htons(port);
-    memcpy(connect_req + 5 + domain_len, &target_port_nbo, 2);
-
-    // 3. Third step: send domain name connection request
-    if (send(fd, (const char*)connect_req, req_total_len, 0) <= 0) {
-        XLOGE("socks5 domain connect send failed");
-        free(connect_req); // Memory release: avoid memory leak
-        return -1;
-    }
-    free(connect_req); // Free allocated memory
-    return 0;
 }
 
 // SOCKS5 server read callback
@@ -716,56 +876,122 @@ static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest
     if (slot < 0 || slot >= g_config.max_conns) return;
 
     ProxyConn* conn = &g_conn_list[slot];
+    if (conn->state == CONN_STATE_CLOSED || conn->closing) return;
     switch (conn->state) {
     case CONN_STATE_AUTHING:{
         // Receive handshake response
-        uint8_t handshake_resp[2];
-        int ret = recv(fd, (char*)handshake_resp, sizeof(handshake_resp), 0);
+        int need = 2 - conn->rep_size;
+        int ret = recv(fd, conn->rep_buf + conn->rep_size, need, 0);
         if (ret <= 0) {
+            if (ret < 0 && socket_check_eagain()) return;
             if (ret == 0) {
                 XLOGE("[http] SOCKS5 socket %d closed by SOCKS5 server during handshake (EOF)", (int)fd);
             } else {
                 XLOGE("[http] SOCKS5 socket %d handshake recv failed, locally closed, ERRNO=%d", (int)fd, GET_ERRNO());
             }
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "socks5_handshake_read_error");
             return;
         }
+
+        conn->rep_size += ret;
+        if (conn->rep_size < 2) return;
+
+        uint8_t* handshake_resp = (uint8_t*)conn->rep_buf;
         if (handshake_resp[0] != 0x05 || handshake_resp[1] != 0x00) {
             XLOGE("socks5 domain auth failed (only no-auth supported)");
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "socks5_auth_failed");
             return;
         }
-        if(socks5_send_connect(fd, conn->host, conn->port)!=0) {
-            XLOGE("socks5 domain connect send failed, host=%s", conn->host);
-            close_conn_slot(slot);
+
+        conn->rep_size = 0;
+        conn->rep_head = 0;
+        size_t req_len = 0;
+        if (socks5_build_connect_request(conn, &req_len) != 0) {
+            XLOGE("socks5 domain connect request build failed, host=%s", conn->host);
+            shutdown_conn_slot(slot, "socks5_connect_build_failed");
             return;
         }
         conn->state = CONN_STATE_CONNECTING;
+        int send_rc = socks5_send_or_queue(conn, conn->rep_buf, req_len);
+        if (send_rc < 0) {
+            XLOGE("socks5 domain connect send failed, host=%s", conn->host);
+            shutdown_conn_slot(slot, "socks5_connect_send_failed");
+            return;
+        }
+        if (send_rc == 0) {
+            if (socks5_arm_write(slot) != 0) {
+                XLOGE("socks5 domain connect write registration failed, host=%s", conn->host);
+                shutdown_conn_slot(slot, "socks5_connect_write_register_failed");
+                return;
+            }
+        } else if (socks5_arm_read(slot) != 0) {
+            XLOGE("socks5 domain connect read registration failed, host=%s", conn->host);
+            shutdown_conn_slot(slot, "socks5_connect_read_register_failed");
+            return;
+        }
         break;
     }
     case CONN_STATE_CONNECTING: {
-        uint8_t connect_resp[10]; // Response fixed 10 bytes (regardless of ATYP)
-        int ret = recv(conn->socks5_sock, (char*)connect_resp, sizeof(connect_resp), 0);
+        int expected = socks5_reply_expected_len((const uint8_t*)conn->rep_buf,
+                                                  conn->rep_size);
+        if (expected < 0 || expected > (int)sizeof(conn->rep_buf)) {
+            XLOGE("[http] invalid SOCKS5 connect response");
+            shutdown_conn_slot(slot, "socks5_connect_bad_response");
+            return;
+        }
+
+        int need = 0;
+        if (expected > 0) {
+            need = expected - conn->rep_size;
+        } else if (conn->rep_size < 4) {
+            need = 4 - conn->rep_size;
+        } else {
+            need = 1;
+        }
+
+        int ret = recv(conn->socks5_sock,
+                       conn->rep_buf + conn->rep_size,
+                       need, 0);
         if (ret <= 0) {
+            if (ret < 0 && socket_check_eagain()) return;
             if (ret == 0) {
                 XLOGE("[http] SOCKS5 socket %d closed by SOCKS5 server during connect response (EOF)", (int)conn->socks5_sock);
             } else {
                 XLOGE("[http] SOCKS5 socket %d connect response recv failed, locally closed, ERRNO=%d", (int)conn->socks5_sock, GET_ERRNO());
             }
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "socks5_connect_read_error");
+            return;
+        }
+
+        conn->rep_size += ret;
+        expected = socks5_reply_expected_len((const uint8_t*)conn->rep_buf,
+                                             conn->rep_size);
+        if (expected < 0 || expected > (int)sizeof(conn->rep_buf)) {
+            XLOGE("[http] invalid SOCKS5 connect response");
+            shutdown_conn_slot(slot, "socks5_connect_bad_response");
+            return;
+        }
+        if (expected == 0 || conn->rep_size < expected) return;
+
+        uint8_t* connect_resp = (uint8_t*)conn->rep_buf;
+        if (connect_resp[0] != 0x05) {
+            XLOGE("socks5 domain connect invalid version: %d", connect_resp[0]);
+            shutdown_conn_slot(slot, "socks5_connect_bad_version");
             return;
         }
 
         // Verify response result: 0x00 means connection successful
         if (connect_resp[1] != 0x00) {
             XLOGE("socks5 domain connect target failed, code: %d", connect_resp[1]);
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "socks5_connect_failed");
             return;
         }
+        conn->rep_size = 0;
+        conn->rep_head = 0;
         conn->state = CONN_STATE_SOCKS5_OK;
         if (enable_tunnel_channels(conn) != 0) {
             XLOGE("[http] Failed to enable tunnel channels");
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "tunnel_channel_enable_failed");
             return;
         }
 
@@ -778,7 +1004,7 @@ static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest
             conn->rep_head = 0;
             if (xchannel_send_raw(conn->client_ch, ok_resp, sizeof(ok_resp) - 1) != 0) {
                 XLOGE("[http] failed to send CONNECT 200 response");
-                close_conn_slot(slot);
+                shutdown_conn_slot(slot, "connect_200_send_failed");
                 return;
             }
             XLOGD("[http] HTTPS tunnel established");
@@ -788,7 +1014,7 @@ static void socks5_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest
                                       conn->req_buf + conn->req_head,
                                       (size_t)conn->req_size) != 0) {
                     XLOGE("[http] failed to forward initial HTTP request");
-                    close_conn_slot(slot);
+                    shutdown_conn_slot(slot, "initial_request_send_failed");
                     return;
                 }
                 conn->req_size = 0;
@@ -813,34 +1039,55 @@ static void socks5_write_cb(SOCKET_T fd, int mask, void *clientData, xPollReques
     if (slot < 0 || slot >= g_config.max_conns) return;
 
     ProxyConn* conn = &g_conn_list[slot];
+    if (conn->state == CONN_STATE_CLOSED || conn->closing) return;
     if (conn->state == CONN_STATE_TCP_CONNECTING) {
         // using getsockopt(SO_ERROR) to confirm async connect success
         int err = 0;
         socklen_t errlen = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&err, &errlen) != 0 || err != 0) {
             XLOGE("[http] async connect failed, SO_ERROR=%d, host=%s", err, conn->host);
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "socks5_async_connect_failed");
             return;
         }
 
         XLOGD("[http] async connect succeeded, host=%s:%d", conn->host, conn->port);
-        // connected, send SOCKS5 handshake
-        uint8_t handshake_req[] = {0x05, 0x01, 0x00};
-        if (send(fd, (const char*)handshake_req, sizeof(handshake_req), 0) <= 0) {
+        conn->state = CONN_STATE_AUTHING;
+        int send_rc = socks5_send_handshake(conn);
+        if (send_rc < 0) {
             XLOGE("[http] socks5 handshake send failed");
-            close_conn_slot(slot);
+            shutdown_conn_slot(slot, "socks5_handshake_send_failed");
             return;
         }
+        if (send_rc == 0) {
+            return;
+        }
+        if (socks5_arm_read(slot) != 0) {
+            XLOGE("[http] socks5 read registration failed after handshake");
+            shutdown_conn_slot(slot, "socks5_read_register_failed");
+            return;
+        }
+        return;
+    }
 
-        conn->state = CONN_STATE_AUTHING;
-
-        // remove write ev,add read ev
-        xpoll_add_event(fd, XPOLL_READABLE,
-                        socks5_read_cb, NULL, socks5_error_cb,
-                        (void*)(intptr_t)slot);
-        xpoll_del_event(fd, XPOLL_WRITABLE);
+    if (conn->rep_head < conn->rep_size) {
+        int rc = socks5_flush_pending_write(conn);
+        if (rc < 0) {
+            XLOGE("[http] socks5 pending write failed, state=%d", conn->state);
+            shutdown_conn_slot(slot, "socks5_pending_write_failed");
+            return;
+        }
+        if (rc == 0) {
+            return;
+        }
+        if (socks5_arm_read(slot) != 0) {
+            XLOGE("[http] socks5 read registration failed after write");
+            shutdown_conn_slot(slot, "socks5_read_register_failed");
+            return;
+        }
     } else if (conn->state == CONN_STATE_SOCKS5_OK) {
         // handled by xchannel tunnel callbacks
+        xpoll_del_event(fd, XPOLL_WRITABLE);
+    } else {
         xpoll_del_event(fd, XPOLL_WRITABLE);
     }
 }

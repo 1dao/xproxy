@@ -74,6 +74,9 @@ struct xChannel {
     bool file_pending;
     long long file_remaining;
 
+    bool close_after_flush;
+    char close_reason[64];
+
     uint64_t bytes_sent;
     uint64_t bytes_recv;
 
@@ -253,6 +256,7 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
     ch->attached = false;
     ch->connected = false;
     ch->connect_pending = false;
+    ch->close_after_flush = false;
 
 #if defined(XCHANNEL_WITH_IO_URING)
     if (ch->read_req) {
@@ -279,8 +283,29 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
     }
 }
 
+static bool has_pending_output(xChannel* ch) {
+    return ch && (ch->connect_pending ||
+                  xbuf_size(&ch->out) > 0 ||
+                  has_pending_file(ch));
+}
+
+static bool finish_close_after_flush(xChannel* ch) {
+    if (!ch || ch->closed || !ch->close_after_flush) return false;
+
+    if (!has_pending_output(ch)) {
+        const char* reason = ch->close_reason[0]
+            ? ch->close_reason
+            : "close_after_flush";
+        close_internal(ch, reason, true);
+        return true;
+    }
+
+    return false;
+}
+
 static int check_send_limit(xChannel* ch, size_t alen, size_t blen) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
+    if (ch->close_after_flush) return -1;
     if (alen == 0 && blen == 0) return 0;
     if (has_pending_file(ch)) return -1;
     if (ch->out.max > 0 && xbuf_size(&ch->out) >= ch->out.max) return -2;
@@ -549,6 +574,10 @@ static void flush_output(xChannel* ch) {
         close_pending_file(ch);
         xpoll_del_event(ch->fd, XPOLL_WRITABLE);
     }
+
+    if (!ch->closed) {
+        finish_close_after_flush(ch);
+    }
 }
 
 /* Atomically queue or send a (head, body) pair. Either segment may be empty.
@@ -636,7 +665,7 @@ static bool finish_connect(xChannel* ch) {
         }
         flush_output(ch);
 
-        if (xbuf_size(&ch->out) > 0 || has_pending_file(ch)) {
+        if (!ch->closed && (xbuf_size(&ch->out) > 0 || has_pending_file(ch))) {
             if (arm_writable(ch, false) != 0)
                 return false;
         }
@@ -853,6 +882,7 @@ void xchannel_destroy(xChannel* ch) {
         ch->attached = false;
         ch->connected = false;
         ch->connect_pending = false;
+        ch->close_after_flush = false;
 #if defined(XCHANNEL_WITH_IO_URING)
         if (ch->read_req) {
             xpoll_cancel_request(ch->read_req);
@@ -1004,6 +1034,7 @@ int xchannel_send_file_raw(xChannel* ch,
                            const char* path,
                            long long offset, long long length) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL || !path) return -1;
+    if (ch->close_after_flush) return -1;
     if (!header && header_len > 0) return -1;
     if (has_pending_file(ch)) return -1;
     // if (ch->out.max > 0 && xbuf_size(&ch->out) >= ch->out.max) return -2;
@@ -1096,6 +1127,36 @@ void xchannel_close(xChannel* ch, const char* reason) {
     xchannel_retain(ch);
     close_internal(ch, reason, true);
     xchannel_release(ch);
+}
+
+int xchannel_close_after_flush(xChannel* ch, const char* reason) {
+    if (!ch) return -1;
+
+    xchannel_retain(ch);
+    if (ch->closed || ch->fd == INVALID_SOCKET_VAL) {
+        xchannel_release(ch);
+        return -1;
+    }
+
+    ch->close_after_flush = true;
+    const char* why = reason ? reason : "close_after_flush";
+    strncpy(ch->close_reason, why, sizeof(ch->close_reason) - 1);
+    ch->close_reason[sizeof(ch->close_reason) - 1] = '\0';
+
+    if (!ch->connect_pending) {
+        flush_output(ch); /* may invoke finish_close_after_flush and close */
+    }
+
+    if (!ch->closed && has_pending_output(ch)) {
+        if (arm_writable(ch, ch->connect_pending) != 0) {
+            xchannel_release(ch);
+            return -1;
+        }
+    }
+
+    int rc = ch->closed ? -1 : 0;
+    xchannel_release(ch);
+    return rc;
 }
 
 void xchannel_get_stats(xChannel* ch,

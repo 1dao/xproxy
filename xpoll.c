@@ -133,12 +133,12 @@ static int _uring_mask_from_poll_events(int events) {
     if (events & POLLIN)  mask |= XPOLL_READABLE;
     if (events & POLLOUT) mask |= XPOLL_WRITABLE;
     if (events & POLLERR) mask |= XPOLL_ERROR;
-    if (events & POLLHUP) mask |= XPOLL_CLOSE;
+    if ((events & POLLHUP) && !(events & POLLIN)) mask |= XPOLL_CLOSE;
 #ifdef POLLNVAL
     if (events & POLLNVAL) mask |= XPOLL_ERROR | XPOLL_CLOSE;
 #endif
 #ifdef POLLRDHUP
-    if (events & POLLRDHUP) mask |= XPOLL_CLOSE;
+    if ((events & POLLRDHUP) && !(events & POLLIN)) mask |= XPOLL_CLOSE;
 #endif
     return mask;
 }
@@ -372,6 +372,9 @@ static void _pfd_sync(xPollState *loop, int idx) {
     if (!fe) return;
     if (fe->mask & XPOLL_READABLE) loop->poll_fds[idx].events |= POLLIN;
     if (fe->mask & XPOLL_WRITABLE) loop->poll_fds[idx].events |= POLLOUT;
+#ifdef POLLRDHUP
+    loop->poll_fds[idx].events |= POLLRDHUP;
+#endif
 }
 
 #endif /* poll / WSAPoll */
@@ -835,9 +838,11 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe || fe->mask == XPOLL_NONE) continue;
 
         int mask = 0;
-        if (e->events & (EPOLLIN  | EPOLLRDHUP)) mask |= XPOLL_READABLE;
+        if (e->events & EPOLLIN)                  mask |= XPOLL_READABLE;
         if (e->events & EPOLLOUT)                 mask |= XPOLL_WRITABLE;
-        if (e->events & (EPOLLERR | EPOLLHUP))    mask |= XPOLL_ERROR | XPOLL_CLOSE;
+        if ((e->events & (EPOLLRDHUP | EPOLLHUP)) && !(e->events & EPOLLIN))
+                                                    mask |= XPOLL_CLOSE;
+        if (e->events & EPOLLERR)                  mask |= XPOLL_ERROR | XPOLL_CLOSE;
 
         SOCKET_T fd = fe->fd;
 
@@ -891,9 +896,12 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe || fe->mask == XPOLL_NONE) continue;
 
         int mask = 0;
-        if (ke->filter == EVFILT_READ)   mask |= XPOLL_READABLE;
+        int readable = (ke->filter == EVFILT_READ)
+                       && (!(ke->flags & EV_EOF) || ke->data > 0);
+        if (readable)                    mask |= XPOLL_READABLE;
         if (ke->filter == EVFILT_WRITE)  mask |= XPOLL_WRITABLE;
-        if (ke->flags  & EV_EOF)         mask |= XPOLL_CLOSE;
+        if ((ke->flags & EV_EOF) && !readable)
+                                            mask |= XPOLL_CLOSE;
         if (ke->flags  & EV_ERROR)       mask |= XPOLL_ERROR;
 
         SOCKET_T fd = fe->fd;
@@ -953,7 +961,13 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         int mask = 0;
         if (revents & POLLIN)                       mask |= XPOLL_READABLE;
         if (revents & POLLOUT)                      mask |= XPOLL_WRITABLE;
-        if (revents & (POLLERR | POLLHUP | POLLNVAL))
+#ifdef POLLRDHUP
+        if ((revents & POLLRDHUP) && !(revents & POLLIN))
+                                                    mask |= XPOLL_CLOSE;
+#endif
+        if ((revents & POLLHUP) && !(revents & POLLIN))
+                                                    mask |= XPOLL_CLOSE;
+        if (revents & (POLLERR | POLLNVAL))
                                                     mask |= XPOLL_ERROR | XPOLL_CLOSE;
         loop->poll_fds[i].revents = 0;
 
