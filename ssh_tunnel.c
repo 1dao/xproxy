@@ -1,8 +1,14 @@
 #include "ssh_tunnel.h"
 #include <wolfssl/wolfcrypt/types.h>
+#include <wolfssh/log.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef LOG_TAG
+#define LOG_TAG "ssh"
+#endif
+#include "xlog.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -16,6 +22,23 @@
 
 static int wolf_ssh_initialized = 0;
 static WOLFSSH_CTX* g_ssh_ctx = NULL;
+
+/* Route wolfssh's internal logs through xlog. wolfssh's logLevel global is
+ * fixed at WS_LOG_DEBUG and has no public setter, so we drop DEBUG here to
+ * keep volume manageable; INFO/WARN/ERROR pass through. The INFO line we
+ * actually care about for diagnosis is:
+ *     "channel open failure reason code: %u"  (RFC4254 1..4)
+ *     "description: ..."
+ * logged from DoChannelOpenFail in 3rd/wolfssh/src/internal.c. */
+static void wolfssh_log_bridge(enum wolfSSH_LogLevel level, const char* msg) {
+    if (!msg) return;
+    if (level == WS_LOG_DEBUG) return;
+    switch (level) {
+        case WS_LOG_ERROR: XLOGE("[wolfssh] %s", msg); break;
+        case WS_LOG_WARN:  XLOGW("[wolfssh] %s", msg); break;
+        default:           XLOGI("[wolfssh] %s", msg); break;
+    }
+}
 
 static int wsUserAuth(byte authType, WS_UserAuthData* authData, void* ctx)
 {
@@ -54,6 +77,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     SOCKET_T sock;
     int ret;
 
+    wolfSSH_SetLoggingCb(wolfssh_log_bridge);
     wolfSSH_Debugging_ON();
 
     printf("[DEBUG] 1. Calling wolfSSH_Init...\n");

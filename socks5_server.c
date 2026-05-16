@@ -20,6 +20,52 @@
  * to tell callers "the client is now in a terminal state — stop further work". */
 #define SOCKS5_SEND_CLOSED (-3)
 
+/* ---- SOCKS5 wire protocol (RFC 1928) -------------------------------------
+ * These were public in socks5_server.h, but no caller of the public API ever
+ * referenced them — they're an internal protocol detail. */
+#define SOCKS5_VERSION                  0x05
+#define SOCKS5_RESERVED                 0x00  /* RFC 1928 RSV byte */
+
+#define SOCKS5_AUTH_NONE                0x00
+#define SOCKS5_AUTH_GSSAPI              0x01
+#define SOCKS5_AUTH_PASSWORD            0x02
+#define SOCKS5_AUTH_NO_ACCEPTABLE       0xFF
+
+#define SOCKS5_CMD_CONNECT              0x01
+#define SOCKS5_CMD_BIND                 0x02
+#define SOCKS5_CMD_UDP_ASSOCIATE        0x03
+
+#define SOCKS5_ATYP_IPV4                0x01
+#define SOCKS5_ATYP_DOMAIN              0x03
+#define SOCKS5_ATYP_IPV6                0x04
+
+#define SOCKS5_REP_SUCCESS              0x00
+#define SOCKS5_REP_GENERAL_FAILURE      0x01
+#define SOCKS5_REP_CONNECTION_NOT_ALLOWED 0x02
+#define SOCKS5_REP_NETWORK_UNREACHABLE  0x03
+#define SOCKS5_REP_HOST_UNREACHABLE     0x04
+#define SOCKS5_REP_CONNECTION_REFUSED   0x05
+#define SOCKS5_REP_TTL_EXPIRED          0x06
+#define SOCKS5_REP_COMMAND_NOT_SUPPORTED 0x07
+#define SOCKS5_REP_ADDRESS_NOT_SUPPORTED 0x08
+
+/* ---- RFC 1929 user/password sub-negotiation ------------------------------
+ * Distinct from SOCKS5_AUTH_*: same byte values overlap across the two
+ * protocols by coincidence, so the names matter. */
+#define SOCKS5_USERPASS_VERSION         0x01
+#define SOCKS5_USERPASS_OK              0x00
+#define SOCKS5_USERPASS_FAIL            0x01
+
+typedef enum {
+    SOCKS5_STATE_INIT,
+    SOCKS5_STATE_AUTH,
+    SOCKS5_STATE_AUTH_PASSWORD,
+    SOCKS5_STATE_REQUEST,
+    SOCKS5_STATE_OPENING,
+    SOCKS5_STATE_CONNECTED,
+    SOCKS5_STATE_ERROR
+} Socks5ClientState;
+
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
 static WOLFSSH *g_ssh_session = NULL;
@@ -96,23 +142,18 @@ static void socks5_client_fail(Socks5Client* client, const char* reason) {
 static int socks5_client_close_after_send(Socks5Client* client, const char* reason) {
     if (!client) return SOCKS5_SEND_CLOSED;
     const char* why = reason ? reason : "close_after_send";
-    client->state = SOCKS5_STATE_ERROR;
 
-    if (!client->io_ch || xchannel_close_after_flush(client->io_ch, why) != 0) {
+    if (!client->io_ch) {
+        /* No xchannel attached: client is alive, take the immediate-fail path. */
         socks5_client_fail(client, why);
+    } else {
+        client->state = SOCKS5_STATE_ERROR;
+        /* IMPORTANT: xchannel_close_after_flush can synchronously fire close_cb,
+         * which routes through socks5_client_cleanup -> free(client). After this
+         * call returns, `client` may be a dangling pointer — do NOT touch it. */
+        xchannel_close_after_flush(client->io_ch, why);
     }
     return SOCKS5_SEND_CLOSED;
-}
-
-static void socks5_destroy_shared_session(WOLFSSH* session) {
-    if (!session) return;
-    SOCKET_T ssh_socket = wolfSSH_session_get_socket(session);
-    xhash *hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
-    xpoll_del_event(ssh_socket, XPOLL_ALL);
-    if (hash_table) {
-        xhash_destroy(hash_table, false);
-    }
-    wolfSSH_session_close(session);
 }
 
 static WOLFSSH* socks5_create_shared_session(const Socks5ServerConfig* config) {
@@ -147,6 +188,17 @@ static WOLFSSH* socks5_create_shared_session(const Socks5ServerConfig* config) {
                              ssh_channel_open_fail_callback,
                              hash_table);
     return ssh_session;
+}
+
+static void socks5_destroy_shared_session(WOLFSSH* session) {
+    if (!session) return;
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(session);
+    xhash *hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
+    xpoll_del_event(ssh_socket, XPOLL_ALL);
+    if (hash_table) {
+        xhash_destroy(hash_table, false);
+    }
+    wolfSSH_session_close(session);
 }
 
 static void socks5_client_wbuf_reset(Socks5Client* client) {
@@ -213,37 +265,55 @@ static int socks5_client_send_raw(Socks5Client* client,
     return 0;
 }
 
-static int socks5_send_reply(Socks5Client* client, uint8_t rep) {
-    uint8_t response[256];
-    int len = 0;
+/* Send a small terminal response over io_ch, then schedule a graceful close.
+ * Always returns SOCKS5_SEND_CLOSED. Caller MUST NOT touch `client` after
+ * this — close_cb may have fired synchronously and freed it. */
+static int socks5_send_raw_and_close(Socks5Client* client,
+                                     const void* data, size_t len,
+                                     const char* what,
+                                     const char* close_reason) {
+    int sr = socks5_client_send_raw(client, data, len, what);
+    if (sr == SOCKS5_SEND_CLOSED) return SOCKS5_SEND_CLOSED;
+    if (sr != 0) {
+        socks5_client_fail(client, "reply_send_error");
+        return SOCKS5_SEND_CLOSED;
+    }
+    return socks5_client_close_after_send(client, close_reason);
+}
 
-    response[len++] = 0x05;  // SOCKS version
-    response[len++] = rep;   // Reply code
-    response[len++] = 0x00;  // Reserved
+/* Build a SOCKS5 reply packet into `out` (must hold at least 22 bytes).
+ * Returns the byte length. */
+static int build_socks5_reply(uint8_t* out, uint8_t rep) {
+    int len = 0;
+    out[len++] = SOCKS5_VERSION;
+    out[len++] = rep;
+    out[len++] = SOCKS5_RESERVED;
 
     if (rep == SOCKS5_REP_SUCCESS) {
-        response[len++] = 0x01;  // IPv4
+        out[len++] = SOCKS5_ATYP_IPV4;
 
-        // convert host address to IP address
         struct in_addr ip_addr;
         if (inet_pton(AF_INET, g_server_config.ssh_host, &ip_addr) == 1) {
-            memcpy(&response[len], &ip_addr, 4);
+            memcpy(&out[len], &ip_addr, 4);
         } else {
-            // rollback to 0.0.0.0
-            memset(&response[len], 0, 4);
+            memset(&out[len], 0, 4);  // fall back to 0.0.0.0
         }
         len += 4;
 
-        // response ssh port
         uint16_t ssh_port = htons(g_server_config.ssh_port);
-        memcpy(&response[len], &ssh_port, 2);
+        memcpy(&out[len], &ssh_port, 2);
         len += 2;
     } else {
-        response[len++] = 0x01;
-        memset(&response[len], 0, 6);
+        out[len++] = SOCKS5_ATYP_IPV4;
+        memset(&out[len], 0, 6);      // BND.ADDR + BND.PORT zeroed
         len += 6;
     }
+    return len;
+}
 
+static int socks5_send_reply(Socks5Client* client, uint8_t rep) {
+    uint8_t response[22];
+    int len = build_socks5_reply(response, rep);
     return socks5_client_send_raw(client, response, (size_t)len, "socks5_reply");
 }
 
@@ -252,13 +322,10 @@ static int socks5_send_reply(Socks5Client* client, uint8_t rep) {
  * send failure that already escalated to socks5_client_fail). Callers should
  * propagate this as a terminal indicator and stop touching the client. */
 static int socks5_reply_and_close(Socks5Client* client, uint8_t rep, const char* reason) {
-    int sr = socks5_send_reply(client, rep);
-    if (sr == SOCKS5_SEND_CLOSED) return SOCKS5_SEND_CLOSED;
-    if (sr != 0) {
-        socks5_client_fail(client, "reply_send_error");
-        return SOCKS5_SEND_CLOSED;
-    }
-    return socks5_client_close_after_send(client, reason);
+    uint8_t response[22];
+    int len = build_socks5_reply(response, rep);
+    return socks5_send_raw_and_close(client, response, (size_t)len,
+                                     "socks5_reply", reason);
 }
 
 #ifdef _MSC_VER
@@ -274,8 +341,8 @@ UNUSED_FUNCTION static int socks5_accout_auth(Socks5Client* client) {
     return -1;
 }
 
-static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
-static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud);
+// static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
+// static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud);
 static int socks5_client_stage(Socks5Client* client) {
     if (!client || !g_ssh_session) return -1;
 
@@ -340,13 +407,13 @@ static int socks5_consume_auth(Socks5Client* client, const uint8_t* buf,
     if (len < need) return 0;
     *consumed = need;
 
-    if (buf[0] != 0x05) {
+    if (buf[0] != SOCKS5_VERSION) {
         XLOGE("SOCKS5 version mismatch 0x%02X, fd=%d",
               buf[0], (int)client->client_sock);
         return -1;
     }
 
-    uint8_t selected = 0xFF;
+    uint8_t selected = SOCKS5_AUTH_NO_ACCEPTABLE;
     const bool need_userpass = socks5_userpass_configured();
     for (size_t i = 0; i < (size_t)nmethods; i++) {
         uint8_t method = buf[2 + i];
@@ -363,23 +430,16 @@ static int socks5_consume_auth(Socks5Client* client, const uint8_t* buf,
         }
     }
 
-    if (selected == 0xFF) {
+    if (selected == SOCKS5_AUTH_NO_ACCEPTABLE) {
         XLOGE("No acceptable auth method, fd=%d", (int)client->client_sock);
-        {
-            uint8_t resp[2] = {0x05, SOCKS5_AUTH_NO_ACCEPTABLE};
-            int sr = socks5_client_send_raw(client, resp, sizeof(resp),
-                                            "auth_no_acceptable");
-            if (sr == SOCKS5_SEND_CLOSED) return SOCKS5_SEND_CLOSED;
-            if (sr != 0) {
-                socks5_client_fail(client, "auth_no_acceptable_send_error");
-                return SOCKS5_SEND_CLOSED;
-            }
-        }
-        return socks5_client_close_after_send(client, "auth_no_acceptable");
+        uint8_t resp[2] = {SOCKS5_VERSION, SOCKS5_AUTH_NO_ACCEPTABLE};
+        return socks5_send_raw_and_close(client, resp, sizeof(resp),
+                                         "auth_no_acceptable",
+                                         "auth_no_acceptable");
     }
 
     {
-        uint8_t resp[2] = {0x05, selected};
+        uint8_t resp[2] = {SOCKS5_VERSION, selected};
         int sr = socks5_client_send_raw(client, resp, sizeof(resp),
                                         "auth_response");
         if (sr != 0) return sr;
@@ -398,7 +458,7 @@ static int socks5_consume_userpass_auth(Socks5Client* client, const uint8_t* buf
     *consumed = 0;
     if (len < 2) return 0;
 
-    if (buf[0] != 0x01) {
+    if (buf[0] != SOCKS5_USERPASS_VERSION) {
         XLOGE("Invalid RFC1929 auth version=0x%02X, fd=%d",
               buf[0], (int)client->client_sock);
         return -1;
@@ -420,7 +480,8 @@ static int socks5_consume_userpass_auth(Socks5Client* client, const uint8_t* buf
 
     bool ok = socks5_equal_token(uname, ulen, g_server_config.proxy_username) &&
               socks5_equal_token(passwd, plen, g_server_config.proxy_password);
-    uint8_t resp[2] = {0x01, ok ? 0x00 : 0x01};
+    uint8_t resp[2] = {SOCKS5_USERPASS_VERSION,
+                       ok ? SOCKS5_USERPASS_OK : SOCKS5_USERPASS_FAIL};
     int sr = socks5_client_send_raw(client, resp, sizeof(resp),
                                     "userpass_response");
     if (sr != 0) return sr;
@@ -440,7 +501,7 @@ static int socks5_consume_request(Socks5Client* client, const uint8_t* buf,
     *consumed = 0;
     if (len < 4) return 0;
 
-    if (buf[0] != 0x05) {
+    if (buf[0] != SOCKS5_VERSION) {
         XLOGE("SOCKS5 request version mismatch, fd=%d", (int)client->client_sock);
         return -1;
     }
@@ -454,14 +515,14 @@ static int socks5_consume_request(Socks5Client* client, const uint8_t* buf,
     size_t pos = 4;
     size_t addr_len = 0;
 
-    if (atyp == SOCKS5_ATYP_IPV4) {
-        addr_len = 4;
-    } else if (atyp == SOCKS5_ATYP_IPV6) {
-        addr_len = 16;
-    } else if (atyp == SOCKS5_ATYP_DOMAIN) {
+    switch (atyp) {
+    case SOCKS5_ATYP_IPV4: addr_len = 4;    break;
+    case SOCKS5_ATYP_IPV6: addr_len = 16;   break;
+    case SOCKS5_ATYP_DOMAIN:
         if (len < pos + 1) return 0;
         addr_len = 1u + (size_t)buf[pos];
-    } else {
+        break;
+    default:
         XLOGE("Unsupported ATYP=0x%02X, fd=%d", atyp, (int)client->client_sock);
         return socks5_reply_and_close(client, SOCKS5_REP_ADDRESS_NOT_SUPPORTED,
                                       "address_not_supported");
@@ -474,17 +535,22 @@ static int socks5_consume_request(Socks5Client* client, const uint8_t* buf,
 
     {
         char target_host[256];
-        if (atyp == SOCKS5_ATYP_IPV4) {
+        switch (atyp) {
+        case SOCKS5_ATYP_IPV4: {
             struct in_addr addr;
             memcpy(&addr, &buf[pos], 4);
             inet_ntop(AF_INET, &addr, target_host, sizeof(target_host));
             pos += 4;
-        } else if (atyp == SOCKS5_ATYP_IPV6) {
+            break;
+        }
+        case SOCKS5_ATYP_IPV6: {
             struct in6_addr addr6;
             memcpy(&addr6, &buf[pos], 16);
             inet_ntop(AF_INET6, &addr6, target_host, sizeof(target_host));
             pos += 16;
-        } else {
+            break;
+        }
+        case SOCKS5_ATYP_DOMAIN: {
             size_t domain_len = (size_t)buf[pos++];
             if (domain_len >= sizeof(target_host)) {
                 XLOGE("Domain too long, fd=%d", (int)client->client_sock);
@@ -493,6 +559,11 @@ static int socks5_consume_request(Socks5Client* client, const uint8_t* buf,
             memcpy(target_host, &buf[pos], domain_len);
             target_host[domain_len] = '\0';
             pos += domain_len;
+            break;
+        }
+        default:
+            /* Unreachable: ATYP was validated by the switch above. */
+            return -1;
         }
 
         uint16_t net_port = 0;
@@ -897,6 +968,84 @@ static int socks5_forward_client_data_to_ssh(Socks5Client* client,
     return 0;
 }
 
+typedef enum {
+    PKT_ADVANCE,    /* consumed some bytes, loop and re-dispatch */
+    PKT_NEED_MORE,  /* not enough data this turn; caller returns off */
+    PKT_DONE,       /* whole packet handled (or implicitly drained); caller returns len */
+    PKT_ABORT,      /* client already failed/closed; caller returns len */
+} packet_step_t;
+
+/* Single-state consumer for client_channel_packet_cb. Reads from data + *off
+ * and advances *off on progress. The outer loop re-dispatches on PKT_ADVANCE
+ * because consume_* may have moved client->state forward. */
+static packet_step_t packet_step(Socks5Client* client,
+                                 const char* data, size_t len, size_t* off) {
+    size_t used = 0;
+    int rc;
+
+    switch (client->state) {
+    case SOCKS5_STATE_AUTH:
+        rc = socks5_consume_auth(client,
+                                 (const uint8_t*)data + *off, len - *off, &used);
+        if (rc < 0) {
+            if (rc != SOCKS5_SEND_CLOSED) socks5_client_fail(client, "auth_error");
+            return PKT_ABORT;
+        }
+        if (rc == 0) return PKT_NEED_MORE;
+        *off += used;
+        return PKT_ADVANCE;
+
+    case SOCKS5_STATE_AUTH_PASSWORD:
+        rc = socks5_consume_userpass_auth(client,
+                                          (const uint8_t*)data + *off, len - *off, &used);
+        if (rc < 0) {
+            if (rc != SOCKS5_SEND_CLOSED) socks5_client_fail(client, "auth_userpass_error");
+            return PKT_ABORT;
+        }
+        if (used > 0) *off += used;
+        return (rc == 0 && used == 0) ? PKT_NEED_MORE : PKT_ADVANCE;
+
+    case SOCKS5_STATE_REQUEST:
+        rc = socks5_consume_request(client,
+                                    (const uint8_t*)data + *off, len - *off, &used);
+        if (rc < 0) {
+            if (rc != SOCKS5_SEND_CLOSED) socks5_client_fail(client, "request_error");
+            return PKT_ABORT;
+        }
+        if (used > 0) *off += used;
+        return (rc == 0 && used == 0) ? PKT_NEED_MORE : PKT_ADVANCE;
+
+    case SOCKS5_STATE_OPENING: {
+        size_t remaining = len - *off;
+        if (remaining > 0 &&
+            socks5_client_wbuf_append(client, data + *off, remaining) != 0) {
+            XLOGE("ERROR: Pending buffer full while opening. needed=%zu, host=%s",
+                  remaining, client->target_host);
+            socks5_client_fail(client, "buffer_full");
+            return PKT_ABORT;
+        }
+        *off = len;
+        return PKT_DONE;
+    }
+
+    case SOCKS5_STATE_CONNECTED:
+        if (!client->ssh_channel || !client->ssh_session) {
+            socks5_client_fail(client, "missing_ssh_channel");
+            return PKT_ABORT;
+        }
+        if (socks5_forward_client_data_to_ssh(client, data + *off, len - *off) != 0) {
+            socks5_client_fail(client, "ssh_write_error");
+        }
+        return PKT_DONE;
+
+    default:
+        /* Unknown / unexpected state — bail with whatever we already consumed
+         * (NEED_MORE in the outer loop returns off, matching the old default
+         * fall-through `break`). */
+        return PKT_NEED_MORE;
+    }
+}
+
 static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud) {
     (void)ch;
     Socks5Client *client = (Socks5Client*)ud;
@@ -905,75 +1054,13 @@ static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t le
 
     size_t off = 0;
     while (off < len) {
-        if (client->state == SOCKS5_STATE_AUTH) {
-            size_t used = 0;
-            int rc = socks5_consume_auth(client, (const uint8_t*)data + off, len - off, &used);
-            if (rc < 0) {
-                if (rc != SOCKS5_SEND_CLOSED) {
-                    socks5_client_fail(client, "auth_error");
-                }
-                return len;
-            }
-            if (rc == 0) break;
-            off += used;
-            continue;
+        switch (packet_step(client, data, len, &off)) {
+        case PKT_ADVANCE:   continue;
+        case PKT_NEED_MORE: return off;
+        case PKT_DONE:
+        case PKT_ABORT:     return len;
         }
-
-        if (client->state == SOCKS5_STATE_AUTH_PASSWORD) {
-            size_t used = 0;
-            int rc = socks5_consume_userpass_auth(client, (const uint8_t*)data + off, len - off, &used);
-            if (rc < 0) {
-                if (rc != SOCKS5_SEND_CLOSED) {
-                    socks5_client_fail(client, "auth_userpass_error");
-                }
-                return len;
-            }
-            if (used > 0) off += used;
-            if (rc == 0 && used == 0) break;
-            continue;
-        }
-
-        if (client->state == SOCKS5_STATE_REQUEST) {
-            size_t used = 0;
-            int rc = socks5_consume_request(client, (const uint8_t*)data + off, len - off, &used);
-            if (rc < 0) {
-                if (rc != SOCKS5_SEND_CLOSED) {
-                    socks5_client_fail(client, "request_error");
-                }
-                return len;
-            }
-            if (used > 0) off += used;
-            if (rc == 0 && used == 0) break;
-            continue;
-        }
-
-        if (client->state == SOCKS5_STATE_OPENING) {
-            size_t remaining = len - off;
-            if (remaining > 0 &&
-                socks5_client_wbuf_append(client, data + off, remaining) != 0) {
-                XLOGE("ERROR: Pending buffer full while opening. needed=%zu, host=%s",
-                      remaining, client->target_host);
-                socks5_client_fail(client, "buffer_full");
-                return len;
-            }
-            off = len;
-            break;
-        }
-
-        if (client->state == SOCKS5_STATE_CONNECTED) {
-            if (!client->ssh_channel || !client->ssh_session) {
-                socks5_client_fail(client, "missing_ssh_channel");
-                return len;
-            }
-            if (socks5_forward_client_data_to_ssh(client, data + off, len - off) != 0) {
-                socks5_client_fail(client, "ssh_write_error");
-            }
-            return len;
-        }
-
-        break;
     }
-
     return off;
 }
 

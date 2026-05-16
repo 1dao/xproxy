@@ -1149,6 +1149,9 @@ int xchannel_close_after_flush(xChannel* ch, const char* reason) {
 
     if (!ch->closed && has_pending_output(ch)) {
         if (arm_writable(ch, ch->connect_pending) != 0) {
+            /* arm_writable already called xchannel_close("poll_error") on
+             * failure, so ch->closed is true and close_cb has fired. The
+             * caller's lifecycle ownership has transferred — just bail. */
             xchannel_release(ch);
             return -1;
         }

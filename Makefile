@@ -2,10 +2,17 @@
 # All sources compiled from source
 
 CC = gcc
-#CFLAGS = -Wall -g3 -O0 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
-CFLAGS = -Wall -O2 -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
-CPPFLAGS = -I. -I./3rd/wolfssl -I./3rd/wolfssl/wolfssl -I./3rd/wolfssh -I./3rd/wolfssh/wolfssh -DWOLFSSL_USER_SETTINGS -DWOLFSSH_USER_SETTINGS -DWOLFSSH_FWD
 
+# Build mode: release by default, `make debug` (or `make DEBUG=1`) for debug.
+DEBUG ?= 0
+COMMON_CFLAGS = -Wall -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
+CPPFLAGS = -I. -I./3rd/wolfssl -I./3rd/wolfssl/wolfssl -I./3rd/wolfssh -I./3rd/wolfssh/wolfssh -DWOLFSSL_USER_SETTINGS -DWOLFSSH_USER_SETTINGS -DWOLFSSH_FWD
+ifeq ($(DEBUG),1)
+    CFLAGS = $(COMMON_CFLAGS) -g3 -O0
+    CPPFLAGS += -DDEBUG_WOLFSSH
+else
+    CFLAGS = $(COMMON_CFLAGS) -O2
+endif
 # Detect platform and set appropriate flags/libraries
 ifeq ($(OS),Windows_NT)
     # Native Windows (cmd.exe)
@@ -87,9 +94,13 @@ WOLFSSH_OBJECTS = $(addprefix $(OBJDIR)/wolfssh/, $(notdir $(WOLFSSH_SOURCES:.c=
 
 ALL_OBJECTS = $(APP_OBJECTS) $(WOLFCRYPT_OBJECTS) $(WOLFSSH_OBJECTS)
 
-.PHONY: all clean run
+.PHONY: all clean run debug
 
 all: $(EXE)
+
+# Convenience target: `make debug` -> recurse with DEBUG=1
+debug:
+	$(MAKE) DEBUG=1
 
 # Create required directories
 $(OBJDIR):
