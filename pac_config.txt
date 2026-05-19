@@ -3,6 +3,11 @@
 # 示例：*.google.com socks5
 #        *.xxx.com http
 
+*.todesktop.com socks5
+*.cursor-cdn.com socks5
+*.cursor.sh socks5
+*.cursor.com socks5
+*.google.co.jp socks5
 *.facebook.net socks5
 *.intellimizeio.com socks5
 *.anthropic.com socks5

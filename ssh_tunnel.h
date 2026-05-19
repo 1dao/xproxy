@@ -34,6 +34,8 @@ int wolfSSH_channel_write(WOLFSSH_CHANNEL *channel, const void *buffer, size_t b
 
 /* 获取SSH session的socket描述符，用于select监听 */
 SOCKET_T wolfSSH_session_get_socket(WOLFSSH* session);
+int wolfSSH_session_has_buffered_input(WOLFSSH* session);
+int wolfSSH_session_has_pending_output(WOLFSSH* session);
 
 /* 处理SSH事件（轮询模式下调用） */
 int wolfSSH_process_events(WOLFSSH* session, word32* channelId);

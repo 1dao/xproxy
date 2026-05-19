@@ -808,14 +808,16 @@ int xpoll_poll(int timeout_ms) {
 #if defined(XPOLL_BACKEND_EPOLL)
 
 int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
+int wait_ms = timeout_ms;
 #if defined(XPOLL_WITH_IO_URING)
-    num_processed += _uring_drain(loop);
-    if (num_processed > 0) return num_processed;
+    int drained = _uring_drain(loop);
+    num_processed += drained;
+    if (drained > 0) wait_ms = 0;
     if (loop->uring_ready) maxevents++;
 #endif
 
     if (maxevents > loop->setsize) maxevents = loop->setsize;
-    num_ready = epoll_wait(loop->epfd, loop->ep_events, maxevents, timeout_ms);
+    num_ready = epoll_wait(loop->epfd, loop->ep_events, maxevents, wait_ms);
 
     if (num_ready < 0) {
         if (errno == EINTR) return 0;

@@ -22,6 +22,7 @@
 
 static int wolf_ssh_initialized = 0;
 static WOLFSSH_CTX* g_ssh_ctx = NULL;
+inline static int is_temporary_state(int error_code);
 
 /* Route wolfssh's internal logs through xlog. wolfssh's logLevel global is
  * fixed at WS_LOG_DEBUG and has no public setter, so we drop DEBUG here to
@@ -240,21 +241,24 @@ void wolfSSH_channel_close(WOLFSSH_CHANNEL* channel) {
     if (!channel)
         return;
 
-    // int ssh_error = wolfSSH_get_error(channel->ssh);
-    // if(ssh_error != WS_SOCKET_ERROR_E
-    //     && ssh_error != WS_CHANNEL_CLOSED
-    //     && ssh_error != WS_EOF
-    //     && ssh_error != WS_FATAL_ERROR) {
-    //     if (wolfSSH_channel_eof(channel) == 0) {
-    //         // read remain data
-    //         char temp[1024];int n;
-    //         while ((n = wolfSSH_ChannelRead(channel, temp, sizeof(temp))) > 0) {}
-    //     }
-    // }
-
     fprintf(stderr, "SSH channel closed, address=%p\n", channel);
+    if (channel->openConfirmed) {
+        if (!channel->eofTxd) {
+            int ret = SendChannelEof(channel->ssh, channel->peerChannel);
+            if (ret < 0 && !is_temporary_state(ret)) {
+                XLOGE("SendChannelEof failed: %d:%s",
+                      ret, wolfSSH_ErrorToName(ret));
+            }
+        }
+        if (!channel->closeTxd) {
+            int ret = SendChannelClose(channel->ssh, channel->peerChannel);
+            if (ret < 0 && !is_temporary_state(ret)) {
+                XLOGE("SendChannelClose failed: %d:%s",
+                      ret, wolfSSH_ErrorToName(ret));
+            }
+        }
+    }
     wolfSSH_ChannelFree(channel);
-    //wolfSSH_ChannelExit(channel);
 }
 
 static inline int check_fatal_err(int err_code) {
@@ -333,6 +337,16 @@ SOCKET_T wolfSSH_session_get_socket(WOLFSSH* ssh) {
         return INVALID_SOCKET;
     }
     return wolfSSH_get_fd(ssh);
+}
+
+int wolfSSH_session_has_buffered_input(WOLFSSH* ssh) {
+    if (!ssh) return 0;
+    return ssh->inputBuffer.length > ssh->inputBuffer.idx;
+}
+
+int wolfSSH_session_has_pending_output(WOLFSSH* ssh) {
+    if (!ssh) return 0;
+    return ssh->outputBuffer.length > ssh->outputBuffer.idx;
 }
 
 int wolfSSH_process_events(WOLFSSH* ssh, word32* channelId) {
