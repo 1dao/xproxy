@@ -33,6 +33,7 @@ typedef struct DomainRule {
 static XpacConfig g_config = {
     .http_proxy_port = 7890,
     .socks5_proxy_port = 1080,
+    .proxy_host = NULL,
     .config_file = NULL,
     .enable_web_admin = 1,        // 默认启用Web管理
     .admin_password = NULL        // 默认无需密码
@@ -69,6 +70,7 @@ void xpac_init(const XpacConfig* config) {
         g_config.socks5_proxy_port = config->socks5_proxy_port;
         g_config.enable_web_admin = config->enable_web_admin;
         g_config.bind_address = config->bind_address;
+        g_config.proxy_host = config->proxy_host;
         g_config.config_file = config->config_file;
         g_config.admin_password = config->admin_password;
     }
@@ -419,7 +421,13 @@ static const char* proxy_type_to_str(ProxyType type) {
 
 // ===================== PAC生成API =====================
 static const char* get_pac_proxy_address(void) {
-    static char address[INET_ADDRSTRLEN] = "127.0.0.1";
+    static char address[256] = "127.0.0.1";
+
+    if (g_config.proxy_host && g_config.proxy_host[0] != '\0') {
+        strncpy(address, g_config.proxy_host, sizeof(address) - 1);
+        address[sizeof(address) - 1] = '\0';
+        return address;
+    }
 
     if (!g_config.bind_address || g_config.bind_address[0] == '\0')
         return address;

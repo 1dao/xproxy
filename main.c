@@ -168,6 +168,7 @@ void show_help(const char *prog_name) {
     printf("  --disable-http          Disable HTTP/HTTPS proxy (default: enabled)\n");
     printf("  --max-http-conns <num>  Max HTTP proxy connections (default: 1024)\n");
     printf("  --pac-file <path>       PAC configuration file (default: pac_config.txt)\n");
+    printf("  --proxy-host <address>  Public proxy host written into PAC files\n");
     printf("\nGeneral Options:\n");
     printf("  -d, --daemon            Run as a Linux daemon in the background\n");
     printf("  --help                  Show this help message\n");
@@ -182,6 +183,8 @@ void show_help(const char *prog_name) {
     printf("  %s -l 1080 -t 7890\n", prog_name);
     printf("\n  # Run HTTP proxy with custom SOCKS5 backend\n");
     printf("  %s -l 1080 -t 7890 -b 192.168.1.100\n", prog_name);
+    printf("\n  # Run on a public Linux server and publish its external IP in PAC\n");
+    printf("  %s -b 0.0.0.0 --proxy-host 206.119.173.196 -h ssh.example.com -u user -P pass\n", prog_name);
     printf("\n  # Run in background on Linux\n");
     printf("  %s -h ssh.example.com -u user -P pass --daemon\n", prog_name);
 }
@@ -211,7 +214,7 @@ int main(int argc, char *argv[]) {
     static char bind_addr[256], ssh_host[256], ssh_user[256], ssh_pass[256];
     static char socks_user[256], socks_pass[256];
     static char http_port_str[16];
-    static char max_http_conns_str[16], pac_file[256];
+    static char max_http_conns_str[16], pac_file[256], proxy_host[256];
 
     strcpy(bind_addr, "127.0.0.1");
     strcpy(ssh_host, "");
@@ -222,6 +225,7 @@ int main(int argc, char *argv[]) {
     strcpy(http_port_str, "7890");
     strcpy(max_http_conns_str, "1024");
     strcpy(pac_file, "pac_config.txt");
+    strcpy(proxy_host, "");
 
     xArgsCFG configs[] = {
         // Common options
@@ -238,6 +242,7 @@ int main(int argc, char *argv[]) {
         {0, "disable-http", NULL, 1},
         {0, "max-http-conns", max_http_conns_str, 0},
         {0, "pac-file", pac_file, 0},
+        {0, "proxy-host", proxy_host, 0},
         {'d', "daemon", NULL, 1}
     };
 
@@ -256,6 +261,7 @@ int main(int argc, char *argv[]) {
     strcpy(ssh_pass, xargs_get("P"));
     strcpy(socks_user, xargs_get("socks-user"));
     strcpy(socks_pass, xargs_get("socks-pass"));
+    strcpy(proxy_host, xargs_get("proxy-host"));
 
     int has_ssh_args = strlen(ssh_host) > 0;
     int disable_http = (xargs_get("disable-http") != NULL);
@@ -472,10 +478,13 @@ int main(int argc, char *argv[]) {
         if (!pac_file_path || strlen(pac_file_path) == 0) {
             pac_file_path = pac_file;  // 回退到默认值
         }
+        const char* pac_proxy_host = proxy_host[0] ? proxy_host : NULL;
+        const char* pac_url_host = pac_proxy_host ? pac_proxy_host : "127.0.0.1";
         XpacConfig pac_config = {
             .http_proxy_port = http_config.listen_port,
             .socks5_proxy_port = http_config.socks5_server_port,
             .bind_address = bind_addr[0] ? bind_addr : "127.0.0.1",
+            .proxy_host = pac_proxy_host,
             .config_file = pac_file_path,
             .enable_web_admin = 1,
             .admin_password = NULL
@@ -483,11 +492,11 @@ int main(int argc, char *argv[]) {
         xpac_init(&pac_config);
 
         XLOGI("\nPAC Files:");
-        XLOGI("  http://127.0.0.1:%d/proxy.pac", http_config.listen_port);
-        XLOGI("  http://127.0.0.1:%d/proxy.socks5.pac", http_config.listen_port);
-        XLOGI("  http://127.0.0.1:%d/proxy.http.pac", http_config.listen_port);
+        XLOGI("  http://%s:%d/proxy.pac", pac_url_host, http_config.listen_port);
+        XLOGI("  http://%s:%d/proxy.socks5.pac", pac_url_host, http_config.listen_port);
+        XLOGI("  http://%s:%d/proxy.http.pac", pac_url_host, http_config.listen_port);
         XLOGI("\nWeb Admin Interface:");
-        XLOGI("  http://127.0.0.1:%d/admin", http_config.listen_port);
+        XLOGI("  http://%s:%d/admin", pac_url_host, http_config.listen_port);
         XLOGI("\n");
     }
 
