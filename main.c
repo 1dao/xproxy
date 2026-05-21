@@ -6,6 +6,7 @@
 #include "xargs.h"
 #include "xpoll.h"
 #include "xlog.h"
+#include "xdaemon.h"
 #include "socks5_server.h"
 #include "https_proxy.h"
 #include "xpac_server.h"
@@ -14,8 +15,12 @@ int g_running = 0;
 
 // Signal handler function
 void signal_handler(int sig) {
-    if (sig == SIGINT) {
-        printf("\nReceived interrupt signal, stopping proxy servers...\n");
+    if (sig == SIGINT
+#ifdef SIGTERM
+        || sig == SIGTERM
+#endif
+    ) {
+        printf("\nReceived stop signal, stopping proxy servers...\n");
         g_running = 0;
     } else if (sig == SIGSEGV) {
         printf("Generating dump file...\n");
@@ -42,6 +47,7 @@ static void allow_sleep(void) {
 #include <termios.h>
 #include <unistd.h>
 #endif
+
 void get_hidden_input(const char* prompt, char* buffer, int size) {
     printf("%s", prompt);
     fflush(stdout);
@@ -163,6 +169,7 @@ void show_help(const char *prog_name) {
     printf("  --max-http-conns <num>  Max HTTP proxy connections (default: 1024)\n");
     printf("  --pac-file <path>       PAC configuration file (default: pac_config.txt)\n");
     printf("\nGeneral Options:\n");
+    printf("  -d, --daemon            Run as a Linux daemon in the background\n");
     printf("  --help                  Show this help message\n");
     printf("\nIf no SSH arguments provided, will run HTTP proxy only.\n");
     printf("If SSH arguments provided, will run both SOCKS5 and HTTP proxy servers.\n");
@@ -175,6 +182,8 @@ void show_help(const char *prog_name) {
     printf("  %s -l 1080 -t 7890\n", prog_name);
     printf("\n  # Run HTTP proxy with custom SOCKS5 backend\n");
     printf("  %s -l 1080 -t 7890 -b 192.168.1.100\n", prog_name);
+    printf("\n  # Run in background on Linux\n");
+    printf("  %s -h ssh.example.com -u user -P pass --daemon\n", prog_name);
 }
 
 #ifdef __ANDROID__
@@ -182,13 +191,14 @@ int xproxy_main(int argc, char *argv[]) {
 #else
 int main(int argc, char *argv[]) {
 #endif
-    XLOGI("[VPN] xproxy_main prepare to start with argc=%d", argc);
-
     console_set_consolas_font();
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
     signal(SIGINT, signal_handler);
+#ifdef SIGTERM
+    signal(SIGTERM, signal_handler);
+#endif
     signal(SIGSEGV, signal_handler);
 
 #ifdef _WIN32
@@ -227,7 +237,8 @@ int main(int argc, char *argv[]) {
         {'t', "http_port", http_port_str, 0},
         {0, "disable-http", NULL, 1},
         {0, "max-http-conns", max_http_conns_str, 0},
-        {0, "pac-file", pac_file, 0}
+        {0, "pac-file", pac_file, 0},
+        {'d', "daemon", NULL, 1}
     };
 
     xargs_init(configs, sizeof(configs)/sizeof(configs[0]), argc, argv);
@@ -249,6 +260,13 @@ int main(int argc, char *argv[]) {
     int has_ssh_args = strlen(ssh_host) > 0;
     int disable_http = (xargs_get("disable-http") != NULL);
     int enable_http = !disable_http;  // HTTP is enabled by default
+    int daemon_mode = (xargs_get("daemon") != NULL);
+
+    if (daemon_mode && !xdaemon_is_supported()) {
+        XLOGE("Error: --daemon is only supported on Linux");
+        xargs_cleanup();
+        return EXIT_FAILURE;
+    }
 
     // Interactive mode for SOCKS5 server if no SSH args provided
     if (!has_ssh_args && enable_http) {
@@ -261,6 +279,12 @@ int main(int argc, char *argv[]) {
     } else if (has_ssh_args) {
         // Check if we need to enter interactive mode
         if (strlen(ssh_user) == 0) {
+            if (daemon_mode) {
+                XLOGE("Error: --daemon requires non-interactive SSH configuration; provide -u/--user");
+                xargs_cleanup();
+                return EXIT_FAILURE;
+            }
+
             printf("Entering interactive configuration mode for SOCKS5 server\n\n");
             Socks5ServerConfig config = {
                 .bind_address = bind_addr[0] ? bind_addr : "127.0.0.1",
@@ -283,6 +307,16 @@ int main(int argc, char *argv[]) {
             strcpy(ssh_host, config.ssh_host);
         }
     }
+
+    if (daemon_mode) {
+        if (xdaemon_daemonize() != 0) {
+            XLOGE("Failed to daemonize process");
+            xargs_cleanup();
+            return EXIT_FAILURE;
+        }
+    }
+
+    XLOGI("[VPN] xproxy_main prepare to start with argc=%d", argc);
 
     // Initialize socket library
     if (socket_init() != 0) {
