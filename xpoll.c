@@ -38,6 +38,8 @@
 #include "xhash.h"
 
 #if defined(XPOLL_WITH_IO_URING)
+#	include <fcntl.h>
+#	include <sys/types.h>
 #   include <liburing.h>
 #   include <poll.h>
 #endif

@@ -16,6 +16,8 @@
 #define MAX_REOPEN_COUNT 10 // wait for 3min
 #define SOCKS5_WRITE_BUFFER_INITIAL 65536u
 #define SOCKS5_WRITE_BUFFER_MAX (16u * 1024u * 1024u)
+/* Pause io_ch reads when SSH wbuf exceeds this; resume when fully drained. */
+#define SOCKS5_WBUF_PAUSE_THRESHOLD (256u * 1024u)
 /* Returned by socks5_send_reply / socks5_client_send_raw / socks5_reply_and_close
  * to tell callers "the client is now in a terminal state — stop further work". */
 #define SOCKS5_SEND_CLOSED (-3)
@@ -114,6 +116,7 @@ typedef struct {
     size_t wlen;
     size_t wcap;
     xChannel *io_ch;
+    bool io_recv_paused;  // true when io_ch reads are paused due to SSH wbuf backpressure
 
     // reopen cd
     long64 last_retry_time;  // retry time
@@ -797,6 +800,17 @@ static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
         socks5_client_wbuf_reset(client);
         XLOGE("All buffered data (%d bytes) written for fd=%d",
                written, (int)client->client_sock);
+        /* Resume io_ch reads now that the SSH wbuf has fully drained. */
+        if (client->io_recv_paused && client->io_ch
+            && !xchannel_is_closed(client->io_ch)) {
+            XLOGD("SSH wbuf drained: resuming io_ch reads fd=%d",
+                  (int)client->client_sock);
+            client->io_recv_paused = false;
+            if (xchannel_attach(client->io_ch) != 0) {
+                socks5_client_fail(client, "resume_read_error");
+                return true;
+            }
+        }
     } else if(written != 0) {
         // Partial write
         socks5_client_wbuf_consume(client, (size_t)written);
@@ -1008,6 +1022,16 @@ static int socks5_forward_client_data_to_ssh(Socks5Client* client,
 
     if (client->wlen > 0 && hash_table) {
         xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
+    }
+
+    /* Back-pressure: when SSH wbuf is large, pause io_ch reads so we stop
+     * accumulating data faster than SSH can drain it. */
+    if (!client->io_recv_paused && client->wlen > SOCKS5_WBUF_PAUSE_THRESHOLD
+        && client->io_ch && !xchannel_is_closed(client->io_ch)) {
+        XLOGD("SSH wbuf backpressure: pausing io_ch reads fd=%d wlen=%zu",
+              (int)client->client_sock, client->wlen);
+        client->io_recv_paused = true;
+        xpoll_del_event(xchannel_fd(client->io_ch), XPOLL_READABLE);
     }
     return 0;
 }
