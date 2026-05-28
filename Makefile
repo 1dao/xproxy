@@ -44,7 +44,7 @@ endif
 OBJDIR = .objs
 
 # Application sources
-APP_SOURCES = main.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c https_proxy.c xpac_server.c xsock.c xchannel.c xdaemon.c
+APP_SOURCES = main.c xpoll.c socks5_server.c ssh_tunnel.c xargs.c https_proxy.c xpac_server.c xsock.c xchannel.c xdaemon.c xlog.c
 
 # wolfCrypt sources (required for SSH crypto)
 WOLFCRYPT_SOURCES = \

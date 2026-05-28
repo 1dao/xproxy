@@ -197,6 +197,8 @@ int main(int argc, char *argv[]) {
     console_set_consolas_font();
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    xlog_init("./logs", "xproxy", 1);
+    atexit(xlog_uninit);
 
     signal(SIGINT, signal_handler);
 #ifdef SIGTERM

@@ -510,16 +510,16 @@ static char* xpac_generate_pac_content(int pac_type) {
                 // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s %s:%d; DIRECT\";\n"
+                    "        return \"%s %s:%d\";\n"
                     "    }\n"
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s %s:%d; DIRECT\";\n"
+                    "        return \"%s %s:%d\";\n"
                     "    }\n",
                     current->pattern, proxy_str, ip, port, current->pattern+2, proxy_str, ip, port);  // 跳过 '*' 字符
             } else {
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s %s:%d; DIRECT\";\n"
+                    "        return \"%s %s:%d\";\n"
                     "    }\n",
                     current->pattern, proxy_str, ip, port);
             }
@@ -531,17 +531,18 @@ static char* xpac_generate_pac_content(int pac_type) {
     if (pac_type == 3) { // proxy.http.pac，强制所有流量走代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 所有流量走HTTP代理\n"
-            "    return \"PROXY %s:%d; DIRECT\";\n",
+            "    return \"PROXY %s:%d\";\n",
             ip, g_config.http_proxy_port);
     } else if (pac_type == 2) { // proxy.socks5.pac，默认SOCKS5
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 所有流量走SOCKS5代理\n"
-            "    return \"SOCKS5 %s:%d; SOCKS %s:%d; DIRECT\";\n",
+            "    return \"SOCKS5 %s:%d; SOCKS %s:%d\";\n",
             ip, g_config.socks5_proxy_port, ip, g_config.socks5_proxy_port);
     } else { // proxy.pac，默认HTTP代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "\n    // 所有其他不走代理直接访问\n"
-                    "    return \"DIRECT\";\n");
+                    "\n    // Default to HTTP proxy to avoid accidental direct egress.\n"
+                    "    return \"PROXY %s:%d\";\n",
+                    ip, g_config.http_proxy_port);
     }
 
     pos += snprintf(pac_content + pos, buffer_size - pos, "}\n");

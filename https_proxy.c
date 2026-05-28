@@ -82,6 +82,144 @@ int https_parse_connect(const char* req_buf, int req_len, char* target_host, int
 // Parse normal HTTP request (GET/POST etc.), extract target host and port
 int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_host, int host_len, uint16_t* target_port);
 
+static int ascii_lower(int c) {
+    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+    return c;
+}
+
+static int header_name_equals(const char* line, size_t line_len, const char* name) {
+    const char* colon = memchr(line, ':', line_len);
+    if (!colon) return 0;
+
+    const char* name_end = colon;
+    while (name_end > line && (name_end[-1] == ' ' || name_end[-1] == '\t')) {
+        name_end--;
+    }
+
+    size_t candidate_len = (size_t)(name_end - line);
+    size_t name_len = strlen(name);
+    if (candidate_len != name_len) return 0;
+
+    for (size_t i = 0; i < name_len; i++) {
+        if (ascii_lower((unsigned char)line[i]) != ascii_lower((unsigned char)name[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int header_name_has_prefix(const char* line, size_t line_len, const char* prefix) {
+    const char* colon = memchr(line, ':', line_len);
+    if (!colon) return 0;
+
+    const char* name_end = colon;
+    while (name_end > line && (name_end[-1] == ' ' || name_end[-1] == '\t')) {
+        name_end--;
+    }
+
+    size_t candidate_len = (size_t)(name_end - line);
+    size_t prefix_len = strlen(prefix);
+    if (candidate_len < prefix_len) return 0;
+
+    for (size_t i = 0; i < prefix_len; i++) {
+        if (ascii_lower((unsigned char)line[i]) != ascii_lower((unsigned char)prefix[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int should_strip_forwarding_header(const char* line, size_t line_len) {
+    static const char* strip_names[] = {
+        "Forwarded",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
+        "X-Forwarded-Port",
+        "X-Forwarded-Server",
+        "X-Original-Forwarded-For",
+        "X-Real-IP",
+        "X-Originating-IP",
+        "X-Client-IP",
+        "Client-IP",
+        "True-Client-IP",
+        "CF-Connecting-IP",
+        "Fastly-Client-IP",
+        "X-Cluster-Client-IP",
+        "Via",
+        "Proxy-Connection"
+    };
+
+    if (header_name_has_prefix(line, line_len, "X-Forwarded-")) {
+        return 1;
+    }
+
+    for (size_t i = 0; i < sizeof(strip_names) / sizeof(strip_names[0]); i++) {
+        if (header_name_equals(line, line_len, strip_names[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int strip_forwarding_headers_inplace(char* req_buf, int* req_len, int buf_size) {
+    if (!req_buf || !req_len || *req_len <= 0 || buf_size <= 0) return -1;
+    if (*req_len >= buf_size) return -1;
+
+    char* header_end = strstr(req_buf, "\r\n\r\n");
+    if (!header_end) return 0;
+
+    char* request_line_end = strstr(req_buf, "\r\n");
+    if (!request_line_end || request_line_end > header_end) return -1;
+
+    char* read = request_line_end + 2;
+    char* headers_done = header_end + 2;
+    char* write = read;
+    int stripped = 0;
+
+    while (read < headers_done) {
+        char* line_end = strstr(read, "\r\n");
+        if (!line_end || line_end > headers_done) return -1;
+
+        size_t line_len = (size_t)(line_end - read);
+        int strip = should_strip_forwarding_header(read, line_len);
+        char* block_end = line_end + 2;
+
+        if (strip) {
+            stripped++;
+            while (block_end < headers_done &&
+                   (block_end[0] == ' ' || block_end[0] == '\t')) {
+                char* continuation_end = strstr(block_end, "\r\n");
+                if (!continuation_end || continuation_end > headers_done) return -1;
+                block_end = continuation_end + 2;
+            }
+        } else {
+            size_t block_len = (size_t)(block_end - read);
+            if (write != read) memmove(write, read, block_len);
+            write += block_len;
+        }
+
+        read = block_end;
+    }
+
+    if (stripped == 0) return 0;
+
+    *write++ = '\r';
+    *write++ = '\n';
+
+    char* body = header_end + 4;
+    int body_len = *req_len - (int)(body - req_buf);
+    if (body_len > 0) {
+        memmove(write, body, (size_t)body_len);
+        write += body_len;
+    }
+
+    *req_len = (int)(write - req_buf);
+    req_buf[*req_len] = '\0';
+    XLOGD("[http] stripped %d forwarding/privacy headers", stripped);
+    return 0;
+}
+
 // ===================== Global Variables =====================
 static HttpProxyConfig g_config;
 static ProxyConn* g_conn_list = NULL;
@@ -243,8 +381,11 @@ int http_parse_request(char* req_buf, int* req_len, int buf_size, char* target_h
         *target_port = 80; // HTTP default port
     }
 
-    // 4. Convert absolute URL to relative path using the improved method
-    convert_http_request_inplace(req_buf, req_len, buf_size);
+    // 4. Convert absolute URL to relative path and remove forwarding hints.
+    if (convert_http_request_inplace(req_buf, req_len, buf_size) != 0)
+        return -1;
+    if (strip_forwarding_headers_inplace(req_buf, req_len, buf_size) != 0)
+        return -1;
 
     return 0;
 }
@@ -1199,4 +1340,3 @@ void https_proxy_stop(void) {
 
     XLOGW("[http] HTTP/HTTPS service stoped");
 }
-

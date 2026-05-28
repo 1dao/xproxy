@@ -38,6 +38,7 @@
 *.redditspace.com socks5
 *.googletagmanager.com socks5
 *.google.com socks5
+*antigravity.google socks5
 *.google-analytics.com socks5
 *.googleapis.com socks5
 *.googlecode.com socks5
