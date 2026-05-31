@@ -13,38 +13,30 @@ set "RESET=[0m"
 :: 1. 初始化 VS 编译环境
 :: ======================================
 echo %GREEN%[INFO]%RESET% Searching for MSVC Environment...
-set "VS_VCVARS="
-for %%P in (
-    "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\Program Files\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\Program Files\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\software\MicrosoftVisual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\software\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\Program Files\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\Program Files\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-) do (
-    if exist %%P (
-        set "VS_VCVARS=%%P"
-        goto :found_vcvars
-    )
-)
-
-:found_vcvars
-if not defined VS_VCVARS (
-    echo %RED%[ERROR]%RESET%Visual Studio vcvarsall.bat not found!
-    pause
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+    echo %RED%[ERROR]%RESET% vswhere.exe not found. Install Visual Studio 2017+ or the VS Build Tools.
     exit /b 1
 )
 
-if "%VSCMD_ARG_TGT_ARCH%" neq "x64" (
-    call %VS_VCVARS% x64
+set "VS_VCVARS="
+for /f "usebackq tokens=*" %%P in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvarsall.bat`) do (
+    set "VS_VCVARS=%%P"
+)
+
+if not defined VS_VCVARS (
+    echo %RED%[ERROR]%RESET% Visual Studio with VC x86/x64 tools not found via vswhere.
+    exit /b 1
+)
+
+if /I not "%VSCMD_ARG_TGT_ARCH%"=="x64" (
+    echo %GREEN%[INFO]%RESET% Loading MSVC x64 environment...
+    call "%VS_VCVARS%" x64
+    if errorlevel 1 (
+        echo %RED%[ERROR]%RESET% Failed to initialize MSVC environment.
+        exit /b 1
+    )
 )
 
 :: ======================================
