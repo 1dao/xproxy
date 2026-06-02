@@ -20,9 +20,14 @@
 #include <arpa/inet.h>
 #endif
 
+static HttpProxyConfig g_config;
+
 // Check if host is a local address (127.0.0.1, localhost, 0.0.0.0, or actual local IP)
 static int is_local_address(const char* host) {
     if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0 || strcmp(host, "0.0.0.0") == 0)
+        return 1;
+
+    if (g_config.proxy_host[0] && strcmp(host, g_config.proxy_host) == 0)
         return 1;
 
     // Get local hostname and resolve to IP
@@ -71,6 +76,7 @@ typedef struct {
     int rep_size;
 
     int is_https;
+    char client_ip[INET_ADDRSTRLEN];
     char host[255];
     uint16_t port;
 } ProxyConn;
@@ -221,7 +227,6 @@ static int strip_forwarding_headers_inplace(char* req_buf, int* req_len, int buf
 }
 
 // ===================== Global Variables =====================
-static HttpProxyConfig g_config;
 static ProxyConn* g_conn_list = NULL;
 static int g_conn_count = 0;
 static SOCKET_T g_listen_sock = INVALID_SOCKET;  // listening socket
@@ -424,7 +429,7 @@ static int find_free_conn_slot(void) {
 }
 
 // Add new client connection to list
-static int add_new_client_conn(SOCKET_T client_sock) {
+static int add_new_client_conn(SOCKET_T client_sock, const char* client_ip) {
     int slot = find_free_conn_slot();
     if (slot == -1) return -1;
 
@@ -436,6 +441,8 @@ static int add_new_client_conn(SOCKET_T client_sock) {
     g_conn_list[slot].closing = false;
     g_conn_list[slot].req_size = 0; g_conn_list[slot].req_head = 0;
     g_conn_list[slot].rep_size = 0; g_conn_list[slot].rep_head = 0;
+    strncpy(g_conn_list[slot].client_ip, client_ip ? client_ip : "", sizeof(g_conn_list[slot].client_ip) - 1);
+    g_conn_list[slot].client_ip[sizeof(g_conn_list[slot].client_ip) - 1] = '\0';
     memset(g_conn_list[slot].req_buf, 0, sizeof(g_conn_list[slot].req_buf));
 
     g_conn_count++;
@@ -854,6 +861,12 @@ static int handle_client_request(int slot) {
         return xpac_handle_request(conn->client_sock, conn->req_buf, conn->req_size)==1?-2:-1;
     }
 
+    if (!xpac_proxy_client_allowed(conn->client_ip)) {
+        XLOGW("[http] Reject proxy request from %s to %s:%d: not in proxy whitelist",
+              conn->client_ip, conn->host, conn->port);
+        return -1;
+    }
+
     SOCKET_T socks5_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (socks5_sock == INVALID_SOCKET) {
         XLOGE("[http] create socks5 socket failed");
@@ -936,11 +949,13 @@ static void accept_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *sub
     SOCKET_T client_sock = accept(fd, (struct sockaddr*)&client_addr, &client_addr_len);
 
     if (client_sock != INVALID_SOCKET) {
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         XLOGI("[http] New client connected: %s:%d (socket %d)",
-               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), (int)client_sock);
+               client_ip, ntohs(client_addr.sin_port), (int)client_sock);
 
         // Add new connection to list
-        int slot = add_new_client_conn(client_sock);
+        int slot = add_new_client_conn(client_sock, client_ip);
         if (slot == -1) {
             XLOGE("[http] Connection list full, rejecting new connection");
             CLOSE_SOCKET(client_sock);

@@ -12,6 +12,7 @@
 #include "xpac_server.h"
 
 int g_running = 0;
+static volatile sig_atomic_t g_stop_signal = 0;
 
 // Signal handler function
 void signal_handler(int sig) {
@@ -21,6 +22,7 @@ void signal_handler(int sig) {
 #endif
     ) {
         printf("\nReceived stop signal, stopping proxy servers...\n");
+        g_stop_signal = sig;
         g_running = 0;
     } else if (sig == SIGSEGV) {
         printf("Generating dump file...\n");
@@ -169,6 +171,9 @@ void show_help(const char *prog_name) {
     printf("  --max-http-conns <num>  Max HTTP proxy connections (default: 1024)\n");
     printf("  --pac-file <path>       PAC configuration file (default: pac_config.txt)\n");
     printf("  --proxy-host <address>  Public proxy host written into PAC files\n");
+    printf("  --enable-whitelist      Enable proxy client IP whitelist (default: disabled)\n");
+    printf("  --admin-user <user>     Web admin username (default: admin)\n");
+    printf("  --admin-pass <pass>     Web admin password (empty = disabled)\n");
     printf("\nGeneral Options:\n");
     printf("  -d, --daemon            Run as a Linux daemon in the background\n");
     printf("  --help                  Show this help message\n");
@@ -217,6 +222,7 @@ int main(int argc, char *argv[]) {
     static char socks_user[256], socks_pass[256];
     static char http_port_str[16];
     static char max_http_conns_str[16], pac_file[256], proxy_host[256];
+    static char admin_user[256], admin_pass[256];
 
     strcpy(bind_addr, "127.0.0.1");
     strcpy(ssh_host, "");
@@ -228,6 +234,8 @@ int main(int argc, char *argv[]) {
     strcpy(max_http_conns_str, "1024");
     strcpy(pac_file, "pac_config.txt");
     strcpy(proxy_host, "");
+    strcpy(admin_user, "admin");
+    strcpy(admin_pass, "");
 
     xArgsCFG configs[] = {
         // Common options
@@ -245,6 +253,9 @@ int main(int argc, char *argv[]) {
         {0, "max-http-conns", max_http_conns_str, 0},
         {0, "pac-file", pac_file, 0},
         {0, "proxy-host", proxy_host, 0},
+        {0, "enable-whitelist", NULL, 1},
+        {0, "admin-user", admin_user, 0},
+        {0, "admin-pass", admin_pass, 0},
         {'d', "daemon", NULL, 1}
     };
 
@@ -264,11 +275,14 @@ int main(int argc, char *argv[]) {
     strcpy(socks_user, xargs_get("socks-user"));
     strcpy(socks_pass, xargs_get("socks-pass"));
     strcpy(proxy_host, xargs_get("proxy-host"));
+    strcpy(admin_user, xargs_get("admin-user"));
+    strcpy(admin_pass, xargs_get("admin-pass"));
 
     int has_ssh_args = strlen(ssh_host) > 0;
     int disable_http = (xargs_get("disable-http") != NULL);
     int enable_http = !disable_http;  // HTTP is enabled by default
     int daemon_mode = (xargs_get("daemon") != NULL);
+    int enable_whitelist = (xargs_get("enable-whitelist") != NULL);
 
     if (daemon_mode && !xdaemon_is_supported()) {
         XLOGE("Error: --daemon is only supported on Linux");
@@ -440,17 +454,20 @@ int main(int argc, char *argv[]) {
 
     // Start HTTP/HTTPS proxy if enabled
     if (enable_http) {
-        int http_port = atoi(http_port_str);
+        int http_port = atoi(xargs_get("t"));
         int socks5_port = atoi(xargs_get("l"));
+        int max_http_conns = atoi(xargs_get("max-http-conns"));
 
         HttpProxyConfig http_config = {
             .listen_port = http_port,
             .socks5_server_port = socks5_port,
-            .max_conns = atoi(max_http_conns_str)
+            .max_conns = max_http_conns
         };
 
         strncpy(http_config.socks5_server_ip, bind_addr, sizeof(http_config.socks5_server_ip) - 1);
         http_config.socks5_server_ip[sizeof(http_config.socks5_server_ip) - 1] = '\0';
+        strncpy(http_config.proxy_host, proxy_host, sizeof(http_config.proxy_host) - 1);
+        http_config.proxy_host[sizeof(http_config.proxy_host) - 1] = '\0';
 
         XLOGI("\n========================================");
         XLOGI("  HTTP/HTTPS to SOCKS5 Proxy");
@@ -489,7 +506,9 @@ int main(int argc, char *argv[]) {
             .proxy_host = pac_proxy_host,
             .config_file = pac_file_path,
             .enable_web_admin = 1,
-            .admin_password = NULL
+            .enable_proxy_whitelist = enable_whitelist,
+            .admin_username = admin_user,
+            .admin_password = admin_pass[0] ? admin_pass : NULL
         };
         xpac_init(&pac_config);
 
@@ -525,6 +544,10 @@ int main(int argc, char *argv[]) {
         if (http_proxy_started) {
             https_proxy_update();
         }
+    }
+
+    if (g_stop_signal) {
+        XLOGW("Received stop signal %d, shutting down", (int)g_stop_signal);
     }
 
     // Cleanup

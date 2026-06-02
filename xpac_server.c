@@ -1,6 +1,7 @@
 #include "xpac_server.h"
 #include "xlog.h"
 #include <ctype.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -29,6 +30,11 @@ typedef struct DomainRule {
     struct DomainRule* next;      // 链表下一个节点
 } DomainRule;
 
+typedef struct AllowIpRule {
+    char ip[64];
+    struct AllowIpRule* next;
+} AllowIpRule;
+
 // ===================== 全局变量 =====================
 static XpacConfig g_config = {
     .http_proxy_port = 7890,
@@ -36,17 +42,23 @@ static XpacConfig g_config = {
     .proxy_host = NULL,
     .config_file = NULL,
     .enable_web_admin = 1,        // 默认启用Web管理
+    .enable_proxy_whitelist = 0,   // 默认不启用代理白名单
+    .admin_username = "admin",
     .admin_password = NULL        // 默认无需密码
 };
 
 static DomainRule* g_domain_list = NULL;  // 域名规则链表头
 static int g_domain_count = 0;            // 域名规则数量
+static AllowIpRule* g_allow_ip_list = NULL;
+static int g_allow_ip_count = 0;
 static int g_initialized = 0;             // 是否已初始化
 
 // ===================== 内部工具函数声明 =====================
 static int is_valid_domain_pattern(const char* pattern);
 static DomainRule* find_domain_rule(const char* pattern);
+static AllowIpRule* find_allow_ip_rule(const char* ip);
 static void free_domain_list(void);
+static void free_allow_ip_list(void);
 static int parse_proxy_type(const char* type_str);
 static const char* proxy_type_to_str(ProxyType type);
 static int xpac_load_config(const char* filename);
@@ -57,6 +69,8 @@ static const char* get_pac_proxy_address(void);
 static int xpac_add_domain(const char* pattern, ProxyType proxy_type);
 static int xpac_remove_domain(const char* pattern);
 static void xpac_clear_domains(void);
+static int xpac_add_allow_ip(const char* ip);
+static int xpac_remove_allow_ip(const char* ip);
 
 // ===================== 初始化函数 =====================
 void xpac_init(const XpacConfig* config) {
@@ -73,6 +87,8 @@ void xpac_init(const XpacConfig* config) {
         g_config.proxy_host = config->proxy_host;
         g_config.config_file = config->config_file;
         g_config.admin_password = config->admin_password;
+        g_config.admin_username = config->admin_username;
+        g_config.enable_proxy_whitelist = config->enable_proxy_whitelist;
     }
 
     printf("[PAC] PAC服务器初始化完成\n");
@@ -80,6 +96,8 @@ void xpac_init(const XpacConfig* config) {
            g_config.http_proxy_port, g_config.socks5_proxy_port);
     printf("[PAC] Web管理界面: %s\n",
            g_config.enable_web_admin ? "启用" : "禁用");
+    printf("[PAC] 代理白名单: %s\n",
+           g_config.enable_proxy_whitelist ? "启用" : "禁用");
 
     // 尝试加载配置文件
     if (g_config.config_file) {
@@ -96,6 +114,9 @@ void xpac_init(const XpacConfig* config) {
 // 释放资源
 void xpac_uninit(void) {
     xpac_clear_domains();
+    free_allow_ip_list();
+    g_allow_ip_list = NULL;
+    g_allow_ip_count = 0;
 }
 
 // ===================== 配置文件管理 =====================
@@ -115,10 +136,14 @@ static int xpac_load_config(const char* filename) {
     // 保存旧列表以便出错时恢复
     DomainRule* old_list = g_domain_list;
     int old_count = g_domain_count;
+    AllowIpRule* old_allow_list = g_allow_ip_list;
+    int old_allow_count = g_allow_ip_count;
 
     // 清空当前列表
     g_domain_list = NULL;
     g_domain_count = 0;
+    g_allow_ip_list = NULL;
+    g_allow_ip_count = 0;
 
     char line[512];
     int line_num = 0;
@@ -146,6 +171,19 @@ static int xpac_load_config(const char* filename) {
         // 额外检查：直接查找并移除回车符（处理只有\r的情况）
         char* cr = strchr(trimmed, '\r');
         if (cr) *cr = '\0';
+
+        if (strncmp(trimmed, "@allow", 6) == 0) {
+            char ip[64];
+            if (sscanf(trimmed + 6, "%63s", ip) == 1) {
+                if (xpac_add_allow_ip(ip) == 0)
+                    success_count++;
+                else
+                    printf("[PAC] 警告：第%d行白名单解析失败: %s\n", line_num, trimmed);
+            } else {
+                printf("[PAC] 警告：第%d行白名单格式无效: %s\n", line_num, trimmed);
+            }
+            continue;
+        }
 
         // 解析格式：域名模式 代理类型
         char pattern[256];
@@ -175,6 +213,9 @@ static int xpac_load_config(const char* filename) {
         free_domain_list();
         g_domain_list = old_list;
         g_domain_count = old_count;
+        free_allow_ip_list();
+        g_allow_ip_list = old_allow_list;
+        g_allow_ip_count = old_allow_count;
         printf("[PAC] 配置文件未包含有效规则: %s\n", filename);
         return -1;
     } else {
@@ -185,7 +226,14 @@ static int xpac_load_config(const char* filename) {
             free(current);
             current = next;
         }
-        printf("[PAC] 成功从配置文件加载 %d 条规则: %s\n", success_count, filename);
+        AllowIpRule* allow_current = old_allow_list;
+        while (allow_current) {
+            AllowIpRule* next = allow_current->next;
+            free(allow_current);
+            allow_current = next;
+        }
+        printf("[PAC] 成功从配置文件加载 %d 条规则，%d 个白名单IP: %s\n",
+               success_count, g_allow_ip_count, filename);
         return 0;
     }
 }
@@ -218,7 +266,17 @@ static int xpac_save_config(const char* filename) {
     fprintf(fp, "# 格式：域名模式 代理类型(http/socks5)\n");
     fprintf(fp, "# 示例：*.google.com socks5\n");
     fprintf(fp, "#        *.github.com http\n");
+    fprintf(fp, "# 白名单格式：@allow 1.2.3.4\n");
     fprintf(fp, "\n");
+
+    AllowIpRule* allow = g_allow_ip_list;
+    while (allow) {
+        fprintf(fp, "@allow %s\n", allow->ip);
+        allow = allow->next;
+    }
+    if (g_allow_ip_count > 0) {
+        fprintf(fp, "\n");
+    }
 
     DomainRule* current = g_domain_list;
     while (current) {
@@ -229,7 +287,8 @@ static int xpac_save_config(const char* filename) {
     }
 
     fclose(fp);
-    printf("[PAC] 成功保存 %d 条规则到配置文件: %s\n", g_domain_count, filename);
+    printf("[PAC] 成功保存 %d 条规则，%d 个白名单IP到配置文件: %s\n",
+           g_domain_count, g_allow_ip_count, filename);
     return 0;
 }
 
@@ -349,6 +408,71 @@ static int xpac_remove_domain(const char* pattern) {
     return -1;
 }
 
+static int is_valid_ipv4_address(const char* ip) {
+    struct sockaddr_in addr;
+    return ip && inet_pton(AF_INET, ip, &addr.sin_addr) == 1;
+}
+
+static int xpac_add_allow_ip(const char* ip) {
+    if (!is_valid_ipv4_address(ip)) {
+        printf("[PAC] 错误：白名单IP无效: %s\n", ip ? ip : "");
+        return -1;
+    }
+
+    if (find_allow_ip_rule(ip)) {
+        printf("[PAC] 白名单IP已存在: %s\n", ip);
+        return 0;
+    }
+
+    AllowIpRule* rule = (AllowIpRule*)malloc(sizeof(AllowIpRule));
+    if (!rule) {
+        printf("[PAC] 错误：白名单内存分配失败\n");
+        return -1;
+    }
+
+    strncpy(rule->ip, ip, sizeof(rule->ip) - 1);
+    rule->ip[sizeof(rule->ip) - 1] = '\0';
+    rule->next = g_allow_ip_list;
+    g_allow_ip_list = rule;
+    g_allow_ip_count++;
+
+    XLOGI("[PAC] 添加代理白名单IP: %s", ip);
+    if (g_config.config_file && g_initialized)
+        xpac_save_config(g_config.config_file);
+
+    return 0;
+}
+
+static int xpac_remove_allow_ip(const char* ip) {
+    if (!ip || !ip[0]) {
+        printf("[PAC] 错误：白名单IP为空\n");
+        return -1;
+    }
+
+    AllowIpRule* prev = NULL;
+    AllowIpRule* current = g_allow_ip_list;
+    while (current) {
+        if (strcmp(current->ip, ip) == 0) {
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                g_allow_ip_list = current->next;
+            }
+            free(current);
+            g_allow_ip_count--;
+            XLOGI("[PAC] 删除代理白名单IP: %s", ip);
+            if (g_config.config_file && g_initialized)
+                xpac_save_config(g_config.config_file);
+            return 0;
+        }
+        prev = current;
+        current = current->next;
+    }
+
+    printf("[PAC] 未找到白名单IP: %s\n", ip);
+    return -1;
+}
+
 static void xpac_clear_domains(void) {
     free_domain_list();
     g_domain_list = NULL;
@@ -368,6 +492,16 @@ static DomainRule* find_domain_rule(const char* pattern) {
     return NULL;
 }
 
+static AllowIpRule* find_allow_ip_rule(const char* ip) {
+    AllowIpRule* current = g_allow_ip_list;
+    while (current) {
+        if (strcmp(current->ip, ip) == 0)
+            return current;
+        current = current->next;
+    }
+    return NULL;
+}
+
 static void free_domain_list(void) {
     DomainRule* current = g_domain_list;
     while (current) {
@@ -375,6 +509,23 @@ static void free_domain_list(void) {
         free(current);
         current = next;
     }
+}
+
+static void free_allow_ip_list(void) {
+    AllowIpRule* current = g_allow_ip_list;
+    while (current) {
+        AllowIpRule* next = current->next;
+        free(current);
+        current = next;
+    }
+}
+
+int xpac_proxy_client_allowed(const char* client_ip) {
+    if (!g_config.enable_proxy_whitelist) return 1;
+    if (!client_ip || !client_ip[0]) return 0;
+    if (strcmp(client_ip, "127.0.0.1") == 0 || strcmp(client_ip, "localhost") == 0)
+        return 1;
+    return find_allow_ip_rule(client_ip) != NULL;
 }
 
 static int is_valid_domain_pattern(const char* pattern) {
@@ -495,8 +646,13 @@ static char* xpac_generate_pac_content(int pac_type) {
                 proxy_str = "SOCKS5";
                 port = g_config.socks5_proxy_port;
             } else if (current->proxy_type == PROXY_TYPE_SOCKS5) {
-                proxy_str = "SOCKS5";
-                port = g_config.socks5_proxy_port;
+                /*
+                 * Default proxy.pac is intended for Windows system proxy too.
+                 * Route through the HTTP proxy so WinINET clients do not drop
+                 * SOCKS5 PAC results; the HTTP proxy still forwards via SOCKS5.
+                 */
+                proxy_str = "PROXY";
+                port = g_config.http_proxy_port;
             } else if (current->proxy_type == PROXY_TYPE_AUTO) {
                 proxy_str = (pac_type == 2) ? "SOCKS5" : "PROXY";
                 port = (pac_type == 2) ? g_config.socks5_proxy_port : g_config.http_proxy_port;
@@ -613,6 +769,24 @@ static int is_admin_request(const char* req_buf, int req_len) {
                 return 5; // GET /admin/api/status
             }
         }
+
+        if (remaining >= 9 && memcmp(api_path, "whitelist", 9) == 0) {
+            if (remaining == 9 || api_path[9] == ' ' || api_path[9] == '?' || api_path[9] == '/') {
+                return 6; // GET /admin/api/whitelist
+            }
+        }
+
+        if (remaining >= 9 && memcmp(api_path, "allow-add", 9) == 0) {
+            if (remaining == 9 || api_path[9] == ' ' || api_path[9] == '?' || api_path[9] == '/') {
+                return 7; // GET /admin/api/allow-add
+            }
+        }
+
+        if (remaining >= 12 && memcmp(api_path, "allow-remove", 12) == 0) {
+            if (remaining == 12 || api_path[12] == ' ' || api_path[12] == '?' || api_path[12] == '/') {
+                return 8; // GET /admin/api/allow-remove
+            }
+        }
     }
 
     // 管理界面检查（需要至少11字节 "GET /admin"）
@@ -692,6 +866,97 @@ static void send_error_response(SOCKET_T client_sock, int code, const char* mess
     send(client_sock, body, strlen(body), 0);
 }
 
+static void send_auth_required_response(SOCKET_T client_sock) {
+    const char* body = "<html><body><h1>401 Unauthorized</h1></body></html>";
+    char header[512];
+
+    snprintf(header, sizeof(header),
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "WWW-Authenticate: Basic realm=\"xproxy admin\"\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        (int)strlen(body));
+
+    send(client_sock, header, strlen(header), 0);
+    send(client_sock, body, strlen(body), 0);
+}
+
+static int base64_value(char ch) {
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    if (ch == '=') return -2;
+    return -1;
+}
+
+static int base64_decode(const char* src, unsigned char* dst, int dst_len) {
+    int out = 0;
+    int val = 0;
+    int bits = -8;
+
+    while (*src && *src != '\r' && *src != '\n') {
+        int c = base64_value(*src++);
+        if (c == -2) break;
+        if (c < 0) return -1;
+        val = (val << 6) | c;
+        bits += 6;
+        if (bits >= 0) {
+            if (out >= dst_len) return -1;
+            dst[out++] = (unsigned char)((val >> bits) & 0xFF);
+            bits -= 8;
+        }
+    }
+
+    return out;
+}
+
+static const char* find_header_value(const char* req_buf, int req_len, const char* header_name) {
+    const char* p = req_buf;
+    const char* end = req_buf + req_len;
+    size_t name_len = strlen(header_name);
+
+    while (p < end) {
+        const char* line_end = strstr(p, "\r\n");
+        if (!line_end || line_end > end) break;
+        if (line_end == p) break;
+
+        if ((size_t)(line_end - p) > name_len &&
+            strncasecmp(p, header_name, name_len) == 0 &&
+            p[name_len] == ':') {
+            p += name_len + 1;
+            while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+            return p;
+        }
+
+        p = line_end + 2;
+    }
+
+    return NULL;
+}
+
+static int admin_auth_ok(const char* req_buf, int req_len) {
+    const char* user = g_config.admin_username;
+    const char* pass = g_config.admin_password;
+    if (!pass || pass[0] == '\0') return 1;
+    if (!user || user[0] == '\0') user = "admin";
+
+    const char* auth = find_header_value(req_buf, req_len, "Authorization");
+    if (!auth || strncasecmp(auth, "Basic ", 6) != 0) return 0;
+
+    unsigned char decoded[512];
+    int decoded_len = base64_decode(auth + 6, decoded, sizeof(decoded) - 1);
+    if (decoded_len <= 0) return 0;
+    decoded[decoded_len] = '\0';
+
+    char expected[512];
+    snprintf(expected, sizeof(expected), "%s:%s", user, pass);
+    return strcmp((const char*)decoded, expected) == 0;
+}
+
 static void url_decode(const char* src, char* dst, int dst_len) {
     int i = 0, j = 0;
     while (src[i] && j < dst_len - 1) {
@@ -737,7 +1002,7 @@ static const char* get_query_param(const char* query_str, const char* key,
 
 // 生成管理界面HTML
 static const char* generate_admin_html(void) {
-    static char html[28660];
+    static char html[42000];
 
     // 调试输出
     printf("[PAC-DEBUG] generate_admin_html: http_port=%d, socks5_port=%d, domain_count=%d\n",
@@ -772,6 +1037,29 @@ static const char* generate_admin_html(void) {
         strcpy(domain_rows,
             "<tr><td colspan=\"3\" style=\"text-align: center;\">暂无域名规则</td></tr>\n");
         printf("[PAC-DEBUG] No domain rules found\n");
+    }
+
+    static char whitelist_rows[8192] = {0};
+    AllowIpRule* allow_current = g_allow_ip_list;
+    int allow_pos = 0;
+    int allow_row_count = 0;
+    while (allow_current && allow_pos < sizeof(whitelist_rows) - 100) {
+        allow_pos += snprintf(whitelist_rows + allow_pos,
+            sizeof(whitelist_rows) - allow_pos,
+            "<tr>\n"
+            "  <td><code>%s</code></td>\n"
+            "  <td>\n"
+            "    <button onclick=\"removeAllowIp('%s')\" class=\"btn-delete\">删除</button>\n"
+            "  </td>\n"
+            "</tr>\n",
+            allow_current->ip,
+            allow_current->ip);
+        allow_current = allow_current->next;
+        allow_row_count++;
+    }
+    if (allow_pos == 0) {
+        strcpy(whitelist_rows,
+            "<tr><td colspan=\"2\" style=\"text-align: center;\">暂无白名单IP，启用后仅允许本机内部转发</td></tr>\n");
     }
 
     // 完整的HTML页面
@@ -854,6 +1142,30 @@ static const char* generate_admin_html(void) {
         "            </div>\n"
         "            <p><small>将以上任意链接配置为浏览器的自动代理配置URL即可使用</small></p>\n"
         "        </div>\n"
+        "        \n"
+        "        <h2>代理访问白名单</h2>\n"
+        "        <div class=\"info-box\">\n"
+        "            <p>当前白名单状态：%s。启动参数添加 <code>--enable-whitelist</code> 后才会拦截代理客户端。</p>\n"
+        "            <p>启用后，只有白名单IP可以使用HTTP/SOCKS5代理；白名单为空时外部客户端全部拒绝。</p>\n"
+        "            <p>127.0.0.1 始终允许，用于本机HTTP到SOCKS5转发。</p>\n"
+        "        </div>\n"
+        "        <div class=\"form-group\">\n"
+        "            <label for=\"allowIp\">客户端IP:</label>\n"
+        "            <input type=\"text\" id=\"allowIp\" placeholder=\"例如: 203.0.113.10\"\n"
+        "                   onkeypress=\"if(event.keyCode=='Enter') addAllowIp()\">\n"
+        "        </div>\n"
+        "        <button onclick=\"addAllowIp()\" class=\"btn-success\">添加白名单IP</button>\n"
+        "        <table>\n"
+        "            <thead>\n"
+        "                <tr>\n"
+        "                    <th>IP地址</th>\n"
+        "                    <th>操作</th>\n"
+        "                </tr>\n"
+        "            </thead>\n"
+        "            <tbody id=\"whitelistTableBody\">\n"
+        "                %s\n"
+        "            </tbody>\n"
+        "        </table>\n"
         "        \n"
         "        <h2>添加域名规则</h2>\n"
         "        <div class=\"form-group\">\n"
@@ -988,6 +1300,67 @@ static const char* generate_admin_html(void) {
         "                });\n"
         "        }\n"
         "        \n"
+        "        function refreshWhitelist() {\n"
+        "            fetch('/admin/api/whitelist')\n"
+        "                .then(function(response) { return response.json(); })\n"
+        "                .then(function(data) {\n"
+        "                    if (data.success) {\n"
+        "                        var tbody = document.getElementById('whitelistTableBody');\n"
+        "                        var rows = '';\n"
+        "                        data.ips.forEach(function(ip) {\n"
+        "                            rows += '<tr>' +\n"
+        "                                '<td><code>' + ip + '</code></td>' +\n"
+        "                                '<td><button onclick=\"removeAllowIp(\\'' + ip + '\\')\" class=\"btn-delete\">删除</button></td>' +\n"
+        "                                '</tr>';\n"
+        "                        });\n"
+        "                        if (rows === '') {\n"
+        "                            rows = '<tr><td colspan=\"2\" style=\"text-align: center;\">暂无白名单IP，启用后仅允许本机内部转发</td></tr>';\n"
+        "                        }\n"
+        "                        tbody.innerHTML = rows;\n"
+        "                    } else {\n"
+        "                        showMessage('刷新白名单失败: ' + (data.error || '未知错误'), true);\n"
+        "                    }\n"
+        "                })\n"
+        "                .catch(function(error) {\n"
+        "                    showMessage('刷新白名单网络错误: ' + error, true);\n"
+        "                });\n"
+        "        }\n"
+        "        \n"
+        "        function addAllowIp() {\n"
+        "            var ip = document.getElementById('allowIp').value.trim();\n"
+        "            if (!ip) {\n"
+        "                showMessage('请输入客户端IP', true);\n"
+        "                return;\n"
+        "            }\n"
+        "            fetch('/admin/api/allow-add?ip=' + encodeURIComponent(ip))\n"
+        "                .then(function(response) { return response.json(); })\n"
+        "                .then(function(data) {\n"
+        "                    if (data.success) {\n"
+        "                        showMessage('添加白名单成功: ' + ip, false);\n"
+        "                        document.getElementById('allowIp').value = '';\n"
+        "                        refreshWhitelist();\n"
+        "                    } else {\n"
+        "                        showMessage('添加白名单失败: ' + (data.error || '未知错误'), true);\n"
+        "                    }\n"
+        "                })\n"
+        "                .catch(function(error) { showMessage('网络错误: ' + error, true); });\n"
+        "        }\n"
+        "        \n"
+        "        function removeAllowIp(ip) {\n"
+        "            if (!confirm('确定要删除白名单IP: ' + ip + ' 吗？')) return;\n"
+        "            fetch('/admin/api/allow-remove?ip=' + encodeURIComponent(ip))\n"
+        "                .then(function(response) { return response.json(); })\n"
+        "                .then(function(data) {\n"
+        "                    if (data.success) {\n"
+        "                        showMessage('删除白名单成功: ' + ip, false);\n"
+        "                        refreshWhitelist();\n"
+        "                    } else {\n"
+        "                        showMessage('删除白名单失败: ' + (data.error || '未知错误'), true);\n"
+        "                    }\n"
+        "                })\n"
+        "                .catch(function(error) { showMessage('网络错误: ' + error, true); });\n"
+        "        }\n"
+        "        \n"
         "        // 按回车键添加域名\n"
         "        document.getElementById('domain').addEventListener('keypress', function(e) {\n"
         "            if (e.key === 'Enter') {\n"
@@ -1000,13 +1373,16 @@ static const char* generate_admin_html(void) {
         g_config.http_proxy_port,      // 第一个占位符：HTTP代理端口（统计框）
         g_config.socks5_proxy_port,    // 第二个占位符：SOCKS5代理端口（统计框）
         g_domain_count,                // 第三个占位符：域名规则数（统计框）← 修复这里！
+        g_config.enable_proxy_whitelist ? "启用" : "禁用",
+        whitelist_rows,                // 白名单IP表格
         g_config.http_proxy_port,      // 第四个占位符：HTTP代理端口（下拉框）
         g_config.socks5_proxy_port,    // 第五个占位符：SOCKS5代理端口（下拉框）
         domain_rows,                   // 域名规则表格
         g_config.config_file ? g_config.config_file : "未配置" // 配置文件路径
     );
 
-    printf("[PAC-DEBUG] HTML generated successfully, domain_count=%d\n", g_domain_count);
+    printf("[PAC-DEBUG] HTML generated successfully, domain_count=%d, allow_ip_count=%d\n",
+           g_domain_count, allow_row_count);
     return html;
 }
 
@@ -1044,6 +1420,8 @@ static const char* generate_status_json(void) {
         "  \"socks5_proxy_port\":%d,\n"
         "  \"domain_count\":%d,\n"
         "  \"web_admin_enabled\":%s,\n"
+        "  \"proxy_whitelist_enabled\":%s,\n"
+        "  \"proxy_whitelist_count\":%d,\n"
         "  \"config_file\":\"%s\",\n"
         "  \"initialized\":%s\n"
         "}}",
@@ -1051,6 +1429,8 @@ static const char* generate_status_json(void) {
         socks5_port,
         domain_count,
         g_config.enable_web_admin ? "true" : "false",
+        g_config.enable_proxy_whitelist ? "true" : "false",
+        g_allow_ip_count,
         g_config.config_file ? g_config.config_file : "",
         g_initialized ? "true" : "false");
 
@@ -1107,6 +1487,36 @@ static const char* generate_domains_json(void) {
     return json;
 }
 
+static const char* generate_whitelist_json(void) {
+    static char json[4096];
+    int pos = 0;
+    int remaining = sizeof(json);
+
+    int written = snprintf(json + pos, remaining,
+        "{\"success\":true,\"enabled\":%s,\"ips\":[",
+        g_config.enable_proxy_whitelist ? "true" : "false");
+    if (written < 0 || written >= remaining)
+        return "{\"success\":false,\"error\":\"缓冲区不足\"}";
+    pos += written;
+    remaining -= written;
+
+    AllowIpRule* current = g_allow_ip_list;
+    int first = 1;
+    while (current && remaining > 80) {
+        written = snprintf(json + pos, remaining, "%s\"%s\"",
+                           first ? "" : ",", current->ip);
+        if (written < 0 || written >= remaining) break;
+        pos += written;
+        remaining -= written;
+        first = 0;
+        current = current->next;
+    }
+
+    snprintf(json + pos, remaining, "],\"count\":%d}", g_allow_ip_count);
+    json[sizeof(json) - 1] = '\0';
+    return json;
+}
+
 // ===================== 提取URL查询字符串 =====================
 static const char* extract_query_string(const char* req_buf, int req_len) {
     static char query_buf[512];
@@ -1142,6 +1552,10 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
     if (!g_config.enable_web_admin) {
         send_error_response(client_sock, 403, "Web管理界面已禁用");
         return -1;
+    }
+    if (!admin_auth_ok(req_buf, req_len)) {
+        send_auth_required_response(client_sock);
+        return 1;
     }
 
     const char* query_str = extract_query_string(req_buf, req_len);
@@ -1214,6 +1628,56 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
         case 5: // GET /admin/api/status - 服务器状态
             send_json_response(client_sock, generate_status_json());
             break;
+
+        case 6: // GET /admin/api/whitelist - 获取白名单
+            send_json_response(client_sock, generate_whitelist_json());
+            break;
+
+        case 7: // GET /admin/api/allow-add - 添加白名单IP
+        {
+            if (!query_str) {
+                send_json_response(client_sock, "{\"success\":false,\"error\":\"缺少查询参数\"}");
+                break;
+            }
+
+            char ip[64] = {0};
+            get_query_param(query_str, "ip", ip, sizeof(ip));
+            if (ip[0] == '\0') {
+                send_json_response(client_sock, "{\"success\":false,\"error\":\"缺少IP参数\"}");
+                break;
+            }
+
+            int result = xpac_add_allow_ip(ip);
+            if (result == 0) {
+                send_json_response(client_sock, "{\"success\":true,\"message\":\"白名单IP添加成功\"}");
+            } else {
+                send_json_response(client_sock, "{\"success\":false,\"error\":\"白名单IP添加失败\"}");
+            }
+            break;
+        }
+
+        case 8: // GET /admin/api/allow-remove - 删除白名单IP
+        {
+            if (!query_str) {
+                send_json_response(client_sock, "{\"success\":false,\"error\":\"缺少查询参数\"}");
+                break;
+            }
+
+            char ip[64] = {0};
+            get_query_param(query_str, "ip", ip, sizeof(ip));
+            if (ip[0] == '\0') {
+                send_json_response(client_sock, "{\"success\":false,\"error\":\"缺少IP参数\"}");
+                break;
+            }
+
+            int result = xpac_remove_allow_ip(ip);
+            if (result == 0) {
+                send_json_response(client_sock, "{\"success\":true,\"message\":\"白名单IP删除成功\"}");
+            } else {
+                send_json_response(client_sock, "{\"success\":false,\"error\":\"白名单IP删除失败或不存在\"}");
+            }
+            break;
+        }
 
         default:
             send_error_response(client_sock, 404, "API端点不存在");

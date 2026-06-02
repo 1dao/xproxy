@@ -20,6 +20,8 @@ typedef struct {
     const char* proxy_host;
     const char* config_file;
     int enable_web_admin;
+    int enable_proxy_whitelist;
+    const char* admin_username;
     const char* admin_password;
 } XpacConfig;
 
@@ -27,6 +29,7 @@ void xpac_init(const XpacConfig* config);
 void xpac_uninit(void);
 
 int xpac_handle_request(SOCKET_T client_sock, const char* req_buf, int req_len);
+int xpac_proxy_client_allowed(const char* client_ip);
 
 #ifdef __cplusplus
 }

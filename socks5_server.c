@@ -2,6 +2,7 @@
 #include "xsock.h"
 #include "xchannel.h"
 #include "ssh_tunnel.h"
+#include "xpac_server.h"
 
 #include "xpoll.h"
 #include "xhash.h"
@@ -1216,6 +1217,15 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData, xPo
     socket_set_nonblocking(client_sock);
     socket_set_keepalive(client_sock, 30, 5, 5);
 
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+    if (!xpac_proxy_client_allowed(client_ip)) {
+        XLOGW("Reject SOCKS5 client %s:%d: not in proxy whitelist",
+              client_ip, ntohs(client_addr.sin_port));
+        CLOSE_SOCKET(client_sock);
+        return;
+    }
+
     Socks5Client *client = (Socks5Client*)malloc(sizeof(Socks5Client));
     if (!client) {
         XLOGE("client malloc failed...");
@@ -1234,7 +1244,8 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData, xPo
         return;
     }
 
-    inet_ntop(AF_INET, &client_addr.sin_addr, client->client_host, sizeof(client->client_host));
+    strncpy(client->client_host, client_ip, sizeof(client->client_host) - 1);
+    client->client_host[sizeof(client->client_host) - 1] = '\0';
     client->client_port = ntohs(client_addr.sin_port);
     XLOGW("New client connection from %s:%d, socket=%d",
             client->client_host, client->client_port, (int)client_sock);

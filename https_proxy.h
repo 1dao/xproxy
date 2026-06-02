@@ -10,6 +10,7 @@ typedef struct xPollState xPollState;
 // ===================== 配置结构 =====================
 typedef struct {
     char socks5_server_ip[256];
+    char proxy_host[256];
     int32_t socks5_server_port;
     int32_t listen_port;
     int32_t max_conns;

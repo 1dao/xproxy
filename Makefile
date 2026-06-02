@@ -5,6 +5,7 @@ CC = gcc
 
 # Build mode: release by default, `make debug` (or `make DEBUG=1`) for debug.
 DEBUG ?= 0
+WITH_IO_URING ?= 0
 COMMON_CFLAGS = -Wall -std=c11 -DWIN32_LEAN_AND_MEAN -DWINVER=0x0601 -Wno-unknown-pragmas -Wno-sign-compare -Wno-missing-braces
 CPPFLAGS = -I. -I./3rd/wolfssl -I./3rd/wolfssl/wolfssl -I./3rd/wolfssh -I./3rd/wolfssh/wolfssh -DWOLFSSL_USER_SETTINGS -DWOLFSSH_USER_SETTINGS -DWOLFSSH_FWD
 ifeq ($(DEBUG),1)
@@ -36,7 +37,12 @@ else ifeq ($(UNAME_S),Darwin)
     EXE = xproxy
 else
     # Linux and other Unix-like systems
+	CFLAGS += -D_GNU_SOURCE
     LDFLAGS = -lm -lpthread
+    ifeq ($(WITH_IO_URING),1)
+        CPPFLAGS += -DXPOLL_USE_IO_URING -DXCHANNEL_USE_IO_URING
+        LDFLAGS += -luring
+    endif
     EXE = xproxy
 endif
 

@@ -129,7 +129,9 @@ static int parse_arg(char* arg, int i, int argc, char* argv[], int is_long) {
         }
 
         if (c) {
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
+            if (c->is_flag) {
+                set_config_value(c, "");
+            } else if (i + 1 < argc && argv[i + 1][0] != '-') {
                 set_config_value(c, argv[i + 1]);
                 return 1;
             } else {

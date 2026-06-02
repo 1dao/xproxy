@@ -35,11 +35,17 @@
 #endif
 
 #include "xpoll.h"
+#include "xlog.h"
 #include "xhash.h"
+#if defined(__has_include)
+#  if __has_include("xmacro.h")
+#    include "xmacro.h" /* malloc/free -> rpmalloc when available */
+#  endif
+#else
+#  include "xmacro.h"
+#endif
 
 #if defined(XPOLL_WITH_IO_URING)
-#	include <fcntl.h>
-#	include <sys/types.h>
 #   include <liburing.h>
 #   include <poll.h>
 #endif
@@ -423,9 +429,12 @@ int xpoll_init(void) {
 
 #if defined(XPOLL_WITH_IO_URING)
     if (_uring_loop_init(loop) != 0) {
-        free(loop->ep_events);
-        close(loop->epfd);
-        goto fail;
+        int saved_errno = errno;
+        xlogw("[xpoll] io_uring unavailable, falling back to epoll: %s",
+              strerror(saved_errno));
+        loop->uring_ready = 0;
+        loop->uring_fd = -1;
+        errno = 0;
     }
 #endif
 
@@ -823,7 +832,7 @@ int wait_ms = timeout_ms;
 
     if (num_ready < 0) {
         if (errno == EINTR) return 0;
-        perror("[xpoll] epoll_wait");
+        xloge("[xpoll] epoll_wait: %s", strerror(errno));
         return -1;
     }
 
@@ -846,7 +855,7 @@ int wait_ms = timeout_ms;
         if (e->events & EPOLLOUT)                 mask |= XPOLL_WRITABLE;
         if ((e->events & (EPOLLRDHUP | EPOLLHUP)) && !(e->events & EPOLLIN))
                                                     mask |= XPOLL_CLOSE;
-        if (e->events & EPOLLERR)                  mask |= XPOLL_ERROR | XPOLL_CLOSE;
+        if (e->events & EPOLLERR)                 mask |= XPOLL_ERROR | XPOLL_CLOSE;
 
         SOCKET_T fd = fe->fd;
 
@@ -863,9 +872,8 @@ int wait_ms = timeout_ms;
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
-            fprintf(stderr,
-                "[xpoll] epoll close/error fd=%d events=0x%x\n",
-                (int)sfd, e->events);
+            xlogw("[xpoll] epoll close/error fd=%d events=0x%x",
+                  (int)sfd, e->events);
             fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
                           fe->clientData, NULL);
         }
@@ -888,7 +896,7 @@ int wait_ms = timeout_ms;
 
     if (num_ready < 0) {
         if (errno == EINTR) return 0;
-        perror("[xpoll] kevent");
+        xloge("[xpoll] kevent: %s", strerror(errno));
         return -1;
     }
 
@@ -923,9 +931,8 @@ int wait_ms = timeout_ms;
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
-            fprintf(stderr,
-                "[xpoll] kqueue close/error fd=%d flags=0x%x\n",
-                (int)sfd, ke->flags);
+            xlogw("[xpoll] kqueue close/error fd=%d flags=0x%x",
+                  (int)sfd, ke->flags);
             fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
                           fe->clientData, NULL);
         }
@@ -946,8 +953,7 @@ int wait_ms = timeout_ms;
     if (num_ready < 0) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
-        fprintf(stderr,
-            "[xpoll] poll error nfds=%d: %s\n", nfds, strerror(errno));
+        xloge("[xpoll] poll error nfds=%d: %s", nfds, strerror(errno));
         return -1;
     }
     if (num_ready == 0) return 0;
@@ -993,9 +999,8 @@ int wait_ms = timeout_ms;
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
-            fprintf(stderr,
-                "[xpoll] poll close/error fd=%d revents=0x%x\n",
-                (int)fd, (unsigned)revents);
+            xlogw("[xpoll] poll close/error fd=%d revents=0x%x",
+                  (int)fd, (unsigned)revents);
             fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
                           fe->clientData, NULL);
         }
@@ -1130,7 +1135,8 @@ int xpoll_cancel_request(xPollRequest *request) {
 /* Return the active backend name */
 const char* xpoll_name(void) {
 #if   defined(XPOLL_WITH_IO_URING)
-    return "epoll+io_uring";
+    xPollState *loop = _xpoll;
+    return (loop && loop->uring_ready) ? "epoll+io_uring" : "epoll";
 #elif defined(XPOLL_BACKEND_EPOLL)
     return "epoll";
 #elif defined(XPOLL_BACKEND_KQUEUE)

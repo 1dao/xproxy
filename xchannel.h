@@ -16,7 +16,8 @@ typedef struct xChannel xChannel;
 typedef enum {
     XCHANNEL_FRAME_RAW = 0,
     XCHANNEL_FRAME_LEN32,
-    XCHANNEL_FRAME_CRLF
+    XCHANNEL_FRAME_CRLF,
+    XCHANNEL_FRAME_LEN16
 } xChannelFrame;
 
 typedef void (*xChannelConnectProc)(xChannel* ch, void* ud);
@@ -29,6 +30,29 @@ typedef void (*xChannelConnectProc)(xChannel* ch, void* ud);
 typedef size_t (*xChannelPacketProc)(xChannel* ch, const char* data, size_t len, void* ud);
 
 typedef void (*xChannelCloseProc)(xChannel* ch, const char* reason, void* ud);
+
+/* recv_transform runs AFTER framing slices a packet and BEFORE packet_cb.
+** send_transform runs BEFORE xchannel_send_packet prepends the length header.
+**
+** Both return 0 on success, negative on error (channel will close).
+** On success, *out points to a malloc-allocated buffer; xchannel frees it
+** after consumption. *out may be NULL only when *out_len is 0.
+**
+** The transform owns nothing about framing; xchannel owns the framing layer.
+** Typical use: install an AEAD pair after handshake completes. */
+typedef int (*xChannelRecvTransform)(xChannel* ch,
+                                      const char* in, size_t in_len,
+                                      char** out, size_t* out_len,
+                                      void* ud);
+
+typedef int (*xChannelSendTransform)(xChannel* ch,
+                                      const char* in, size_t in_len,
+                                      char** out, size_t* out_len,
+                                      void* ud);
+
+/* Called when the channel is closed/destroyed so the transform can free its
+** per-channel state (keys, AEAD context, ...). May be NULL. */
+typedef void (*xChannelTransformDtor)(void* ud);
 
 typedef struct xChannelConfig {
     xChannelFrame       frame;
@@ -69,9 +93,32 @@ void      xchannel_get_stats(xChannel* ch,
 
 int       xchannel_set_framing(xChannel* ch, const xChannelConfig* cfg);
 
+/* Install (or clear, with NULL transforms) the per-channel transform pair.
+** Both directions must be set together to keep the wire symmetric. The
+** transform_ud and transform_dtor pair holds optional per-channel state
+** that the transforms need (AEAD keys, sequence counters, ...).
+** Passing recv=NULL and send=NULL clears the transforms; if a previous
+** dtor was installed it is invoked. */
+void      xchannel_set_transform(xChannel* ch,
+                                  xChannelRecvTransform recv,
+                                  xChannelSendTransform send,
+                                  void* transform_ud,
+                                  xChannelTransformDtor transform_dtor);
+
 int       xchannel_attach(xChannel* ch);
 int       xchannel_attach_connect(xChannel* ch);
 void      xchannel_detach(xChannel* ch);
+
+/* Detach from xpoll and surrender ownership of the underlying fd to the
+** caller. Returns the original fd, or INVALID_SOCKET_VAL if the channel is
+** already closed. After this call:
+**   - ch->fd is set to INVALID_SOCKET_VAL
+**   - the channel is marked closed (further sends fail)
+**   - xchannel_destroy will NOT close the fd
+** Typical use: an admission thread reads a handshake, decides routing, and
+** then hands the raw fd to another thread for re-attach via xchannel_create
+** + xchannel_attach. */
+SOCKET_T  xchannel_release_fd(xChannel* ch);
 
 int       xchannel_send_raw(xChannel* ch, const char* data, size_t len);
 int       xchannel_send_packet(xChannel* ch, const char* data, size_t len);
