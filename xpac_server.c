@@ -8,6 +8,8 @@
 #include <direct.h>
 #define PATH_SEPARATOR '\\'
 #define mkdir(dir) _mkdir(dir)
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
 #else
 #include <unistd.h>
 #include <sys/stat.h>
