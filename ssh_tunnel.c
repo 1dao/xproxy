@@ -304,6 +304,24 @@ inline static int is_temporary_state(int error_code) {
     return !check_fatal_err(error_code);
 }
 
+int wolfSSH_channel_send_eof(WOLFSSH_CHANNEL* channel) {
+    if (!channel)
+        return -1;
+    if (!channel->openConfirmed || channel->eofTxd)
+        return 1;
+
+    int ret = SendChannelEof(channel->ssh, channel->peerChannel);
+    if (ret == WS_SUCCESS)
+        return 1;
+
+    int err = wolfSSH_get_error(channel->ssh);
+    if (is_temporary_state(err) || is_temporary_state(ret))
+        return 0;
+
+    XLOGE("SendChannelEof failed: %d:%s", ret, wolfSSH_ErrorToName(ret));
+    return -1;
+}
+
 int wolfSSH_channel_read(WOLFSSH_CHANNEL *channel, void *buffer, size_t buffer_size) {
     if (!channel || !buffer || buffer_size == 0)
         return -1;

@@ -25,6 +25,7 @@ WOLFSSH_CHANNEL* wolfSSH_channel_open(WOLFSSH* session,
                                        const char *dest_host, int dest_port,
                                        const char *source_host, int source_port);
 void wolfSSH_channel_close(WOLFSSH_CHANNEL* channel);
+int wolfSSH_channel_send_eof(WOLFSSH_CHANNEL* channel);
 
 /* 从SSH通道读取数据（非阻塞） */
 int wolfSSH_channel_read(WOLFSSH_CHANNEL *channel, void *buffer, size_t buffer_size);

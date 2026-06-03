@@ -59,6 +59,8 @@ struct xChannel {
     bool attached;
     bool connected;
     bool connect_pending;
+    bool read_closed;
+    bool write_closed;
 
 #if defined(XCHANNEL_WITH_IO_URING)
     bool read_pending;
@@ -83,7 +85,9 @@ struct xChannel {
     long long file_remaining;
 
     bool close_after_flush;
+    bool shutdown_write_after_flush;
     char close_reason[64];
+    char shutdown_reason[64];
 
     uint64_t bytes_sent;
     uint64_t bytes_recv;
@@ -91,6 +95,7 @@ struct xChannel {
     xChannelConnectProc connect_cb;
     xChannelPacketProc packet_cb;
     xChannelCloseProc close_cb;
+    xChannelEofProc eof_cb;
     void* userdata;
 
     xChannelRecvTransform recv_transform;
@@ -107,6 +112,8 @@ static void xchannel_connect_event(SOCKET_T fd, int mask,
                                    void* clientData, xPollRequest* submit_arg);
 static void xchannel_error_event(SOCKET_T fd, int mask,
                                  void* clientData, xPollRequest* submit_arg);
+static void xchannel_read_eof(xChannel* ch, const char* reason);
+static bool finish_fully_half_closed(xChannel* ch);
 #if defined(XCHANNEL_WITH_IO_URING)
 static int xchannel_uring_arm_read(xChannel* ch);
 static int xchannel_uring_arm_write(xChannel* ch);
@@ -304,7 +311,10 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
     ch->attached = false;
     ch->connected = false;
     ch->connect_pending = false;
+    ch->read_closed = true;
+    ch->write_closed = true;
     ch->close_after_flush = false;
+    ch->shutdown_write_after_flush = false;
 
 #if defined(XCHANNEL_WITH_IO_URING)
     if (ch->read_req) {
@@ -351,9 +361,44 @@ static bool finish_close_after_flush(xChannel* ch) {
     return false;
 }
 
+static int shutdown_write_now(xChannel* ch) {
+    if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
+    if (ch->write_closed) return 0;
+
+    (void)SHUTDOWN_SOCKET(ch->fd, SHUTDOWN_WR);
+    ch->write_closed = true;
+    ch->shutdown_write_after_flush = false;
+#if !defined(XCHANNEL_WITH_IO_URING)
+    xpoll_del_event(ch->fd, XPOLL_WRITABLE);
+#endif
+    finish_fully_half_closed(ch);
+    return 0;
+}
+
+static bool finish_shutdown_write_after_flush(xChannel* ch) {
+    if (!ch || ch->closed || !ch->shutdown_write_after_flush) return false;
+
+    if (!has_pending_output(ch)) {
+        shutdown_write_now(ch);
+        return true;
+    }
+
+    return false;
+}
+
+static bool finish_fully_half_closed(xChannel* ch) {
+    if (!ch || ch->closed) return false;
+    if (ch->read_closed && ch->write_closed && !has_pending_output(ch)) {
+        close_internal(ch, "half_closed", true);
+        return true;
+    }
+    return false;
+}
+
 static int check_send_limit(xChannel* ch, size_t alen, size_t blen) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
     if (ch->close_after_flush) return -1;
+    if (ch->write_closed || ch->shutdown_write_after_flush) return -1;
     if (alen == 0 && blen == 0) return 0;
     if (has_pending_file(ch)) return -1;
     if (ch->out.max > 0 && xbuf_size(&ch->out) >= ch->out.max) return -2;
@@ -515,7 +560,7 @@ static int arm_writable(xChannel* ch, bool while_connecting) {
 #if defined(XCHANNEL_WITH_IO_URING)
 static int xchannel_uring_arm_read(xChannel* ch) {
     if (!ch || ch->closed || !ch->attached ||
-        ch->fd == INVALID_SOCKET_VAL || ch->read_pending) {
+        ch->fd == INVALID_SOCKET_VAL || ch->read_pending || ch->read_closed) {
         return 0;
     }
     if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max)
@@ -669,6 +714,10 @@ static void flush_output(xChannel* ch) {
     }
 
     if (!ch->closed) {
+        finish_shutdown_write_after_flush(ch);
+    }
+
+    if (!ch->closed) {
         finish_close_after_flush(ch);
     }
 }
@@ -766,6 +815,24 @@ static bool finish_connect(xChannel* ch) {
     return !ch->closed;
 }
 
+static void xchannel_read_eof(xChannel* ch, const char* reason) {
+    if (!ch || ch->closed || ch->read_closed) return;
+
+    ch->read_closed = true;
+#if !defined(XCHANNEL_WITH_IO_URING)
+    if (ch->fd != INVALID_SOCKET_VAL) {
+        xpoll_del_event(ch->fd, XPOLL_READABLE);
+    }
+#endif
+
+    if (ch->eof_cb) {
+        ch->eof_cb(ch, reason ? reason : "eof", ch->userdata);
+        finish_fully_half_closed(ch);
+    } else {
+        xchannel_close(ch, reason ? reason : "eof");
+    }
+}
+
 static void xchannel_read_event(SOCKET_T fd, int mask,
                                 void* clientData, xPollRequest* submit_arg) {
     (void)fd;
@@ -776,11 +843,12 @@ static void xchannel_read_event(SOCKET_T fd, int mask,
 
     xchannel_retain(ch);
 
+    bool eof_after = false;
     bool close_after = false;
     const char* close_reason = NULL;
 
     int retry = 0;
-    while (!ch->closed) {
+    while (!ch->closed && !ch->read_closed) {
         if (!xbuf_reserve(&ch->in, XCHANNEL_READ_CHUNK)) {
             xchannel_close(ch, "out_of_memory");
             break;
@@ -797,7 +865,7 @@ static void xchannel_read_event(SOCKET_T fd, int mask,
             else break;
         }
         if (n == 0) {
-            close_after = true;
+            eof_after = true;
             close_reason = "eof";
             break;
         }
@@ -830,7 +898,11 @@ static void xchannel_read_event(SOCKET_T fd, int mask,
 #endif
     }
 
-    if (close_after && !ch->closed) xchannel_close(ch, close_reason);
+    if (close_after && !ch->closed) {
+        xchannel_close(ch, close_reason);
+    } else if (eof_after && !ch->closed) {
+        xchannel_read_eof(ch, close_reason);
+    }
 
     xchannel_release(ch);
 }
@@ -898,7 +970,7 @@ static void xchannel_uring_read_done(SOCKET_T fd, int mask,
             if (n == 0 && over_before)
                 xchannel_close(ch, "over_consume_error");
         } else if (nread == 0) {
-            xchannel_close(ch, "eof");
+            xchannel_read_eof(ch, "eof");
         } else if (nread == -EAGAIN || nread == -EWOULDBLOCK ||
                    nread == -EINTR || nread == -EINPROGRESS) {
             /* Retry below. */
@@ -906,7 +978,7 @@ static void xchannel_uring_read_done(SOCKET_T fd, int mask,
             xchannel_error_event(ch->fd, XPOLL_ERROR, ch, NULL);
         }
 
-        if (!ch->closed && ch->attached &&
+        if (!ch->closed && ch->attached && !ch->read_closed &&
             (ch->in.max == 0 || xbuf_size(&ch->in) <= ch->in.max)) {
             xchannel_uring_arm_read(ch);
         }
@@ -975,6 +1047,7 @@ xChannel* xchannel_create(SOCKET_T fd, const xChannelConfig* cfg) {
         if (cfg->connect_cb) ch->connect_cb = cfg->connect_cb;
         if (cfg->packet_cb) ch->packet_cb = cfg->packet_cb;
         if (cfg->close_cb) ch->close_cb = cfg->close_cb;
+        if (cfg->eof_cb) ch->eof_cb = cfg->eof_cb;
         if (cfg->userdata) ch->userdata = cfg->userdata;
     }
 
@@ -988,6 +1061,8 @@ void xchannel_destroy(xChannel* ch) {
         ch->attached = false;
         ch->connected = false;
         ch->connect_pending = false;
+        ch->read_closed = true;
+        ch->write_closed = true;
 #if defined(XCHANNEL_WITH_IO_URING)
         if (ch->read_req) {
             xpoll_cancel_request(ch->read_req);
@@ -1044,6 +1119,14 @@ bool xchannel_is_connected(xChannel* ch) {
     return ch && ch->connected && !ch->closed;
 }
 
+bool xchannel_is_read_closed(xChannel* ch) {
+    return !ch || ch->read_closed || ch->closed;
+}
+
+bool xchannel_is_write_closed(xChannel* ch) {
+    return !ch || ch->write_closed || ch->closed;
+}
+
 void xchannel_set_userdata(xChannel* ch, void* ud) {
     if (ch) ch->userdata = ud;
 }
@@ -1069,18 +1152,21 @@ int xchannel_attach(xChannel* ch) {
 #if defined(XCHANNEL_WITH_IO_URING)
     ch->attached = true;
     ch->connected = true;
+    if (ch->read_closed) return 0;
     if (xchannel_uring_arm_read(ch) != 0) {
         ch->attached = false;
         return -1;
     }
     return 0;
 #else
-    if (xpoll_add_event(ch->fd, XPOLL_READABLE,
-                        xchannel_read_event, NULL, xchannel_error_event, ch) != 0) {
-        return -1;
-    }
     ch->attached = true;
     ch->connected = true;
+    if (ch->read_closed) return 0;
+    if (xpoll_add_event(ch->fd, XPOLL_READABLE,
+                        xchannel_read_event, NULL, xchannel_error_event, ch) != 0) {
+        ch->attached = false;
+        return -1;
+    }
     return 0;
 #endif
 }
@@ -1138,6 +1224,8 @@ SOCKET_T xchannel_release_fd(xChannel* ch) {
     ch->closed = true;
     ch->connected = false;
     ch->connect_pending = false;
+    ch->read_closed = true;
+    ch->write_closed = true;
     return fd;
 }
 
@@ -1305,6 +1393,39 @@ int xchannel_close_after_flush(xChannel* ch, const char* reason) {
     }
 
     if (!ch->closed && has_pending_output(ch)) {
+        if (arm_writable(ch, ch->connect_pending) != 0) {
+            xchannel_release(ch);
+            return -1;
+        }
+    }
+
+    xchannel_release(ch);
+    return 0;
+}
+
+int xchannel_shutdown_write_after_flush(xChannel* ch, const char* reason) {
+    if (!ch) return -1;
+
+    xchannel_retain(ch);
+    if (ch->closed || ch->fd == INVALID_SOCKET_VAL) {
+        xchannel_release(ch);
+        return -1;
+    }
+    if (ch->write_closed) {
+        xchannel_release(ch);
+        return 0;
+    }
+
+    ch->shutdown_write_after_flush = true;
+    const char* why = reason ? reason : "shutdown_write_after_flush";
+    strncpy(ch->shutdown_reason, why, sizeof(ch->shutdown_reason) - 1);
+    ch->shutdown_reason[sizeof(ch->shutdown_reason) - 1] = '\0';
+
+    if (!ch->connect_pending) {
+        flush_output(ch);
+    }
+
+    if (!ch->closed && ch->shutdown_write_after_flush && has_pending_output(ch)) {
         if (arm_writable(ch, ch->connect_pending) != 0) {
             xchannel_release(ch);
             return -1;

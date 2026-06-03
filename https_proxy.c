@@ -528,6 +528,7 @@ static void socks5_error_cb(SOCKET_T fd, int mask, void *clientData, xPollReques
 static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
 static size_t socks5_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
 static void tunnel_channel_close_cb(xChannel* ch, const char* reason, void* ud);
+static void tunnel_channel_eof_cb(xChannel* ch, const char* reason, void* ud);
 static int enable_tunnel_channels(ProxyConn* conn);
 
 // ===================== Core Processing Functions =====================
@@ -756,12 +757,14 @@ static int enable_tunnel_channels(ProxyConn* conn) {
     c_cfg.frame = XCHANNEL_FRAME_RAW;
     c_cfg.packet_cb = client_channel_packet_cb;
     c_cfg.close_cb = tunnel_channel_close_cb;
+    c_cfg.eof_cb = tunnel_channel_eof_cb;
     c_cfg.userdata = conn;
 
     xChannelConfig s_cfg = XCHANNEL_CONFIG_INIT;
     s_cfg.frame = XCHANNEL_FRAME_RAW;
     s_cfg.packet_cb = socks5_channel_packet_cb;
     s_cfg.close_cb = tunnel_channel_close_cb;
+    s_cfg.eof_cb = tunnel_channel_eof_cb;
     s_cfg.userdata = conn;
 
     conn->client_ch = xchannel_create(conn->client_sock, &c_cfg);
@@ -825,6 +828,8 @@ static void tunnel_channel_close_cb(xChannel* ch, const char* reason, void* ud) 
         return;
     }
 
+    bool half_closed = (reason && strcmp(reason, "half_closed") == 0);
+
     if (conn->client_ch == ch) {
         conn->client_ch = NULL;
         conn->client_sock = INVALID_SOCKET;
@@ -834,8 +839,32 @@ static void tunnel_channel_close_cb(xChannel* ch, const char* reason, void* ud) 
         conn->socks5_sock = INVALID_SOCKET;
     }
 
-    close_conn_from_ptr(conn);
     xchannel_destroy(ch);
+
+    if (half_closed) {
+        if (!conn->client_ch && !conn->socks5_ch) {
+            close_conn_from_ptr(conn);
+        }
+        return;
+    }
+
+    close_conn_from_ptr(conn);
+}
+
+static void tunnel_channel_eof_cb(xChannel* ch, const char* reason, void* ud) {
+    ProxyConn* conn = (ProxyConn*)ud;
+    XLOGW("[http] tunnel channel EOF: reason=%s", reason ? reason : "unknown");
+    if (!conn || conn->state != CONN_STATE_SOCKS5_OK) return;
+
+    if (conn->client_ch == ch && conn->socks5_ch) {
+        if (xchannel_shutdown_write_after_flush(conn->socks5_ch, "client_eof") != 0) {
+            shutdown_conn_from_ptr(conn, "client_eof_shutdown_failed");
+        }
+    } else if (conn->socks5_ch == ch && conn->client_ch) {
+        if (xchannel_shutdown_write_after_flush(conn->client_ch, "socks5_eof") != 0) {
+            shutdown_conn_from_ptr(conn, "socks5_eof_shutdown_failed");
+        }
+    }
 }
 
 // Handle client request (parse + establish Socks5 connection)

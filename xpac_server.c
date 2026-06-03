@@ -698,9 +698,8 @@ static char* xpac_generate_pac_content(int pac_type) {
             ip, g_config.socks5_proxy_port, ip, g_config.socks5_proxy_port);
     } else { // proxy.pac，默认HTTP代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "\n    // Default to HTTP proxy to avoid accidental direct egress.\n"
-                    "    return \"PROXY %s:%d\";\n",
-                    ip, g_config.http_proxy_port);
+                    "\n    // 所有其他不走代理直接访问\n"
+                    "    return \"DIRECT\";\n");
     }
 
     pos += snprintf(pac_content + pos, buffer_size - pos, "}\n");
