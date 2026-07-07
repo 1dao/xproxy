@@ -610,9 +610,9 @@ static char* xpac_generate_pac_content(int pac_type) {
     int buffer_size = 2048; // 基础大小
     DomainRule* current = g_domain_list;
 
-    // 为域名规则预留空间
+    // 为域名规则预留空间（每条规则展开为4个shExpMatch条件）
     while (current) {
-        buffer_size += 256; // 每个规则约256字节
+        buffer_size += 256 + 4 * (int)strlen(current->pattern);
         current = current->next;
     }
 
@@ -665,15 +665,17 @@ static char* xpac_generate_pac_content(int pac_type) {
 
             // 生成域名匹配条件
             if (strncmp(current->pattern, "*.", 2) == 0) {
-                // 如果是 *. 开头的模式，去掉 * 直接匹配域名本身
+                // *.X 模式需同时覆盖：子域名、裸域名 X 本身、
+                // 以及带额外后缀的形态（如 google.com.hk / www.google.com.hk）
+                const char* bare = current->pattern + 2; // 跳过 "*."
                 pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s %s:%d\";\n"
-                    "    }\n"
-                    "    if (shExpMatch(host, \"%s\")) {\n"
+                    "    if (shExpMatch(host, \"%s\") ||\n"
+                    "        shExpMatch(host, \"%s\") ||\n"
+                    "        shExpMatch(host, \"%s.*\") ||\n"
+                    "        shExpMatch(host, \"%s.*\")) {\n"
                     "        return \"%s %s:%d\";\n"
                     "    }\n",
-                    current->pattern, proxy_str, ip, port, current->pattern+2, proxy_str, ip, port);  // 跳过 '*' 字符
+                    current->pattern, bare, bare, current->pattern, proxy_str, ip, port);
             } else {
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"%s\")) {\n"
