@@ -114,7 +114,6 @@ static void xchannel_connect_event(SOCKET_T fd, int mask,
 static void xchannel_error_event(SOCKET_T fd, int mask,
                                  void* clientData, xPollRequest* submit_arg);
 static void xchannel_read_eof(xChannel* ch, const char* reason);
-static bool finish_fully_half_closed(xChannel* ch);
 #if defined(XCHANNEL_WITH_IO_URING)
 static int xchannel_uring_arm_read(xChannel* ch);
 static int xchannel_uring_arm_write(xChannel* ch);
@@ -348,20 +347,6 @@ static bool has_pending_output(xChannel* ch) {
                   has_pending_file(ch));
 }
 
-static bool finish_close_after_flush(xChannel* ch) {
-    if (!ch || ch->closed || !ch->close_after_flush) return false;
-
-    if (!has_pending_output(ch)) {
-        const char* reason = ch->close_reason[0]
-            ? ch->close_reason
-            : "close_after_flush";
-        close_internal(ch, reason, true);
-        return true;
-    }
-
-    return false;
-}
-
 static int shutdown_write_now(xChannel* ch) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
     if (ch->write_closed) return 0;
@@ -372,28 +357,28 @@ static int shutdown_write_now(xChannel* ch) {
 #if !defined(XCHANNEL_WITH_IO_URING)
     xpoll_del_event(ch->fd, XPOLL_WRITABLE);
 #endif
-    finish_fully_half_closed(ch);
     return 0;
 }
 
-static bool finish_shutdown_write_after_flush(xChannel* ch) {
-    if (!ch || ch->closed || !ch->shutdown_write_after_flush) return false;
+/* Advance whatever deferred close state is pending, once output may have
+** drained or a direction just closed. Priority: close_after_flush beats
+** shutdown_write_after_flush; a fully half-closed channel is destroyed. */
+static void finish_deferred_close(xChannel* ch) {
+    if (!ch || ch->closed || has_pending_output(ch)) return;
 
-    if (!has_pending_output(ch)) {
+    if (ch->close_after_flush) {
+        close_internal(ch, ch->close_reason[0] ? ch->close_reason
+                                               : "close_after_flush", true);
+        return;
+    }
+
+    if (ch->shutdown_write_after_flush)
         shutdown_write_now(ch);
-        return true;
-    }
 
-    return false;
-}
-
-static bool finish_fully_half_closed(xChannel* ch) {
-    if (!ch || ch->closed) return false;
-    if (ch->read_closed && ch->write_closed && !has_pending_output(ch)) {
-        close_internal(ch, "half_closed", true);
-        return true;
+    if (ch->read_closed && ch->write_closed) {
+        close_internal(ch, ch->shutdown_reason[0] ? ch->shutdown_reason
+                                                  : "half_closed", true);
     }
-    return false;
 }
 
 static int check_send_limit(xChannel* ch, size_t alen, size_t blen) {
@@ -714,13 +699,7 @@ static void flush_output(xChannel* ch) {
         xpoll_del_event(ch->fd, XPOLL_WRITABLE);
     }
 
-    if (!ch->closed) {
-        finish_shutdown_write_after_flush(ch);
-    }
-
-    if (!ch->closed) {
-        finish_close_after_flush(ch);
-    }
+    finish_deferred_close(ch);
 }
 
 /* Atomically queue or send a (head, body) pair. Either segment may be empty.
@@ -828,7 +807,7 @@ static void xchannel_read_eof(xChannel* ch, const char* reason) {
 
     if (ch->eof_cb) {
         ch->eof_cb(ch, reason ? reason : "eof", ch->userdata);
-        finish_fully_half_closed(ch);
+        finish_deferred_close(ch);
     } else {
         xchannel_close(ch, reason ? reason : "eof");
     }
