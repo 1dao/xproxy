@@ -113,6 +113,17 @@ int       xchannel_attach(xChannel* ch);
 int       xchannel_attach_connect(xChannel* ch);
 void      xchannel_detach(xChannel* ch);
 
+/* Explicit read-side flow control for proxy/tunnel use.
+** pause_read suspends READABLE (already-buffered input is kept untouched).
+** resume_read flushes the buffered input back through packet_cb and, unless the
+** consumer re-pauses from within that callback, re-arms reads. is_read_paused
+** reports the current state. All three are no-ops / safe on a closed channel
+** and safe to call repeatedly. Only affects the read direction; the write side
+** (and its flush) keeps running while reads are paused. */
+void      xchannel_pause_read(xChannel* ch);
+int       xchannel_resume_read(xChannel* ch);
+bool      xchannel_is_read_paused(xChannel* ch);
+
 /* Detach from xpoll and surrender ownership of the underlying fd to the
 ** caller. Returns the original fd, or INVALID_SOCKET_VAL if the channel is
 ** already closed. After this call:

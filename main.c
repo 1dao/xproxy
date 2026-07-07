@@ -350,7 +350,7 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
     // 等待网络就绪（开机启动时网络可能还未连接）
     if (has_ssh_args) {
-        XLOGI("[Network] Waiting for network to be ready...");
+        XLOGI("[Network] Waiting for network to be ready (target %s:%s)...", ssh_host, xargs_get("p"));
         int retries = 0;
         int max_retries = 60;
         int network_ready = 0;
@@ -397,7 +397,7 @@ int main(int argc, char *argv[]) {
             if (!network_ready) {
                 retries++;
                 if (retries < max_retries) {
-                    XLOGI("[Network] Waiting for network... (%d/%d)", retries, max_retries);
+                    XLOGI("[Network] Waiting for network (%s:%s)... (%d/%d)", ssh_host, xargs_get("p"), retries, max_retries);
                     Sleep(1000);
                 }
             }

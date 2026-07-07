@@ -61,6 +61,7 @@ struct xChannel {
     bool connect_pending;
     bool read_closed;
     bool write_closed;
+    bool read_paused;  /* reads suspended via xchannel_pause_read (flow control) */
 
 #if defined(XCHANNEL_WITH_IO_URING)
     bool read_pending;
@@ -840,6 +841,7 @@ static void xchannel_read_event(SOCKET_T fd, int mask,
     (void)submit_arg;
     xChannel* ch = (xChannel*)clientData;
     if (!ch || ch->closed) return;
+    if (ch->read_paused) return;  /* flow control: don't drain while paused */
 
     xchannel_retain(ch);
 
@@ -1210,6 +1212,59 @@ void xchannel_detach(xChannel* ch) {
     xpoll_del_event(ch->fd, XPOLL_ALL);
     ch->attached = false;
 #endif
+}
+
+void xchannel_pause_read(xChannel* ch) {
+    if (!ch || ch->closed || ch->read_paused) return;
+    ch->read_paused = true;
+#if defined(XCHANNEL_WITH_IO_URING)
+    if (ch->read_req) {
+        xpoll_cancel_request(ch->read_req);
+        ch->read_req = NULL;
+    }
+    ch->read_pending = false;
+#else
+    if (ch->fd != INVALID_SOCKET_VAL) {
+        xpoll_del_event(ch->fd, XPOLL_READABLE);
+    }
+#endif
+}
+
+int xchannel_resume_read(xChannel* ch) {
+    if (!ch || ch->closed) return -1;
+    if (!ch->read_paused) return 0;
+    ch->read_paused = false;
+    if (ch->read_closed) return 0;
+
+    int rc = 0;
+    xchannel_retain(ch);
+
+    /* Flush already-buffered input before re-arming, so held bytes move even if
+    ** no new data arrives on the socket. The consumer may re-pause us from
+    ** inside process_input -> packet_cb; if so, leave reads suspended. */
+    process_input(ch);
+
+    if (!ch->closed && !ch->read_paused && !ch->read_closed &&
+        (ch->in.max == 0 || xbuf_size(&ch->in) <= ch->in.max)) {
+#if defined(XCHANNEL_WITH_IO_URING)
+        if (xchannel_uring_arm_read(ch) != 0)
+            rc = -1;
+#else
+        if (xpoll_add_event(ch->fd, XPOLL_READABLE,
+                            xchannel_read_event, NULL,
+                            xchannel_error_event, ch) != 0) {
+            xchannel_close(ch, "poll_error");
+            rc = -1;
+        }
+#endif
+    }
+
+    xchannel_release(ch);
+    return rc;
+}
+
+bool xchannel_is_read_paused(xChannel* ch) {
+    return ch && ch->read_paused && !ch->closed;
 }
 
 SOCKET_T xchannel_release_fd(xChannel* ch) {

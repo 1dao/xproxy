@@ -22,6 +22,13 @@
 
 static HttpProxyConfig g_config;
 
+/* Tunnel backpressure: when one side's send buffer reaches the high water we
+ * pause reads on the other side; we resume (from https_proxy_update) once it
+ * drains below the low water. High water sits below the 16 MB max_send so a
+ * forward never gets rejected with -2 in the common case. */
+#define HTTP_TUNNEL_SEND_HIGH_WATER (8u * 1024u * 1024u)
+#define HTTP_TUNNEL_SEND_LOW_WATER  (2u * 1024u * 1024u)
+
 // Check if host is a local address (127.0.0.1, localhost, 0.0.0.0, or actual local IP)
 static int is_local_address(const char* host) {
     if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0 || strcmp(host, "0.0.0.0") == 0)
@@ -796,28 +803,48 @@ fail:
     return -1;
 }
 
-static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud) {
-    (void)ch;
-    ProxyConn* conn = (ProxyConn*)ud;
-    if (!conn || conn->state != CONN_STATE_SOCKS5_OK || !conn->socks5_ch) return len;
-    if (len == 0) return 0;
-    if (xchannel_send_raw(conn->socks5_ch, data, len) != 0) {
-        XLOGE("[http] tunnel client->socks5 send failed");
-        shutdown_conn_from_ptr(conn, "tunnel_client_send_failed");
+/* Forward one tunnel direction with backpressure. `ch` is the source channel
+ * (the one that received data); `dst` is where it goes. On dst backpressure we
+ * pause reads on `ch` and hold the bytes in its input buffer (return 0), or
+ * proactively pause once dst crosses the high water. https_proxy_update()
+ * resumes `ch` after dst drains. Returns bytes consumed (xchannel RAW semantics). */
+static size_t tunnel_forward(xChannel* ch, xChannel* dst, ProxyConn* conn,
+                             const char* data, size_t len, const char* what) {
+    int rc = xchannel_send_raw(dst, data, len);
+    if (rc == -2) {
+        /* Destination at its send cap: keep the data buffered in the source and
+         * stop reading until it drains. */
+        xchannel_pause_read(ch);
+        return 0;
+    }
+    if (rc != 0) {
+        XLOGE("[http] tunnel %s send failed", what);
+        shutdown_conn_from_ptr(conn, what);
+        return len;
+    }
+
+    size_t send_buf = 0;
+    xchannel_get_stats(dst, &send_buf, NULL, NULL, NULL);
+    if (send_buf >= HTTP_TUNNEL_SEND_HIGH_WATER) {
+        xchannel_pause_read(ch);
     }
     return len;
 }
 
+static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud) {
+    ProxyConn* conn = (ProxyConn*)ud;
+    if (!conn || conn->state != CONN_STATE_SOCKS5_OK || !conn->socks5_ch) return len;
+    if (len == 0) return 0;
+    return tunnel_forward(ch, conn->socks5_ch, conn, data, len,
+                          "tunnel_client_send_failed");
+}
+
 static size_t socks5_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud) {
-    (void)ch;
     ProxyConn* conn = (ProxyConn*)ud;
     if (!conn || conn->state != CONN_STATE_SOCKS5_OK || !conn->client_ch) return len;
     if (len == 0) return 0;
-    if (xchannel_send_raw(conn->client_ch, data, len) != 0) {
-        XLOGE("[http] tunnel socks5->client send failed");
-        shutdown_conn_from_ptr(conn, "tunnel_socks5_send_failed");
-    }
-    return len;
+    return tunnel_forward(ch, conn->client_ch, conn, data, len,
+                          "tunnel_socks5_send_failed");
 }
 
 static void tunnel_channel_close_cb(xChannel* ch, const char* reason, void* ud) {
@@ -1366,7 +1393,39 @@ int https_proxy_start(const HttpProxyConfig* config) {
     return 0;
 }
 
+/* Resume a paused tunnel direction once its destination has drained below the
+ * low water. `src` was paused because `dst` filled up; re-read `src` to flush
+ * any held bytes and re-arm its reads. Returns -1 if the resume failed. */
+static int tunnel_resume_if_drained(xChannel* src, xChannel* dst) {
+    if (!src || !dst || !xchannel_is_read_paused(src)) return 0;
+
+    size_t send_buf = 0;
+    xchannel_get_stats(dst, &send_buf, NULL, NULL, NULL);
+    if (send_buf > HTTP_TUNNEL_SEND_LOW_WATER) return 0;  /* still draining */
+
+    return xchannel_resume_read(src);
+}
+
 void https_proxy_update(void) {
+    if (!g_conn_list) return;
+
+    for (int slot = 0; slot < g_config.max_conns; slot++) {
+        ProxyConn* conn = &g_conn_list[slot];
+        if (conn->state != CONN_STATE_SOCKS5_OK || conn->closing) continue;
+
+        /* Download: socks5_ch reads paused because client_ch (toward the real
+         * client) backed up. Resuming here lets backpressure propagate all the
+         * way to the SSH/remote side instead of dropping the connection. */
+        if (tunnel_resume_if_drained(conn->socks5_ch, conn->client_ch) != 0) {
+            shutdown_conn_slot(slot, "tunnel_resume_socks5_failed");
+            continue;
+        }
+        /* Upload: client_ch reads paused because socks5_ch backed up. */
+        if (tunnel_resume_if_drained(conn->client_ch, conn->socks5_ch) != 0) {
+            shutdown_conn_slot(slot, "tunnel_resume_client_failed");
+            continue;
+        }
+    }
 }
 
 // Stop proxy service

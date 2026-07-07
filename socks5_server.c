@@ -17,9 +17,14 @@
 #define MAX_REOPEN_COUNT 10 // wait for 3min
 #define SOCKS5_WRITE_BUFFER_INITIAL 65536u
 #define SOCKS5_WRITE_BUFFER_MAX (16u * 1024u * 1024u)
-/* High/low watermarks for SSH write backlog. */
+/* High/low watermarks for SSH write backlog (upload: client -> SSH). */
 #define SOCKS5_WBUF_HIGH_WATER (4u * 1024u * 1024u)
 #define SOCKS5_WBUF_LOW_WATER  (1u * 1024u * 1024u)
+/* High/low watermarks for the client send buffer (download: SSH -> io_ch).
+ * High water sits below io_ch's 16 MB max_send so we pause SSH-channel reads
+ * before xchannel_send_raw could ever reject with -2. */
+#define SOCKS5_IO_SEND_HIGH_WATER (8u * 1024u * 1024u)
+#define SOCKS5_IO_SEND_LOW_WATER  (2u * 1024u * 1024u)
 #define SOCKS5_WRITE_PUMP_BYTE_BUDGET (4u * 1024u * 1024u)
 #define SOCKS5_WRITE_PUMP_ITER_BUDGET 256
 /* Returned by socks5_send_reply / socks5_client_send_raw / socks5_reply_and_close
@@ -85,6 +90,36 @@ static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx);
 static int ssh_channel_open_fail_callback(WOLFSSH_CHANNEL* channel, void* ctx);
 static void client_channel_eof_cb(xChannel* ch, const char* reason, void* ud);
 
+static int socks5_arm_ssh_writable(SOCKET_T ssh_socket, xhash* hash_table,
+                                   int force, const char* reason) {
+    if (!g_ssh_session) return 0;
+
+    if (ssh_socket == INVALID_SOCKET) {
+        ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
+    }
+    if (ssh_socket == INVALID_SOCKET) return 0;
+
+    if (!hash_table) {
+        hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
+    }
+    if (!hash_table) return 0;
+
+    if (!force && !wolfSSH_session_has_pending_output(g_ssh_session)) {
+        return 0;
+    }
+
+    if (xpoll_add_event(ssh_socket, XPOLL_WRITABLE,
+                        NULL, ssh_write_cb, NULL, hash_table) != 0) {
+        XLOGE("Failed to arm SSH writable fd=%d reason=%s",
+              (int)ssh_socket, reason ? reason : "pending_output");
+        return -1;
+    }
+
+    XLOGD("Armed SSH writable fd=%d reason=%s",
+          (int)ssh_socket, reason ? reason : "pending_output");
+    return 1;
+}
+
 static int socks5_active_connections(void) {
     if (!g_ssh_session) return 0;
     SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
@@ -121,7 +156,8 @@ typedef struct {
     size_t wlen;
     size_t wcap;
     xChannel *io_ch;
-    bool io_recv_paused;  // true when io_ch reads are paused due to SSH wbuf backpressure
+    bool io_recv_paused;  // true when io_ch reads are paused due to SSH wbuf backpressure (upload)
+    bool io_send_paused;  // true when SSH-channel reads are paused due to io_ch send backpressure (download)
     bool client_read_eof; // true after the client half-closes its write side
     bool ssh_eof_sent;    // true after forwarding EOF to the SSH channel
 
@@ -391,10 +427,8 @@ static int socks5_client_open_channel(Socks5Client* client) {
         if (!wolfSSH_check_fatal(wolfSSH_get_error(client->ssh_session))) {
             SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
             xhash* hash_table = xpoll_get_client_data(ssh_socket);
-            if (hash_table) {
-                xpoll_add_event(ssh_socket, XPOLL_WRITABLE,
-                                NULL, ssh_write_cb, NULL, hash_table);
-            }
+            socks5_arm_ssh_writable(ssh_socket, hash_table, 1,
+                                    "channel_open_retry");
             client->last_retry_time = time_get_ms() + 200;
             return 0;
         }
@@ -620,10 +654,8 @@ void socks5_client_free(Socks5Client* client) {
         wolfSSH_channel_close(client->ssh_channel);
         if (wolfSSH_session_has_pending_output(ssh_session)) {
             xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
-            if (hash_table) {
-                xpoll_add_event(ssh_socket, XPOLL_WRITABLE,
-                                NULL, ssh_write_cb, NULL, hash_table);
-            }
+            socks5_arm_ssh_writable(ssh_socket, hash_table, 0,
+                                    "channel_close");
         }
     }
 
@@ -707,38 +739,55 @@ static void socks5_client_remote_eof(Socks5Client* client, const char* reason) {
     }
 }
 
-static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
-    (void)k;
-    (void)ud;
-    // Get client from hash node
-    Socks5Client *client = (Socks5Client*)value;
+/* Drain one client's SSH channel into its io_ch, applying download-direction
+ * backpressure: if the client send buffer is backed up we stop reading and
+ * leave data in the SSH channel buffer, which makes wolfSSH withhold window
+ * updates and throttles the remote. This is the read-side mirror of
+ * socks5_update_backpressure() (the upload side). Resumed from
+ * socks5_resume_io_send() once the send buffer drains below the low water. */
+static void socks5_pump_client_read(Socks5Client *client) {
     if (!client || client->state != SOCKS5_STATE_CONNECTED || !client->ssh_channel)
-        return true;  // Continue to next client
+        return;
 
     if (client->wlen > SOCKS5_WRITE_BUFFER_MAX) {
         XLOGE("Warning: Invalid wlen=%zu for fd=%d",
                    client->wlen, (int)client->client_sock);
         socks5_client_wbuf_reset(client);
         socks5_client_fail(client, "invalid_write_buffer");
-        return true;
+        return;
+    }
+
+    if (!client->io_ch) {
+        XLOGE("Client channel missing for fd=%d", (int)client->client_sock);
+        socks5_client_fail(client, "missing_client_channel");
+        return;
     }
 
     if (client->ssh_session && client->ssh_channel) {
         if (wolfSSH_channel_eof(client->ssh_channel) != 0) {
             socks5_client_remote_eof(client, "ssh_channel_eof");
-            return true;
+            return;
         }
     }
 
     char ssh_rbuf[8192];
     for (;;) {
+        /* Backpressure: check the client send buffer BEFORE reading so we
+         * never pull bytes off the channel that we couldn't queue. Pausing
+         * here leaves the data in the SSH channel buffer -> window throttle. */
+        size_t send_buf = 0;
+        xchannel_get_stats(client->io_ch, &send_buf, NULL, NULL, NULL);
+        if (send_buf >= SOCKS5_IO_SEND_HIGH_WATER) {
+            if (!client->io_send_paused) {
+                XLOGD("io_ch send high water: pausing SSH reads fd=%d send_buf=%zu",
+                      (int)client->client_sock, send_buf);
+            }
+            client->io_send_paused = true;
+            return;
+        }
+
         int n = wolfSSH_channel_read(client->ssh_channel, ssh_rbuf, sizeof(ssh_rbuf));
         if (n > 0) {
-            if (!client->io_ch) {
-                XLOGE("Client channel missing for fd=%d", (int)client->client_sock);
-                socks5_client_fail(client, "missing_client_channel");
-                return true;
-            }
             SOCKET_T client_fd = client->client_sock;
             int rc = xchannel_send_raw(client->io_ch, ssh_rbuf, (size_t)n);
             if (rc != 0) {
@@ -747,7 +796,7 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
                 if (rc == -2) {
                     socks5_client_fail(client, "client_send_backpressure");
                 }
-                return true;
+                return;
             }
             continue;
         }
@@ -759,7 +808,7 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
                 XLOGE("Channel read failed for fd=%d, n=%d", (int)client->client_sock, n);
                 socks5_client_fail(client, "ssh_channel_read_error");
             }
-            return true;
+            return;
         }
 
         break;
@@ -768,10 +817,15 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
     if (client->ssh_channel && wolfSSH_channel_eof(client->ssh_channel)!=0) {
         XLOGE("Channel closed by remote fd=%d", (int)client->client_sock);
         socks5_client_remote_eof(client, "ssh_channel_closed");
-        return true;
+        return;
     }
+}
 
-    return true;
+static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
+    (void)k;
+    (void)ud;
+    socks5_pump_client_read((Socks5Client*)value);
+    return true;  // Continue to next client
 }
 
 static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
@@ -786,6 +840,10 @@ static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *s
         return;
 
     xhash_foreach(hash_table, ssh_read_each_client, NULL);
+
+    /* Channel reads can queue SSH control packets such as WINDOW_ADJUST.
+     * Arm writable now so pending SSH output drains on the next poll. */
+    socks5_arm_ssh_writable(fd, hash_table, 0, "ssh_read_pending_output");
 }
 
 typedef struct {
@@ -809,7 +867,7 @@ static int socks5_update_backpressure(Socks5Client* client) {
         XLOGD("SSH wbuf high water: pausing io_ch reads fd=%d wlen=%zu",
               (int)client->client_sock, client->wlen);
         client->io_recv_paused = true;
-        xpoll_del_event(xchannel_fd(client->io_ch), XPOLL_READABLE);
+        xchannel_pause_read(client->io_ch);
         return 0;
     }
 
@@ -817,7 +875,7 @@ static int socks5_update_backpressure(Socks5Client* client) {
         XLOGD("SSH wbuf low water: resuming io_ch reads fd=%d wlen=%zu",
               (int)client->client_sock, client->wlen);
         client->io_recv_paused = false;
-        if (xchannel_attach(client->io_ch) != 0) {
+        if (xchannel_resume_read(client->io_ch) != 0) {
             socks5_client_fail(client, "resume_read_error");
             return -1;
         }
@@ -1023,9 +1081,8 @@ static bool client_channel_confirm(xhashKey k, void* value, void* channel_ptr) {
                     return false;
                 }
             }
-            if (hash_table) {
-                xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL, ssh_write_cb, NULL, hash_table);
-            }
+            socks5_arm_ssh_writable(ssh_socket, hash_table, 1,
+                                    "channel_confirm_pending_client_data");
         }
         XLOGE("SSH channel confirm connect, fd=%d, host=%s, trycount=%d"
                 , (int)client->client_sock, client->target_host, client->retry_error_count);
@@ -1144,11 +1201,9 @@ static int socks5_forward_client_data_to_ssh(Socks5Client* client,
         return -1;
     }
 
-    if ((client->wlen > 0 || pump.need_write ||
-         wolfSSH_session_has_pending_output(client->ssh_session)) && hash_table) {
-        xpoll_add_event(ssh_socket, XPOLL_WRITABLE, NULL,
-                        ssh_write_cb, NULL, hash_table);
-    }
+    socks5_arm_ssh_writable(ssh_socket, hash_table,
+                            (client->wlen > 0 || pump.need_write),
+                            "client_data_to_ssh");
 
     return 0;
 }
@@ -1287,12 +1342,8 @@ static void client_channel_eof_cb(xChannel* ch, const char* reason, void* ud) {
         pump.need_write = 1;
     }
 
-    if ((pump.need_write || (client->ssh_session &&
-         wolfSSH_session_has_pending_output(client->ssh_session))) &&
-        pump.hash_table) {
-        xpoll_add_event(pump.ssh_socket, XPOLL_WRITABLE,
-                        NULL, ssh_write_cb, NULL, pump.hash_table);
-    }
+    socks5_arm_ssh_writable(pump.ssh_socket, pump.hash_table,
+                            pump.need_write, "client_eof");
 }
 
 static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud) {
@@ -1335,12 +1386,32 @@ static bool socks5_channel_retry_open(Socks5Client *client) {
 
         SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
         xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
-        if (hash_table) {
-            xpoll_add_event(ssh_socket, XPOLL_WRITABLE,
-                            NULL, ssh_write_cb, NULL, hash_table);
-        }
+        socks5_arm_ssh_writable(ssh_socket, hash_table, 1,
+                                "channel_retry_open");
     }
     return true;
+}
+
+/* Download-direction resume: once the client send buffer has drained below the
+ * low water, re-pump the SSH channel (which re-opens the receive window and lets
+ * the remote send again). Runs off the 100 ms update tick rather than an xchannel
+ * callback so it never re-enters xchannel send while a flush is in progress. */
+static void socks5_resume_io_send(Socks5Client* client) {
+    if (!client || !client->io_send_paused) return;
+    if (client->state != SOCKS5_STATE_CONNECTED || !client->io_ch ||
+        xchannel_is_closed(client->io_ch)) {
+        client->io_send_paused = false;
+        return;
+    }
+
+    size_t send_buf = 0;
+    xchannel_get_stats(client->io_ch, &send_buf, NULL, NULL, NULL);
+    if (send_buf > SOCKS5_IO_SEND_LOW_WATER) return;  /* still draining */
+
+    XLOGD("io_ch send low water: resuming SSH reads fd=%d send_buf=%zu",
+          (int)client->client_sock, send_buf);
+    client->io_send_paused = false;
+    socks5_pump_client_read(client);
 }
 
 static bool socks5_client_update_each(xhashKey k, void* value, void* ud) {
@@ -1350,6 +1421,8 @@ static bool socks5_client_update_each(xhashKey k, void* value, void* ud) {
     if (!client) return true;
     if (client->state == SOCKS5_STATE_OPENING) {
         socks5_channel_retry_open(client);
+    } else if (client->io_send_paused) {
+        socks5_resume_io_send(client);
     }
 
     return true;
@@ -1377,7 +1450,7 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData, xPo
         return;
     }
     socket_set_nonblocking(client_sock);
-    socket_set_keepalive(client_sock, 30, 5, 5);
+    // socket_set_keepalive(client_sock, 30, 5, 5);
 
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
@@ -1468,6 +1541,8 @@ void socks5_server_update() {
                 handle_ssh_session_error();
                 return;
             }
+            socks5_arm_ssh_writable(INVALID_SOCKET, NULL, 0,
+                                    "keepalive_pending_output");
         }
         XLOGI("keepalive success %lld", time_get_ms());
 
@@ -1486,6 +1561,9 @@ void socks5_server_update() {
         xhash* hash = (xhash*)xpoll_get_client_data(ssh_sock);
         if(hash) {
             xhash_foreach(hash, socks5_client_update_each, NULL);
+            /* Resuming a paused download can queue WINDOW_ADJUST packets. */
+            socks5_arm_ssh_writable(ssh_sock, hash, 0,
+                                    "update_pending_output");
         }
     }
 }
