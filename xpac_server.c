@@ -27,7 +27,7 @@
 
 // ===================== 域名规则结构 =====================
 typedef struct DomainRule {
-    char pattern[256];            // 域名匹配模式（如 "*.google.com"）
+    char pattern[256];            // 裸域名（如 "google.com"，匹配形态由PAC生成时派生）
     ProxyType proxy_type;         // 代理类型
     struct DomainRule* next;      // 链表下一个节点
 } DomainRule;
@@ -265,9 +265,10 @@ static int xpac_save_config(const char* filename) {
     }
 
     fprintf(fp, "# PAC域名规则配置文件\n");
-    fprintf(fp, "# 格式：域名模式 代理类型(http/socks5)\n");
-    fprintf(fp, "# 示例：*.google.com socks5\n");
-    fprintf(fp, "#        *.github.com http\n");
+    fprintf(fp, "# 格式：域名 代理类型(http/socks5)，存裸域名（子域名/后缀匹配由PAC生成时派生）\n");
+    fprintf(fp, "# 示例：google.com socks5\n");
+    fprintf(fp, "#        github.com http\n");
+    fprintf(fp, "# 兼容旧格式：*.google.com 会自动剥掉 \"*.\" 前缀\n");
     fprintf(fp, "# 白名单格式：@allow 1.2.3.4\n");
     fprintf(fp, "\n");
 
@@ -295,6 +296,18 @@ static int xpac_save_config(const char* filename) {
 }
 
 // ===================== 域名管理API =====================
+/* 规则以裸域名存储（如 "google.com"），PAC 生成时再派生全部匹配形态。
+** 这里剥掉旧格式的 "*." / "." 前缀，让旧配置文件和 "*.google.com" 这类
+** 输入自动迁移，并与 "google.com" 归一到同一条规则。"*"（全匹配）原样保留。 */
+static void xpac_normalize_pattern(const char* pattern, char* out, size_t out_size) {
+    const char* p = pattern ? pattern : "";
+    if (strcmp(p, "*") != 0) {
+        if (p[0] == '*' && p[1] == '.') p += 2;
+        while (p[0] == '.') p++;
+    }
+    snprintf(out, out_size, "%s", p);
+}
+
 static int xpac_add_domain(const char* pattern, ProxyType proxy_type) {
     if (!pattern || !pattern[0]) {
         printf("[PAC] 错误：域名模式为空\n");
@@ -302,31 +315,9 @@ static int xpac_add_domain(const char* pattern, ProxyType proxy_type) {
     }
 
     char formatted_pattern[256] = {0};
-    // 从后向前查找点号
-    const char* p = pattern + strlen(pattern) - 1;
-    const char* second_dot = NULL;
-    while (p >= pattern) {
-        if (*p == '.') {
-            if (!second_dot) {
-                second_dot = p;  // 第一个找到的点号（从后向前）
-            } else {
-                // 找到第二个点号
-                snprintf(formatted_pattern, sizeof(formatted_pattern), "*.%s", p + 1);
-                break;
-            }
-        }
-        p--;
-    }
-
-    // 格式化域名：如果没有通配符前缀，添加 "*."
-    if (formatted_pattern[0]!='*' && strcmp(pattern, "*") != 0 && !(pattern[0] == '*' && pattern[1] == '.')) {
-        // 域名不是 "*" 且不以 "*." 开头，添加 "*." 前缀
-        snprintf(formatted_pattern, sizeof(formatted_pattern), "*.%s", pattern);
+    xpac_normalize_pattern(pattern, formatted_pattern, sizeof(formatted_pattern));
+    if (strcmp(formatted_pattern, pattern) != 0) {
         printf("[PAC] 格式化域名: %s -> %s\n", pattern, formatted_pattern);
-    } else if(formatted_pattern[0]!='*') {
-        // 已经是通配符格式或 "*"，直接使用
-        strncpy(formatted_pattern, pattern, sizeof(formatted_pattern) - 1);
-        formatted_pattern[sizeof(formatted_pattern) - 1] = '\0';
     }
 
     // 验证格式化后的域名
@@ -377,11 +368,15 @@ static int xpac_remove_domain(const char* pattern) {
         return -1;
     }
 
+    /* 接受裸域名和旧的 "*." 格式，统一归一后再查找 */
+    char formatted_pattern[256] = {0};
+    xpac_normalize_pattern(pattern, formatted_pattern, sizeof(formatted_pattern));
+
     DomainRule* prev = NULL;
     DomainRule* current = g_domain_list;
 
     while (current) {
-        if (strcmp(current->pattern, pattern) == 0) {
+        if (strcmp(current->pattern, formatted_pattern) == 0) {
             if (prev) {
                 prev->next = current->next;
             } else {
@@ -543,7 +538,7 @@ static int is_valid_domain_pattern(const char* pattern) {
         }
     }
 
-    // 检查是否至少包含一个点（允许*.example.com）
+    // 检查是否至少包含一个点（"*" 全匹配除外）
     if (strchr(pattern, '.') == NULL && strcmp(pattern, "*") != 0) {
         return 0;
     }
@@ -663,19 +658,19 @@ static char* xpac_generate_pac_content(int pac_type) {
                 port = g_config.http_proxy_port;
             }
 
-            // 生成域名匹配条件
-            if (strncmp(current->pattern, "*.", 2) == 0) {
-                // *.X 模式需同时覆盖：子域名、裸域名 X 本身、
-                // 以及带额外后缀的形态（如 google.com.hk / www.google.com.hk）
-                const char* bare = current->pattern + 2; // 跳过 "*."
+            // 生成域名匹配条件：规则存裸域名 X，这里派生全部匹配形态——
+            // 子域名、X 本身、以及带额外后缀的形态（如 google.com.hk /
+            // www.google.com.hk）。"*"（全匹配）单独处理。
+            if (strcmp(current->pattern, "*") != 0) {
+                const char* bare = current->pattern;
                 pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "    if (shExpMatch(host, \"%s\") ||\n"
+                    "    if (shExpMatch(host, \"*.%s\") ||\n"
                     "        shExpMatch(host, \"%s\") ||\n"
                     "        shExpMatch(host, \"%s.*\") ||\n"
-                    "        shExpMatch(host, \"%s.*\")) {\n"
+                    "        shExpMatch(host, \"*.%s.*\")) {\n"
                     "        return \"%s %s:%d\";\n"
                     "    }\n",
-                    current->pattern, bare, bare, current->pattern, proxy_str, ip, port);
+                    bare, bare, bare, bare, proxy_str, ip, port);
             } else {
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"%s\")) {\n"
@@ -1173,7 +1168,7 @@ static const char* generate_admin_html(void) {
         "        <h2>添加域名规则</h2>\n"
         "        <div class=\"form-group\">\n"
         "            <label for=\"domain\">域名模式:</label>\n"
-        "            <input type=\"text\" id=\"domain\" placeholder=\"例如: *.google.com 或 www.example.com\" \n"
+        "            <input type=\"text\" id=\"domain\" placeholder=\"例如: google.com（自动匹配子域名和后缀）\" \n"
         "                   onkeypress=\"if(event.keyCode=='Enter') addDomain()\">\n"
         "        </div>\n"
         "        <div class=\"form-group\">\n"
