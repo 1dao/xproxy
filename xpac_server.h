@@ -31,6 +31,9 @@ void xpac_uninit(void);
 int xpac_handle_request(SOCKET_T client_sock, const char* req_buf, int req_len);
 int xpac_proxy_client_allowed(const char* client_ip);
 
+/* host 是否命中 @bulk 大流量分流域名（等于或以 ".域名" 结尾） */
+int xpac_is_bulk_domain(const char* host);
+
 #ifdef __cplusplus
 }
 #endif

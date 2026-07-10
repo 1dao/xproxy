@@ -79,8 +79,60 @@ typedef enum {
 
 static Socks5ServerConfig g_server_config;
 static int g_server_running = 0;
-static WOLFSSH *g_ssh_session = NULL;
+
+/* 两条到同一服务器的 SSH 会话：MAIN 走普通流量，BULK 走 @bulk 命中的
+ * 大流量域名（视频/下载）。大流量把自己那条 TCP 连接灌满时，MAIN 上的
+ * 新通道建立和小流量不再排在它后面。BULK 创建失败或断开时回退 MAIN，
+ * 更新 tick 里按需重建。 */
+enum { SSH_SLOT_MAIN = 0, SSH_SLOT_BULK = 1, SSH_SLOT_COUNT = 2 };
+typedef struct {
+    WOLFSSH* session;
+    const char* name;
+} SshSessionSlot;
+static SshSessionSlot g_ssh_slots[SSH_SLOT_COUNT] = {
+    { NULL, "main" },
+    { NULL, "bulk" },
+};
 static SOCKET_T g_listen_sock = INVALID_SOCKET;
+
+static WOLFSSH* socks5_main_session(void) {
+    return g_ssh_slots[SSH_SLOT_MAIN].session;
+}
+
+/* 会话指针 -> 槽位；也用来校验一个 client 记下的会话指针是否仍然存活
+ * （会话销毁重建后 client->ssh_session 可能悬空）。 */
+static SshSessionSlot* socks5_slot_for_session(WOLFSSH* session) {
+    if (!session) return NULL;
+    for (int i = 0; i < SSH_SLOT_COUNT; i++) {
+        if (g_ssh_slots[i].session == session) return &g_ssh_slots[i];
+    }
+    return NULL;
+}
+
+static SshSessionSlot* socks5_slot_for_socket(SOCKET_T fd) {
+    if (fd == INVALID_SOCKET) return NULL;
+    for (int i = 0; i < SSH_SLOT_COUNT; i++) {
+        if (g_ssh_slots[i].session &&
+            wolfSSH_session_get_socket(g_ssh_slots[i].session) == fd) {
+            return &g_ssh_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static WOLFSSH* socks5_session_for_socket(SOCKET_T fd) {
+    SshSessionSlot* slot = socks5_slot_for_socket(fd);
+    return slot ? slot->session : NULL;
+}
+
+/* CONNECT 时按目标域名选会话：@bulk 命中且 BULK 存活走 BULK，否则 MAIN。 */
+static WOLFSSH* socks5_pick_session(const char* host) {
+    if (host && g_ssh_slots[SSH_SLOT_BULK].session &&
+        xpac_is_bulk_domain(host)) {
+        return g_ssh_slots[SSH_SLOT_BULK].session;
+    }
+    return socks5_main_session();
+}
 
 static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
 static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg);
@@ -92,19 +144,15 @@ static void client_channel_eof_cb(xChannel* ch, const char* reason, void* ud);
 
 static int socks5_arm_ssh_writable(SOCKET_T ssh_socket, xhash* hash_table,
                                    int force, const char* reason) {
-    if (!g_ssh_session) return 0;
-
-    if (ssh_socket == INVALID_SOCKET) {
-        ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
-    }
-    if (ssh_socket == INVALID_SOCKET) return 0;
+    WOLFSSH* session = socks5_session_for_socket(ssh_socket);
+    if (!session) return 0;
 
     if (!hash_table) {
         hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
     }
     if (!hash_table) return 0;
 
-    if (!force && !wolfSSH_session_has_pending_output(g_ssh_session)) {
+    if (!force && !wolfSSH_session_has_pending_output(session)) {
         return 0;
     }
 
@@ -121,10 +169,14 @@ static int socks5_arm_ssh_writable(SOCKET_T ssh_socket, xhash* hash_table,
 }
 
 static int socks5_active_connections(void) {
-    if (!g_ssh_session) return 0;
-    SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
-    xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
-    return hash_table ? (int)xhash_size(hash_table) : 0;
+    int total = 0;
+    for (int i = 0; i < SSH_SLOT_COUNT; i++) {
+        if (!g_ssh_slots[i].session) continue;
+        SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_slots[i].session);
+        xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
+        if (hash_table) total += (int)xhash_size(hash_table);
+    }
+    return total;
 }
 
 static bool socks5_userpass_configured(void) {
@@ -390,9 +442,9 @@ UNUSED_FUNCTION static int socks5_accout_auth(Socks5Client* client) {
 // static size_t client_channel_packet_cb(xChannel* ch, const char* data, size_t len, void* ud);
 // static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud);
 static int socks5_client_stage(Socks5Client* client) {
-    if (!client || !g_ssh_session) return -1;
+    if (!client || !client->ssh_session) return -1;
 
-    SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
     xhash *hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
     if (!hash_table) {
         XLOGE("SSH hash table missing, cannot stage client fd=%d", (int)client->client_sock);
@@ -415,6 +467,31 @@ static int socks5_client_stage(Socks5Client* client) {
         XLOGD("SSH socket fd=%d added to XPOLL_ALL event", (int)ssh_socket);
     }
 
+    return 0;
+}
+
+/* 把 client 从当前会话的哈希表迁到 target 会话（CONNECT 时按域名分流）。
+ * 先加入新表再从旧表摘除，失败则原样留在旧会话上。 */
+static int socks5_client_restage(Socks5Client* client, WOLFSSH* target) {
+    if (!client || !target || client->ssh_session == target) return 0;
+
+    WOLFSSH* old_session = client->ssh_session;
+    client->ssh_session = target;
+    if (socks5_client_stage(client) != 0) {
+        client->ssh_session = old_session;
+        return -1;
+    }
+
+    if (socks5_slot_for_session(old_session)) {
+        SOCKET_T old_socket = wolfSSH_session_get_socket(old_session);
+        xhash* old_hash = (xhash*)xpoll_get_client_data(old_socket);
+        if (old_hash) {
+            xhash_remove_int(old_hash, (long)client->client_sock, false);
+            if (xhash_size(old_hash) <= 0) {
+                xpoll_del_event(old_socket, XPOLL_READABLE);
+            }
+        }
+    }
     return 0;
 }
 
@@ -618,9 +695,24 @@ static int socks5_consume_request(Socks5Client* client, const uint8_t* buf,
         strncpy(client->target_host, target_host, sizeof(client->target_host) - 1);
         client->target_host[sizeof(client->target_host) - 1] = '\0';
         client->target_port = target_port;
+    }
 
-        XLOGI("SOCKS5 CONNECT -> %s:%d, fd=%d",
-              target_host, target_port, (int)client->client_sock);
+    /* 按目标域名分流：@bulk 命中走 BULK 会话，其余走 MAIN。accept 时挂在
+     * MAIN 上，这里才知道目标域名，需要时把 client 迁到 BULK 的哈希表。 */
+    {
+        WOLFSSH* want = socks5_pick_session(client->target_host);
+        if (want && want != client->ssh_session &&
+            socks5_client_restage(client, want) != 0) {
+            XLOGE("Failed to restage client fd=%d to bulk session, using main",
+                  (int)client->client_sock);
+        }
+    }
+
+    {
+        SshSessionSlot* slot = socks5_slot_for_session(client->ssh_session);
+        XLOGI("SOCKS5 CONNECT -> %s:%d, fd=%d via=%s",
+              client->target_host, client->target_port,
+              (int)client->client_sock, slot ? slot->name : "none");
     }
 
     if (!client->ssh_session) {
@@ -647,8 +739,9 @@ void socks5_client_free(Socks5Client* client) {
     }
 
     // Only close channel if it's not already EOF and session is valid
-    if (client->ssh_channel && g_ssh_session &&
-        client->ssh_session == g_ssh_session ) {
+    // (slot lookup also filters dangling pointers to destroyed sessions)
+    if (client->ssh_channel &&
+        socks5_slot_for_session(client->ssh_session)) {
         WOLFSSH *ssh_session = client->ssh_session;
         SOCKET_T ssh_socket = wolfSSH_session_get_socket(ssh_session);
         wolfSSH_channel_close(client->ssh_channel);
@@ -673,8 +766,10 @@ static void socks5_client_cleanup(SOCKET_T fd, Socks5Client *client) {
         xpoll_del_event(key_fd, XPOLL_ALL);
     }
 
-    if (g_ssh_session && key_fd != INVALID_SOCKET) {
-        SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
+    /* 从 client 所在会话的哈希表摘除；会话已销毁重建时 slot 查不到，
+     * 哈希表也随会话销毁了，无需处理。 */
+    if (socks5_slot_for_session(client->ssh_session) && key_fd != INVALID_SOCKET) {
+        SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
         xhash* hash = xpoll_get_client_data(ssh_socket);
 
         if (hash) {
@@ -696,13 +791,14 @@ static void socks5_client_cleanup(SOCKET_T fd, Socks5Client *client) {
 static int ssh_process_session_events(SOCKET_T fd, void *clientData, const char *where) {
     enum { SSH_EVENT_DRAIN_LIMIT = 64 };
 
-    if (!g_ssh_session) return -1;
+    WOLFSSH* session = socks5_session_for_socket(fd);
+    if (!session) return -1;
 
     for (int i = 0; i < SSH_EVENT_DRAIN_LIMIT; i++) {
         word32 channelId = 0;
-        int ret = wolfSSH_process_events(g_ssh_session, &channelId);
+        int ret = wolfSSH_process_events(session, &channelId);
         if (ret < 0) {
-            int error = wolfSSH_get_error(g_ssh_session);
+            int error = wolfSSH_get_error(session);
             if (wolfSSH_check_fatal(error)) {
                 XLOGE("wolfSSH_process_events fatal on %s: %d:%s",
                       where, error, wolfSSH_ErrorToName(error));
@@ -716,7 +812,7 @@ static int ssh_process_session_events(SOCKET_T fd, void *clientData, const char 
             }
         }
 
-        if (!wolfSSH_session_has_buffered_input(g_ssh_session)) {
+        if (!wolfSSH_session_has_buffered_input(session)) {
             return 0;
         }
     }
@@ -999,7 +1095,8 @@ static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
 static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
     (void)submit_arg;
     xhash *hash_table = (xhash*)clientData;
-    if (!hash_table || !g_ssh_session)
+    WOLFSSH* session = socks5_session_for_socket(fd);
+    if (!hash_table || !session)
         return;
 
     static int _call_count = 0;
@@ -1018,7 +1115,7 @@ static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *
         SshWritePumpCtx pump = { fd, hash_table, 0, 0, 0 };
         xhash_foreach(hash_table, ssh_write_each_client, &pump);
 
-        if (wolfSSH_session_has_pending_output(g_ssh_session)) {
+        if (wolfSSH_session_has_pending_output(session)) {
             pump.need_write = 1;
             if (ssh_process_session_events(fd, clientData, "write-pump") != 0)
                 return;
@@ -1037,7 +1134,7 @@ static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *
               (int)fd, total_bytes_written, last_need_write);
     }
 
-    if (!wolfSSH_session_has_pending_output(g_ssh_session) && last_need_write == 0)
+    if (!wolfSSH_session_has_pending_output(session) && last_need_write == 0)
         xpoll_del_event(fd, XPOLL_WRITABLE);
 }
 
@@ -1136,9 +1233,12 @@ static int ssh_channel_close_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
 static int ssh_channel_open_fini_callback(WOLFSSH_CHANNEL* channel, void* ctx) {
     XLOGI("ssh channel opened:%p", channel);
     xhash* hash = (xhash*)ctx;
-    BOOL miss = TRUE;
-    if (hash)
-        miss = xhash_foreach(hash, client_channel_confirm, channel);
+    /* ctx（每会话的 client 哈希）还没注册：这是 wolfSSH_connect 握手期间
+     * 内部打开的 session 通道（回调挂在共享 CTX 上，任何在建会话都会触发）。
+     * 千万不能 ChannelExit——那会杀掉握手用的通道，导致连接失败。 */
+    if (!hash) return WS_SUCCESS;
+
+    BOOL miss = xhash_foreach(hash, client_channel_confirm, channel);
     if (miss) {
         XLOGE("ssh_channel_open_fini_callback: no matching client for channel %p", channel);
         wolfSSH_ChannelExit(channel);
@@ -1163,18 +1263,24 @@ static void ssh_error_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *
         return;
     }
 
-    XLOGE("ssh_error_cb called (fd=%d)", (int)fd);
-
-    xhash_foreach(hash_table, client_on_closed, NULL);
-    socks5_destroy_shared_session(g_ssh_session);
-    g_ssh_session = NULL;
-
-    g_ssh_session = socks5_create_shared_session(&g_server_config);
-    if (!g_ssh_session) {
-        XLOGE("ReCreating failed to create shared SSH session");
+    SshSessionSlot* slot = socks5_slot_for_socket(fd);
+    if (!slot) {
+        XLOGE("ssh_error_cb: no session slot for fd=%d", (int)fd);
         return;
     }
-    XLOGW("ReCreating shared SSH session created successfully");
+
+    XLOGE("ssh_error_cb called (fd=%d, slot=%s)", (int)fd, slot->name);
+
+    xhash_foreach(hash_table, client_on_closed, NULL);
+    socks5_destroy_shared_session(slot->session);
+    slot->session = NULL;
+
+    slot->session = socks5_create_shared_session(&g_server_config);
+    if (!slot->session) {
+        XLOGE("ReCreating failed to create shared SSH session (%s)", slot->name);
+        return;
+    }
+    XLOGW("ReCreating shared SSH session created successfully (%s)", slot->name);
 }
 
 static int socks5_forward_client_data_to_ssh(Socks5Client* client,
@@ -1471,7 +1577,8 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData, xPo
     memset(client, 0, sizeof(Socks5Client));
     client->client_sock = client_sock;
     client->state = SOCKS5_STATE_INIT;
-    client->ssh_session = g_ssh_session;
+    /* 先挂在 MAIN 上；CONNECT 解析出目标域名后再按 @bulk 分流迁移 */
+    client->ssh_session = socks5_main_session();
     if (!client->ssh_session) {
         XLOGE("SSH session not ready, reject client socket=%d", (int)client_sock);
         socks5_client_free(client);
@@ -1519,8 +1626,9 @@ static void accept_cb_single(SOCKET_T listen_fd, int mask, void *clientData, xPo
     XLOGD("New client registered, active connections: %d", socks5_active_connections());
 }
 
-static void handle_ssh_session_error() {
-    SOCKET_T ssh_socket = wolfSSH_session_get_socket(g_ssh_session);
+static void handle_ssh_session_error(SshSessionSlot* slot) {
+    if (!slot || !slot->session) return;
+    SOCKET_T ssh_socket = wolfSSH_session_get_socket(slot->session);
     xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
     if (hash_table) {
         ssh_error_cb(ssh_socket, XPOLL_ERROR | XPOLL_CLOSE, hash_table, NULL);
@@ -1533,31 +1641,37 @@ void socks5_server_update() {
     long64 now_sec = now_ms/1000;
     if (now_sec - last_keepalive >= 15) {
         last_keepalive = now_sec;
-        if (g_ssh_session) {
-            // wolfSSH doesn't have direct keepalive, send ignore packet instead
-            int rc = wolfSSH_session_keepalive(g_ssh_session);
-            if (rc < 0) {
-                XLOGE("keepalive error: %d", rc);
-                handle_ssh_session_error();
-                return;
+        for (int i = 0; i < SSH_SLOT_COUNT; i++) {
+            SshSessionSlot* slot = &g_ssh_slots[i];
+            if (slot->session) {
+                // wolfSSH doesn't have direct keepalive, send ignore packet instead
+                int rc = wolfSSH_session_keepalive(slot->session);
+                if (rc < 0) {
+                    XLOGE("keepalive error: %d (%s)", rc, slot->name);
+                    handle_ssh_session_error(slot);
+                    continue;
+                }
+                socks5_arm_ssh_writable(wolfSSH_session_get_socket(slot->session),
+                                        NULL, 0, "keepalive_pending_output");
+                XLOGI("keepalive success %lld (%s)", time_get_ms(), slot->name);
             }
-            socks5_arm_ssh_writable(INVALID_SOCKET, NULL, 0,
-                                    "keepalive_pending_output");
-        }
-        XLOGI("keepalive success %lld", time_get_ms());
 
-        if(!g_ssh_session) {
-            g_ssh_session = socks5_create_shared_session(&g_server_config);
-            if (!g_ssh_session) {
-                XLOGE("ReCreating failed to create shared SSH session");
-                return;
+            if (!slot->session) {
+                slot->session = socks5_create_shared_session(&g_server_config);
+                if (!slot->session) {
+                    XLOGE("ReCreating failed to create shared SSH session (%s)",
+                          slot->name);
+                    continue;
+                }
+                XLOGW("ReCreating shared SSH session created successfully (%s)",
+                      slot->name);
             }
-            XLOGW("ReCreating shared SSH session created successfully");
         }
     }
 
-    if (g_ssh_session) {
-        SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_session);
+    for (int i = 0; i < SSH_SLOT_COUNT; i++) {
+        if (!g_ssh_slots[i].session) continue;
+        SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_slots[i].session);
         xhash* hash = (xhash*)xpoll_get_client_data(ssh_sock);
         if(hash) {
             xhash_foreach(hash, socks5_client_update_each, NULL);
@@ -1592,11 +1706,20 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     }
     XLOGI("Shared SSH session created successfully");
 
+    /* BULK 会话尽力创建：失败只降级为全部走 MAIN，更新 tick 里会重试 */
+    WOLFSSH *bulk_session = socks5_create_shared_session(config);
+    if (bulk_session) {
+        XLOGI("Bulk SSH session created successfully");
+    } else {
+        XLOGW("Failed to create bulk SSH session, bulk domains fall back to main");
+    }
+
     // Create listening socket
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listen_sock == INVALID_SOCKET) {
         XLOGE("listen socket creation failed");
         socks5_destroy_shared_session(ssh_session);
+        socks5_destroy_shared_session(bulk_session);
         return -1;
     }
 
@@ -1615,6 +1738,7 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     if (bind(g_listen_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         XLOGE("bind failed");
         socks5_destroy_shared_session(ssh_session);
+        socks5_destroy_shared_session(bulk_session);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
         return -1;
@@ -1624,6 +1748,7 @@ int socks5_server_start(const Socks5ServerConfig* config) {
     if (listen(g_listen_sock, SOMAXCONN) < 0) {
         XLOGE("listen failed");
         socks5_destroy_shared_session(ssh_session);
+        socks5_destroy_shared_session(bulk_session);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
         return -1;
@@ -1634,13 +1759,15 @@ int socks5_server_start(const Socks5ServerConfig* config) {
                         accept_cb_single, NULL, NULL, NULL) != 0) {
         XLOGE("Failed to register listen socket event");
         socks5_destroy_shared_session(ssh_session);
+        socks5_destroy_shared_session(bulk_session);
         CLOSE_SOCKET(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
         return -1;
     }
 
-    // Set shared SSH session
-    g_ssh_session = ssh_session;
+    // Set shared SSH sessions
+    g_ssh_slots[SSH_SLOT_MAIN].session = ssh_session;
+    g_ssh_slots[SSH_SLOT_BULK].session = bulk_session;
 
     // Set server running flag
     g_server_running = 1;
@@ -1666,16 +1793,17 @@ void socks5_server_stop(void) {
         XLOGI("SOCKS5 listening socket closed");
     }
 
-    if( g_ssh_session ) {
-        SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_session);
+    for (int i = 0; i < SSH_SLOT_COUNT; i++) {
+        if (!g_ssh_slots[i].session) continue;
+        SOCKET_T ssh_sock = wolfSSH_session_get_socket(g_ssh_slots[i].session);
         xhash* hash = (xhash*)xpoll_get_client_data(ssh_sock);
         if(hash) {
             xhash_foreach(hash, client_on_closed, NULL);
         }
-        socks5_destroy_shared_session(g_ssh_session);
+        socks5_destroy_shared_session(g_ssh_slots[i].session);
+        g_ssh_slots[i].session = NULL;
     }
 
     g_server_running = 0;
-    g_ssh_session = NULL;
     XLOGW("[socks5] socks5 service stoped");
 }

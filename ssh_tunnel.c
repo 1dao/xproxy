@@ -21,6 +21,7 @@
 #endif
 
 static int wolf_ssh_initialized = 0;
+static int g_ssh_session_count = 0;   /* 存活会话数，共享 g_ssh_ctx 的引用计数 */
 static WOLFSSH_CTX* g_ssh_ctx = NULL;
 inline static int is_temporary_state(int error_code);
 
@@ -173,6 +174,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     }
     printf("[DEBUG] 15. Connected!\n");
 
+    g_ssh_session_count++;
     return ssh;
 }
 
@@ -189,6 +191,11 @@ void wolfSSH_session_close(WOLFSSH* ssh) {
     if (sock != INVALID_SOCKET) {
         CLOSE_SOCKET(sock);
     }
+
+    /* g_ssh_ctx 是所有会话共享的，只有最后一条会话关闭时才能清理，
+     * 否则另一条还活着的会话会踩到已释放的 CTX。 */
+    if (g_ssh_session_count > 0) g_ssh_session_count--;
+    if (g_ssh_session_count > 0) return;
 
     if (wolf_ssh_initialized) {
         wolfSSH_Cleanup();

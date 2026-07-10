@@ -37,6 +37,13 @@ typedef struct AllowIpRule {
     struct AllowIpRule* next;
 } AllowIpRule;
 
+/* 大流量分流域名（@bulk）：命中的目标域名走独立的 SSH 会话，
+** 避免视频/下载流量把主会话的 TCP 连接灌满、阻塞新通道建立。 */
+typedef struct BulkDomainRule {
+    char domain[256];             // 裸域名，后缀匹配（如 "googlevideo.com"）
+    struct BulkDomainRule* next;
+} BulkDomainRule;
+
 // ===================== 全局变量 =====================
 static XpacConfig g_config = {
     .http_proxy_port = 7890,
@@ -53,6 +60,8 @@ static DomainRule* g_domain_list = NULL;  // 域名规则链表头
 static int g_domain_count = 0;            // 域名规则数量
 static AllowIpRule* g_allow_ip_list = NULL;
 static int g_allow_ip_count = 0;
+static BulkDomainRule* g_bulk_domain_list = NULL;
+static int g_bulk_domain_count = 0;
 static int g_initialized = 0;             // 是否已初始化
 
 // ===================== 内部工具函数声明 =====================
@@ -73,6 +82,8 @@ static int xpac_remove_domain(const char* pattern);
 static void xpac_clear_domains(void);
 static int xpac_add_allow_ip(const char* ip);
 static int xpac_remove_allow_ip(const char* ip);
+static int xpac_add_bulk_domain(const char* domain);
+static void free_bulk_domain_list(void);
 
 // ===================== 初始化函数 =====================
 void xpac_init(const XpacConfig* config) {
@@ -119,6 +130,9 @@ void xpac_uninit(void) {
     free_allow_ip_list();
     g_allow_ip_list = NULL;
     g_allow_ip_count = 0;
+    free_bulk_domain_list();
+    g_bulk_domain_list = NULL;
+    g_bulk_domain_count = 0;
 }
 
 // ===================== 配置文件管理 =====================
@@ -140,12 +154,16 @@ static int xpac_load_config(const char* filename) {
     int old_count = g_domain_count;
     AllowIpRule* old_allow_list = g_allow_ip_list;
     int old_allow_count = g_allow_ip_count;
+    BulkDomainRule* old_bulk_list = g_bulk_domain_list;
+    int old_bulk_count = g_bulk_domain_count;
 
     // 清空当前列表
     g_domain_list = NULL;
     g_domain_count = 0;
     g_allow_ip_list = NULL;
     g_allow_ip_count = 0;
+    g_bulk_domain_list = NULL;
+    g_bulk_domain_count = 0;
 
     char line[512];
     int line_num = 0;
@@ -187,6 +205,19 @@ static int xpac_load_config(const char* filename) {
             continue;
         }
 
+        if (strncmp(trimmed, "@bulk", 5) == 0) {
+            char domain[256];
+            if (sscanf(trimmed + 5, "%255s", domain) == 1) {
+                if (xpac_add_bulk_domain(domain) == 0)
+                    success_count++;
+                else
+                    printf("[PAC] 警告：第%d行分流域名解析失败: %s\n", line_num, trimmed);
+            } else {
+                printf("[PAC] 警告：第%d行分流域名格式无效: %s\n", line_num, trimmed);
+            }
+            continue;
+        }
+
         // 解析格式：域名模式 代理类型
         char pattern[256];
         char type_str[32];
@@ -218,6 +249,9 @@ static int xpac_load_config(const char* filename) {
         free_allow_ip_list();
         g_allow_ip_list = old_allow_list;
         g_allow_ip_count = old_allow_count;
+        free_bulk_domain_list();
+        g_bulk_domain_list = old_bulk_list;
+        g_bulk_domain_count = old_bulk_count;
         printf("[PAC] 配置文件未包含有效规则: %s\n", filename);
         return -1;
     } else {
@@ -234,8 +268,14 @@ static int xpac_load_config(const char* filename) {
             free(allow_current);
             allow_current = next;
         }
-        printf("[PAC] 成功从配置文件加载 %d 条规则，%d 个白名单IP: %s\n",
-               success_count, g_allow_ip_count, filename);
+        BulkDomainRule* bulk_current = old_bulk_list;
+        while (bulk_current) {
+            BulkDomainRule* next = bulk_current->next;
+            free(bulk_current);
+            bulk_current = next;
+        }
+        printf("[PAC] 成功从配置文件加载 %d 条规则，%d 个白名单IP，%d 个分流域名: %s\n",
+               success_count, g_allow_ip_count, g_bulk_domain_count, filename);
         return 0;
     }
 }
@@ -270,6 +310,7 @@ static int xpac_save_config(const char* filename) {
     fprintf(fp, "#        github.com http\n");
     fprintf(fp, "# 兼容旧格式：*.google.com 会自动剥掉 \"*.\" 前缀\n");
     fprintf(fp, "# 白名单格式：@allow 1.2.3.4\n");
+    fprintf(fp, "# 大流量分流：@bulk googlevideo.com（命中域名走独立SSH会话）\n");
     fprintf(fp, "\n");
 
     AllowIpRule* allow = g_allow_ip_list;
@@ -278,6 +319,15 @@ static int xpac_save_config(const char* filename) {
         allow = allow->next;
     }
     if (g_allow_ip_count > 0) {
+        fprintf(fp, "\n");
+    }
+
+    BulkDomainRule* bulk = g_bulk_domain_list;
+    while (bulk) {
+        fprintf(fp, "@bulk %s\n", bulk->domain);
+        bulk = bulk->next;
+    }
+    if (g_bulk_domain_count > 0) {
         fprintf(fp, "\n");
     }
 
@@ -290,8 +340,8 @@ static int xpac_save_config(const char* filename) {
     }
 
     fclose(fp);
-    printf("[PAC] 成功保存 %d 条规则，%d 个白名单IP到配置文件: %s\n",
-           g_domain_count, g_allow_ip_count, filename);
+    printf("[PAC] 成功保存 %d 条规则，%d 个白名单IP，%d 个分流域名到配置文件: %s\n",
+           g_domain_count, g_allow_ip_count, g_bulk_domain_count, filename);
     return 0;
 }
 
@@ -468,6 +518,78 @@ static int xpac_remove_allow_ip(const char* ip) {
 
     printf("[PAC] 未找到白名单IP: %s\n", ip);
     return -1;
+}
+
+static BulkDomainRule* find_bulk_domain_rule(const char* domain) {
+    BulkDomainRule* current = g_bulk_domain_list;
+    while (current) {
+        if (strcasecmp(current->domain, domain) == 0)
+            return current;
+        current = current->next;
+    }
+    return NULL;
+}
+
+static int xpac_add_bulk_domain(const char* domain) {
+    if (!domain || !domain[0]) {
+        printf("[PAC] 错误：分流域名为空\n");
+        return -1;
+    }
+
+    char normalized[256] = {0};
+    xpac_normalize_pattern(domain, normalized, sizeof(normalized));
+    if (!is_valid_domain_pattern(normalized) || strcmp(normalized, "*") == 0) {
+        printf("[PAC] 错误：分流域名无效: %s\n", domain);
+        return -1;
+    }
+
+    if (find_bulk_domain_rule(normalized)) {
+        printf("[PAC] 分流域名已存在: %s\n", normalized);
+        return 0;
+    }
+
+    BulkDomainRule* rule = (BulkDomainRule*)malloc(sizeof(BulkDomainRule));
+    if (!rule) {
+        printf("[PAC] 错误：分流域名内存分配失败\n");
+        return -1;
+    }
+
+    strncpy(rule->domain, normalized, sizeof(rule->domain) - 1);
+    rule->domain[sizeof(rule->domain) - 1] = '\0';
+    rule->next = g_bulk_domain_list;
+    g_bulk_domain_list = rule;
+    g_bulk_domain_count++;
+
+    XLOGI("[PAC] 添加大流量分流域名: %s", normalized);
+    return 0;
+}
+
+static void free_bulk_domain_list(void) {
+    BulkDomainRule* current = g_bulk_domain_list;
+    while (current) {
+        BulkDomainRule* next = current->next;
+        free(current);
+        current = next;
+    }
+}
+
+/* host 是否命中 @bulk 分流域名：等于该域名，或以 ".域名" 结尾。 */
+int xpac_is_bulk_domain(const char* host) {
+    if (!host || !host[0]) return 0;
+    size_t hlen = strlen(host);
+    BulkDomainRule* rule = g_bulk_domain_list;
+    while (rule) {
+        size_t dlen = strlen(rule->domain);
+        if (dlen > 0 && dlen <= hlen) {
+            const char* tail = host + (hlen - dlen);
+            if (strcasecmp(tail, rule->domain) == 0 &&
+                (hlen == dlen || tail[-1] == '.')) {
+                return 1;
+            }
+        }
+        rule = rule->next;
+    }
+    return 0;
 }
 
 static void xpac_clear_domains(void) {

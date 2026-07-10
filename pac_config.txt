@@ -4,6 +4,16 @@
 #        github.com http
 # 兼容旧格式：*.google.com 会自动剥掉 "*." 前缀
 # 白名单格式：@allow 1.2.3.4
+# 大流量分流：@bulk googlevideo.com（命中域名走独立SSH会话）
+
+@bulk googlevideo.com
+@bulk c.youtube.com
+@bulk ytimg.com
+@bulk video.twimg.com
+@bulk tiktokcdn.com
+@bulk tiktokcdn-us.com
+@bulk nflxvideo.net
+@bulk download.amd.com
 
 huggingface.co socks5
 todesktop.com socks5
