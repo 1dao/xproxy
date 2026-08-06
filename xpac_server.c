@@ -73,6 +73,8 @@ static void free_allow_ip_list(void);
 static int parse_proxy_type(const char* type_str);
 static const char* proxy_type_to_str(ProxyType type);
 static int xpac_load_config(const char* filename);
+static int parse_config_line(char* line, int line_num);
+static int xpac_load_builtin_config(void);
 static int xpac_save_config(const char* filename);
 static const char* get_pac_proxy_address(void);
 
@@ -112,13 +114,17 @@ void xpac_init(const XpacConfig* config) {
     printf("[PAC] 代理白名单: %s\n",
            g_config.enable_proxy_whitelist ? "启用" : "禁用");
 
-    // 尝试加载配置文件
+    // 尝试加载配置文件；失败时回退到 exe 内置的默认规则
     if (g_config.config_file) {
         if (xpac_load_config(g_config.config_file) == 0) {
             printf("[PAC] 已从配置文件加载域名规则: %s\n", g_config.config_file);
         } else {
-            printf("[PAC] 未找到配置文件或配置文件为空: %s\n", g_config.config_file);
+            printf("[PAC] 未找到配置文件或配置文件为空: %s，使用内置默认规则\n",
+                   g_config.config_file);
+            xpac_load_builtin_config();
         }
+    } else {
+        xpac_load_builtin_config();
     }
 
     g_initialized = 1;
@@ -136,6 +142,190 @@ void xpac_uninit(void) {
 }
 
 // ===================== 配置文件管理 =====================
+// 解析一行配置（会就地修改 line），成功添加一条规则返回 1，否则 0
+static int parse_config_line(char* line, int line_num) {
+    // 跳过空行和注释行
+    char* trimmed = line;
+    while (*trimmed && isspace((unsigned char)*trimmed)) trimmed++;
+    if (*trimmed == '#' || *trimmed == ';' || *trimmed == '\0') {
+        return 0;
+    }
+
+    // 移除行尾换行符和回车符
+    char* newline = strchr(trimmed, '\n');
+    if (newline) {
+        *newline = '\0';
+        if (newline > trimmed && *(newline - 1) == '\r') {
+            *(newline - 1) = '\0';
+        }
+    }
+    char* cr = strchr(trimmed, '\r');
+    if (cr) *cr = '\0';
+
+    if (strncmp(trimmed, "@allow", 6) == 0) {
+        char ip[64];
+        if (sscanf(trimmed + 6, "%63s", ip) == 1) {
+            if (xpac_add_allow_ip(ip) == 0)
+                return 1;
+            printf("[PAC] 警告：第%d行白名单解析失败: %s\n", line_num, trimmed);
+        } else {
+            printf("[PAC] 警告：第%d行白名单格式无效: %s\n", line_num, trimmed);
+        }
+        return 0;
+    }
+
+    if (strncmp(trimmed, "@bulk", 5) == 0) {
+        char domain[256];
+        if (sscanf(trimmed + 5, "%255s", domain) == 1) {
+            if (xpac_add_bulk_domain(domain) == 0)
+                return 1;
+            printf("[PAC] 警告：第%d行分流域名解析失败: %s\n", line_num, trimmed);
+        } else {
+            printf("[PAC] 警告：第%d行分流域名格式无效: %s\n", line_num, trimmed);
+        }
+        return 0;
+    }
+
+    // 解析格式：域名模式 代理类型
+    char pattern[256];
+    char type_str[32];
+    int parsed = sscanf(trimmed, "%255s %31s", pattern, type_str);
+
+    if (parsed == 2) {
+        ProxyType proxy_type = parse_proxy_type(type_str);
+        if (xpac_add_domain(pattern, proxy_type) == 0)
+            return 1;
+        printf("[PAC] 警告：第%d行解析失败: %s\n", line_num, trimmed);
+    } else if (parsed == 1) {
+        // 只指定域名，使用默认代理类型
+        if (xpac_add_domain(pattern, PROXY_TYPE_HTTP) == 0)
+            return 1;
+    } else {
+        printf("[PAC] 警告：第%d行格式无效: %s\n", line_num, trimmed);
+    }
+    return 0;
+}
+
+// exe 内置的默认 PAC 规则（与 pac_config.txt 同格式，注释行已去除；
+// 更新预置规则时同步维护这里和 pac_config.txt）
+static const char PAC_BUILTIN_CONFIG[] =
+    "@bulk googlevideo.com\n"
+    "@bulk c.youtube.com\n"
+    "@bulk ytimg.com\n"
+    "@bulk video.twimg.com\n"
+    "@bulk tiktokcdn.com\n"
+    "@bulk tiktokcdn-us.com\n"
+    "@bulk nflxvideo.net\n"
+    "@bulk download.amd.com\n"
+    "huggingface.co socks5\n"
+    "todesktop.com socks5\n"
+    "cursor-cdn.com socks5\n"
+    "cursor.sh socks5\n"
+    "cursor.com socks5\n"
+    "facebook.net socks5\n"
+    "intellimizeio.com socks5\n"
+    "anthropic.com socks5\n"
+    "amplitude.com socks5\n"
+    "unpkg.com socks5\n"
+    "jsdelivr.net socks5\n"
+    "cloudfront.net socks5\n"
+    "intellimize.co socks5\n"
+    "intercom.io socks5\n"
+    "website-files.com socks5\n"
+    "claude.com socks5\n"
+    "claude.ai socks5\n"
+    "android.com socks5\n"
+    "truthsocial.com socks5\n"
+    "manus.im socks5\n"
+    "ytimg.com socks5\n"
+    "cdninstagram.com socks5\n"
+    "instagram.com socks5\n"
+    "telegram.org socks5\n"
+    "telegram5.org socks5\n"
+    "telegramjq.com socks5\n"
+    "discord.com socks5\n"
+    "discord.gg socks5\n"
+    "reddit.com socks5\n"
+    "redd.it socks5\n"
+    "redditmedia.com socks5\n"
+    "redditstatic.com socks5\n"
+    "redditspace.com socks5\n"
+    "googletagmanager.com socks5\n"
+    "google.com socks5\n"
+    "antigravity.google socks5\n"
+    "google-analytics.com socks5\n"
+    "googleapis.com socks5\n"
+    "googlecode.com socks5\n"
+    "googleearth.com socks5\n"
+    "panoramio.com socks5\n"
+    "googlevideo.com socks5\n"
+    "googleusercontent.com socks5\n"
+    "1e100.net socks5\n"
+    "ggpht.com socks5\n"
+    "oaistatic.com socks5\n"
+    "cloudflare.com socks5\n"
+    "chatgpt.com socks5\n"
+    "openai.com socks5\n"
+    "gmail.com socks5\n"
+    "gstatic.com socks5\n"
+    "wikipedia.org socks5\n"
+    "sf.net socks5\n"
+    "sourceforge.net socks5\n"
+    "githubusercontent.com socks5\n"
+    "github.io socks5\n"
+    "github.com socks5\n"
+    "githubassets.com socks5\n"
+    "githubcopilot.com socks5\n"
+    "typora.io socks5\n"
+    "x.com socks5\n"
+    "twitter.com socks5\n"
+    "pscp.tv socks5\n"
+    "twimg.com socks5\n"
+    "hcaptcha.com socks5\n"
+    "ollama.com socks5\n"
+    "hubspot.com socks5\n"
+    "youtube.com socks5\n"
+    "youtube-nocookie.com socks5\n"
+    "lunarg.com socks5\n"
+    "withgoogle.com socks5\n"
+    "yunduanshin.net socks5\n"
+    "cryptomus.com socks5\n"
+    "tiktokv.us socks5\n"
+    "tiktokcdn-us.com socks5\n"
+    "tiktokv.com socks5\n"
+    "tiktokw.com socks5\n"
+    "tiktokcdn.com socks5\n"
+    "tiktok.com socks5\n"
+    "facebook.com socks5\n"
+    "amazon.com socks5\n"
+    "tabbit.ai socks5\n"
+;
+
+// 加载 exe 内置的默认规则。
+// 仅在外部配置文件缺失/无效时调用；规则列表不落盘，直到用户第一次
+// 添加/删除触发 xpac_save_config 才写出到外部文件。
+static int xpac_load_builtin_config(void) {
+    char line[512];
+    const char* p = PAC_BUILTIN_CONFIG;
+    int line_num = 0;
+    int success_count = 0;
+
+    while (*p) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        line_num++;
+        success_count += parse_config_line(line, line_num);
+        p = nl ? nl + 1 : p + len;
+    }
+
+    printf("[PAC] 已加载内置默认规则：%d 条规则，%d 个分流域名\n",
+           success_count, g_bulk_domain_count);
+    return (success_count > 0) ? 0 : -1;
+}
+
 static int xpac_load_config(const char* filename) {
     if (!filename) {
         printf("[PAC] 错误：配置文件路径为空\n");
@@ -171,72 +361,7 @@ static int xpac_load_config(const char* filename) {
 
     while (fgets(line, sizeof(line), fp)) {
         line_num++;
-
-        // 跳过空行和注释行
-        char* trimmed = line;
-        while (*trimmed && isspace((unsigned char)*trimmed)) trimmed++;
-        if (*trimmed == '#' || *trimmed == ';' || *trimmed == '\0') {
-            continue;
-        }
-
-        // 移除行尾换行符和回车符
-        char* newline = strchr(trimmed, '\n');
-        if (newline) {
-            *newline = '\0';
-            // 如果前一个字符是回车符，也将其移除
-            if (newline > trimmed && *(newline - 1) == '\r') {
-                *(newline - 1) = '\0';
-            }
-        }
-        // 额外检查：直接查找并移除回车符（处理只有\r的情况）
-        char* cr = strchr(trimmed, '\r');
-        if (cr) *cr = '\0';
-
-        if (strncmp(trimmed, "@allow", 6) == 0) {
-            char ip[64];
-            if (sscanf(trimmed + 6, "%63s", ip) == 1) {
-                if (xpac_add_allow_ip(ip) == 0)
-                    success_count++;
-                else
-                    printf("[PAC] 警告：第%d行白名单解析失败: %s\n", line_num, trimmed);
-            } else {
-                printf("[PAC] 警告：第%d行白名单格式无效: %s\n", line_num, trimmed);
-            }
-            continue;
-        }
-
-        if (strncmp(trimmed, "@bulk", 5) == 0) {
-            char domain[256];
-            if (sscanf(trimmed + 5, "%255s", domain) == 1) {
-                if (xpac_add_bulk_domain(domain) == 0)
-                    success_count++;
-                else
-                    printf("[PAC] 警告：第%d行分流域名解析失败: %s\n", line_num, trimmed);
-            } else {
-                printf("[PAC] 警告：第%d行分流域名格式无效: %s\n", line_num, trimmed);
-            }
-            continue;
-        }
-
-        // 解析格式：域名模式 代理类型
-        char pattern[256];
-        char type_str[32];
-        int parsed = sscanf(trimmed, "%255s %31s", pattern, type_str);
-
-        if (parsed == 2) {
-            ProxyType proxy_type = parse_proxy_type(type_str);
-            if (xpac_add_domain(pattern, proxy_type) == 0) {
-                success_count++;
-            } else {
-                printf("[PAC] 警告：第%d行解析失败: %s\n", line_num, trimmed);
-            }
-        } else if (parsed == 1) {
-            // 只指定域名，使用默认代理类型
-            if (xpac_add_domain(pattern, PROXY_TYPE_HTTP) == 0)
-                success_count++;
-        } else {
-            printf("[PAC] 警告：第%d行格式无效: %s\n", line_num, trimmed);
-        }
+        success_count += parse_config_line(line, line_num);
     }
 
     fclose(fp);
@@ -668,6 +793,31 @@ static int is_valid_domain_pattern(const char* pattern) {
     return 1;
 }
 
+/* 是否为纯 IPv4 字面量（四段十进制，每段 0-255）。这类规则在生成 PAC 时不派生
+** 子域名/后缀形态：PAC 的 host 是 URL 里的字面主机名，IP 只可能精确相等，而派生
+** 出的 "1.2.3.4.*" 会误伤 nip.io / sslip.io 这类通配DNS域名。 */
+static int is_ipv4_literal(const char* s) {
+    if (!s) return 0;
+
+    for (int seg = 0; seg < 4; seg++) {
+        int val = 0, digits = 0;
+
+        if (!isdigit((unsigned char)*s)) return 0;
+        while (isdigit((unsigned char)*s)) {
+            val = val * 10 + (*s++ - '0');
+            if (++digits > 3 || val > 255) return 0;
+        }
+
+        if (seg < 3) {
+            if (*s++ != '.') return 0;
+        } else if (*s != '\0') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 static int parse_proxy_type(const char* type_str) {
     if (!type_str) return PROXY_TYPE_HTTP;
 
@@ -757,33 +907,20 @@ static char* xpac_generate_pac_content(int pac_type) {
         pos += snprintf(pac_content + pos, buffer_size - pos,
             "\n    // 自定义域名规则\n");
 
+        /*
+         * 规则只在 proxy.pac 里生成（见上面的 pac_type==1），而 proxy.pac 同时
+         * 要给 Windows 系统代理用：WinINET 会丢弃 PAC 返回的 SOCKS5 结果，所以
+         * 无论规则本身标的是 socks5/http/auto，一律返回 PROXY:http_proxy_port，
+         * 由 HTTP 代理内部再转发到 SOCKS5。
+         */
+        const char* proxy_str = "PROXY";
+        int port = g_config.http_proxy_port;
+
         while (current) {
-            const char* proxy_str;
-            int port;
-
-            if (pac_type == 2) { // proxy.socks5.pac，强制使用SOCKS5
-                proxy_str = "SOCKS5";
-                port = g_config.socks5_proxy_port;
-            } else if (current->proxy_type == PROXY_TYPE_SOCKS5) {
-                /*
-                 * Default proxy.pac is intended for Windows system proxy too.
-                 * Route through the HTTP proxy so WinINET clients do not drop
-                 * SOCKS5 PAC results; the HTTP proxy still forwards via SOCKS5.
-                 */
-                proxy_str = "PROXY";
-                port = g_config.http_proxy_port;
-            } else if (current->proxy_type == PROXY_TYPE_AUTO) {
-                proxy_str = (pac_type == 2) ? "SOCKS5" : "PROXY";
-                port = (pac_type == 2) ? g_config.socks5_proxy_port : g_config.http_proxy_port;
-            } else { // PROXY_TYPE_HTTP 或默认
-                proxy_str = "PROXY";
-                port = g_config.http_proxy_port;
-            }
-
             // 生成域名匹配条件：规则存裸域名 X，这里派生全部匹配形态——
             // 子域名、X 本身、以及带额外后缀的形态（如 google.com.hk /
-            // www.google.com.hk）。"*"（全匹配）单独处理。
-            if (strcmp(current->pattern, "*") != 0) {
+            // www.google.com.hk）。"*"（全匹配）和 IP 字面量按原样精确匹配。
+            if (strcmp(current->pattern, "*") != 0 && !is_ipv4_literal(current->pattern)) {
                 const char* bare = current->pattern;
                 pos += snprintf(pac_content + pos, buffer_size - pos,
                     "    if (shExpMatch(host, \"*.%s\") ||\n"
@@ -811,10 +948,15 @@ static char* xpac_generate_pac_content(int pac_type) {
             "    return \"PROXY %s:%d\";\n",
             ip, g_config.http_proxy_port);
     } else if (pac_type == 2) { // proxy.socks5.pac，默认SOCKS5
+        /*
+         * 回落用本机HTTP代理，不用SOCKS(=SOCKS4)：socks5_server 只接受
+         * 版本字节 0x05，SOCKS4 握手必被拒，且 SOCKS4 只能本地解析DNS。
+         * HTTP代理这一跳内部仍然转发到 SOCKS5，语义一致。
+         */
         pos += snprintf(pac_content + pos, buffer_size - pos,
-            "\n    // 所有流量走SOCKS5代理\n"
-            "    return \"SOCKS5 %s:%d; SOCKS %s:%d\";\n",
-            ip, g_config.socks5_proxy_port, ip, g_config.socks5_proxy_port);
+            "\n    // 所有流量走SOCKS5代理，SOCKS5不可用时回落到本机HTTP代理\n"
+            "    return \"SOCKS5 %s:%d; PROXY %s:%d\";\n",
+            ip, g_config.socks5_proxy_port, ip, g_config.http_proxy_port);
     } else { // proxy.pac，默认HTTP代理
         pos += snprintf(pac_content + pos, buffer_size - pos,
                     "\n    // 所有其他不走代理直接访问\n"

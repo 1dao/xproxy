@@ -30,6 +30,14 @@ void signal_handler(int sig) {
     }
 }
 
+// Cooperative stop for embedded runs (xproxy-ui hosts xproxy_main in a
+// thread and calls this from the UI thread); also honored during the
+// startup/network-wait phase via g_stop_signal
+void xproxy_request_stop(void) {
+    g_stop_signal = SIGINT;
+    g_running = 0;
+}
+
 #ifdef _WIN32
 #include <conio.h>
 #include <windows.h>
@@ -194,7 +202,7 @@ void show_help(const char *prog_name) {
     printf("  %s -h ssh.example.com -u user -P pass --daemon\n", prog_name);
 }
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(XPROXY_UI_EMBED)
 int xproxy_main(int argc, char *argv[]) {
 #else
 int main(int argc, char *argv[]) {
@@ -203,7 +211,12 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     xlog_init("./logs", "xproxy", 1);
-    atexit(xlog_uninit);
+    static int atexit_registered = 0;
+    if (!atexit_registered) { // xproxy_main may run more than once when embedded
+        atexit(xlog_uninit);
+        atexit_registered = 1;
+    }
+    g_stop_signal = 0; // reset from a previous embedded run
 
     signal(SIGINT, signal_handler);
 #ifdef SIGTERM
@@ -355,7 +368,7 @@ int main(int argc, char *argv[]) {
         int max_retries = 60;
         int network_ready = 0;
 
-        while (retries < max_retries && !network_ready) {
+        while (retries < max_retries && !network_ready && !g_stop_signal) {
             // 尝试真正的 TCP 连接到 SSH 服务器
             SOCKET test_sock = socket(AF_INET, SOCK_STREAM, 0);
             if (test_sock != INVALID_SOCKET) {
@@ -524,7 +537,7 @@ int main(int argc, char *argv[]) {
     printf("Press Ctrl+C to stop\n");
     printf("========================================\n\n");
 
-    g_running = 1;
+    g_running = (g_stop_signal == 0); // stop may already have been requested
 
     // Main event loop
     while (g_running) {

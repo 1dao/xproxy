@@ -20,7 +20,6 @@ todesktop.com socks5
 cursor-cdn.com socks5
 cursor.sh socks5
 cursor.com socks5
-co.jp socks5
 facebook.net socks5
 intellimizeio.com socks5
 anthropic.com socks5
@@ -51,7 +50,7 @@ redditstatic.com socks5
 redditspace.com socks5
 googletagmanager.com socks5
 google.com socks5
-*antigravity.google socks5
+antigravity.google socks5
 google-analytics.com socks5
 googleapis.com socks5
 googlecode.com socks5
@@ -63,8 +62,8 @@ googleusercontent.com socks5
 ggpht.com socks5
 oaistatic.com socks5
 cloudflare.com socks5
-*chatgpt.com socks5
-*openai.com socks5
+chatgpt.com socks5
+openai.com socks5
 gmail.com socks5
 gstatic.com socks5
 wikipedia.org socks5
