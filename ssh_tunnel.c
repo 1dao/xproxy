@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <poll.h>
 #endif
 
 static int wolf_ssh_initialized = 0;
@@ -85,7 +86,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     printf("[DEBUG] 1. Calling wolfSSH_Init...\n");
     ret = wolfSSH_Init();
     if (ret != WS_SUCCESS) {
-        fprintf(stderr, "wolfSSH_Init failed: %d\n", ret);
+        XLOGE("wolfSSH_Init failed: %d", ret);
         return NULL;
     }
     wolf_ssh_initialized = 1;
@@ -94,7 +95,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     printf("[DEBUG] 3. Creating socket...\n");
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
-        perror("socket");
+        XLOGE("socket creation failed: %d", GET_ERRNO());
 
         return NULL;
     }
@@ -103,7 +104,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     sin.sin_family = AF_INET;
     sin.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &sin.sin_addr) <= 0) {
-        fprintf(stderr, "Invalid address: %s\n", host);
+        XLOGE("Invalid address: %s", host);
         CLOSE_SOCKET(sock);
 
         return NULL;
@@ -111,7 +112,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
 
     printf("[DEBUG] 7. Connecting to %s:%d...\n", host, port);
     if (connect(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-        fprintf(stderr, "Connect failed: host=%s, port=%d\n", host, port);
+        XLOGE("Connect failed: host=%s, port=%d", host, port);
         CLOSE_SOCKET(sock);
 
         return NULL;
@@ -122,7 +123,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     if (g_ssh_ctx == NULL) {
         g_ssh_ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, NULL);
         if (g_ssh_ctx == NULL) {
-            fprintf(stderr, "Could not initialize SSH context\n");
+            XLOGE("Could not initialize SSH context");
             CLOSE_SOCKET(sock);
             return NULL;
         }
@@ -134,7 +135,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     printf("[DEBUG] 9. Creating SSH session...\n");
     WOLFSSH* ssh = wolfSSH_new(g_ssh_ctx);
     if (ssh == NULL) {
-        fprintf(stderr, "Could not create SSH session\n");
+        XLOGE("Could not create SSH session");
         CLOSE_SOCKET(sock);
         return NULL;
     }
@@ -146,7 +147,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     printf("[DEBUG] 12. Setting fd...\n");
     ret = wolfSSH_set_fd(ssh, sock);
     if (ret != WS_SUCCESS) {
-        fprintf(stderr, "wolfSSH_set_fd failed: %d\n", ret);
+        XLOGE("wolfSSH_set_fd failed: %d", ret);
         wolfSSH_free(ssh);
         CLOSE_SOCKET(sock);
         return NULL;
@@ -155,7 +156,7 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     printf("[DEBUG] 13. Setting username...\n");
     ret = wolfSSH_SetUsername(ssh, username);
     if (ret != WS_SUCCESS) {
-        fprintf(stderr, "wolfSSH_SetUsername failed: %d\n", ret);
+        XLOGE("wolfSSH_SetUsername failed: %d", ret);
         wolfSSH_free(ssh);
         CLOSE_SOCKET(sock);
         return NULL;
@@ -167,12 +168,36 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
     printf("[DEBUG] 14. Calling wolfSSH_connect...\n");
     ret = wolfSSH_connect(ssh);
     if (ret != WS_SUCCESS) {
-        fprintf(stderr, "wolfSSH_connect failed: %d (%s)\n", ret, wolfSSH_get_error_name(ssh));
+        XLOGE("wolfSSH_connect failed: %d (%s)", ret, wolfSSH_get_error_name(ssh));
         wolfSSH_free(ssh);
         CLOSE_SOCKET(sock);
         return NULL;
     }
     printf("[DEBUG] 15. Connected!\n");
+
+    /* 握手用阻塞 socket 一次跑完，之后必须切成非阻塞再交给事件循环。
+     *
+     * wolfSSH 读包时走 GetInputData()，里面是 do { ReceiveData() } while(size)
+     * ——要凑齐整个 SSH 包才返回。包最大 32KB（见上面的 SetWindowPacketSize），
+     * 远大于一个 MSS，所以一个包常常跨十几个 TCP 段。socket 是阻塞的时候，
+     * epoll 报了可读、我们进去 recv，读完前几段后剩下的还没到，recv 就直接
+     * 睡在那里——整个单线程事件循环（两条 SSH 会话 + 所有客户端）全停住，
+     * 直到对端把这个包的剩余字节发完。丢一个段就是一个 RTO 的卡顿。
+     * 非阻塞后 recv 返回 EAGAIN -> WS_CBIO_ERR_WANT_READ -> WS_WANT_READ，
+     * is_temporary_state() 判为临时错误，事件循环继续跑，下次可读再续上。 */
+    if (socket_set_nonblocking(sock) != 0) {
+        XLOGE("failed to set SSH socket non-blocking");
+        wolfSSH_free(ssh);
+        CLOSE_SOCKET(sock);
+        return NULL;
+    }
+
+    /* SSH 包是一个个独立的小消息，Nagle 会把控制包（CHANNEL_OPEN /
+     * WINDOW_ADJUST）压在后面等 ACK，直接放大新连接建立的延迟。 */
+    {
+        int one = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+    }
 
     g_ssh_session_count++;
     return ssh;
@@ -216,6 +241,45 @@ void wolfSSH_channel_callback(WOLFSSH* session, WS_CallbackChannelClose fclose, 
     wolfSSH_CTX_SetChannelOpenRespCb(g_ssh_ctx, ffini, ffail);
 }
 
+/* socket 现在能不能整包吞下一个 CHANNEL_OPEN？
+ *
+ * 切非阻塞后必须先问这个。wolfSSH_ChannelFwdNewLocal() 里
+ * SendChannelOpenForward() 一旦返回 WS_WANT_WRITE，它会 ChannelDelete 掉通道并
+ * 返回 NULL —— 可 CHANNEL_OPEN 已经加密进 ssh->outputBuffer，必然会发出去、撤
+ * 不回。服务端随后确认一个我们已经不认识的 channel id，DoChannelOpenConf 里
+ * ChannelFind 失败返回 WS_INVALID_CHANID（不在 check_fatal_err 名单里，会被当成
+ * 临时错误吞掉），那条通道就在服务端泄漏，而调用方还会再开一条。
+ *
+ * wolfssh 是第三方库不能改，所以从调用方规避：不安全就干脆不发起 open。
+ * 两个条件——
+ *   1. outputBuffer 已排空，说明上一次 flush 是整包写出去的；
+ *   2. socket 此刻可写。TCP 的 POLLOUT 条件是发送缓冲至少空出三分之一
+ *      （Linux sk_stream_min_wspace），远大于一个 CHANNEL_OPEN 包（约百字节），
+ *      所以可写就等于这个包能被整包收下。 */
+int wolfSSH_session_can_open_channel(WOLFSSH* ssh) {
+    if (!ssh) return 0;
+    if (wolfSSH_session_has_pending_output(ssh)) return 0;
+
+    SOCKET_T fd = wolfSSH_get_fd(ssh);
+    if (fd == INVALID_SOCKET) return 0;
+
+#ifdef _WIN32
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = POLLWRNORM;
+    pfd.revents = 0;
+    int rc = WSAPoll(&pfd, 1, 0);
+    return rc > 0 && (pfd.revents & POLLWRNORM) && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL));
+#else
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, 0);
+    return rc > 0 && (pfd.revents & POLLOUT) && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL));
+#endif
+}
+
 WOLFSSH_CHANNEL* wolfSSH_channel_open(WOLFSSH* ssh,
                                        const char *dest_host, int dest_port,
                                        const char *source_host, int source_port) {
@@ -230,15 +294,33 @@ WOLFSSH_CHANNEL* wolfSSH_channel_open(WOLFSSH* ssh,
         source_port = 12345;
     }
 
+    /* 发不出整包就别开，否则会在服务端漏一条通道（见上面的说明）。
+     * 报 WS_WANT_WRITE 让调用方走它已有的“临时错误 -> 挂可写 -> 重试”分支。 */
+    if (!wolfSSH_session_can_open_channel(ssh)) {
+        XLOGD("Deferring channel open to %s:%d, SSH socket not drained",
+              dest_host, dest_port);
+        ssh->error = WS_WANT_WRITE;
+        return NULL;
+    }
+
     WOLFSSH_CHANNEL* channel = wolfSSH_ChannelFwdNew(ssh,
         dest_host, (word16)dest_port,
         source_host, (word16)source_port);
 
     if (channel) {
-        fprintf(stderr, "SSH channel opened successfully to %s:%d, address=%p, error=%d\n", dest_host, dest_port, channel, wolfSSH_get_error(channel->ssh));
+        XLOGI("SSH channel opened successfully to %s:%d, address=%p, error=%d",
+              dest_host, dest_port, channel, wolfSSH_get_error(channel->ssh));
     } else {
-        fprintf(stderr, "Failed to open channel to %s:%d, error: %d\n",
-                dest_host, dest_port, wolfSSH_get_error(ssh));
+        /* 上面的门槛过了还撞上 WS_WANT_WRITE，说明缓冲在这一小段里被灌满了：
+         * 通道已经被库删掉但 CHANNEL_OPEN 会发出去，服务端那条是泄漏的。
+         * 改不了库，至少让它在日志里可见。 */
+        int err = wolfSSH_get_error(ssh);
+        if (err == WS_WANT_WRITE) {
+            XLOGE("CHANNEL_OPEN to %s:%d hit WS_WANT_WRITE after drain check; "
+                  "channel leaked on the server side", dest_host, dest_port);
+        }
+        XLOGE("Failed to open channel to %s:%d, error: %d",
+              dest_host, dest_port, err);
     }
 
     return channel;
@@ -248,7 +330,7 @@ void wolfSSH_channel_close(WOLFSSH_CHANNEL* channel) {
     if (!channel)
         return;
 
-    fprintf(stderr, "SSH channel closed, address=%p\n", channel);
+    XLOGI("SSH channel closed, address=%p", channel);
     if (channel->openConfirmed) {
         if (!channel->eofTxd) {
             int ret = SendChannelEof(channel->ssh, channel->peerChannel);

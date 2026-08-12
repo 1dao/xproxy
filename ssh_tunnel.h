@@ -20,6 +20,11 @@ void wolfSSH_channel_callback(WOLFSSH* session
     , WS_CallbackChannelOpen ffini
     , WS_CallbackChannelOpen ffail, void* ctx);
 
+/* CHANNEL_OPEN 现在发得出整包吗？发不出就别开——wolfSSH 会在 WS_WANT_WRITE 时
+ * 删掉通道结构，但报文已经进了输出缓冲、必然发出去，服务端那条通道就漏了。
+ * 详见 ssh_tunnel.c 中该函数上方的说明。 */
+int wolfSSH_session_can_open_channel(WOLFSSH* session);
+
 /* 打开SSH通道 (Direct TCP/IP) */
 WOLFSSH_CHANNEL* wolfSSH_channel_open(WOLFSSH* session,
                                        const char *dest_host, int dest_port,

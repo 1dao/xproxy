@@ -223,6 +223,18 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
 #endif
     signal(SIGSEGV, signal_handler);
+#ifdef SIGPIPE
+    /* A peer that vanishes mid-transfer (browser tab closed, RST after our
+     * half-close) makes the next write on that fd raise SIGPIPE, whose default
+     * action terminates the process. Ignoring it turns those into EPIPE, which
+     * every socket write here already handles.
+     *
+     * This is the only mechanism available: xchannel also writes via writev()
+     * and sendfile(), neither of which takes MSG_NOSIGNAL. Embedded runs reach
+     * this too -- xproxy_main() is the single entry point, and the disposition
+     * is process-wide even though it runs on a worker thread. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
 #ifdef _WIN32
     // 阻止系统进入睡眠

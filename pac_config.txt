@@ -15,6 +15,7 @@
 @bulk nflxvideo.net
 @bulk download.amd.com
 
+x.ai socks5
 huggingface.co socks5
 todesktop.com socks5
 cursor-cdn.com socks5

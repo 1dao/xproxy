@@ -1474,6 +1474,17 @@ static bool socks5_channel_retry_open(Socks5Client *client) {
     if (time_get_ms() < client->last_retry_time) return false;
     if (client->ssh_channel) return true;
 
+    /* SSH socket 还没冲干净时不发起 open（发出去会在服务端漏通道，见
+     * wolfSSH_session_can_open_channel）。这只是等发送缓冲，不是开通道被拒，
+     * 所以不能计进 retry_error_count —— 否则拥塞几百毫秒就把 MAX_REOPEN_COUNT
+     * 耗光，把本来好好的连接判成 TTL_EXPIRED。 */
+    if (!wolfSSH_session_can_open_channel(client->ssh_session)) {
+        SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
+        socks5_arm_ssh_writable(ssh_socket, NULL, 1, "channel_open_wait_drain");
+        client->last_retry_time = time_get_ms() + 20;
+        return true;
+    }
+
     client->ssh_channel = wolfSSH_channel_open(client->ssh_session,
                                                client->target_host, client->target_port,
                                                g_server_config.ssh_host, client->client_port);
