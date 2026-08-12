@@ -1,6 +1,7 @@
 #include "xpac_server.h"
 #include "xlog.h"
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -25,24 +26,31 @@
 #include <arpa/inet.h>
 #endif
 
-// ===================== 域名规则结构 =====================
-typedef struct DomainRule {
-    char pattern[256];            // 裸域名（如 "google.com"，匹配形态由PAC生成时派生）
-    ProxyType proxy_type;         // 代理类型
-    struct DomainRule* next;      // 链表下一个节点
-} DomainRule;
+// ===================== 规则链表 =====================
+/* 域名规则、代理白名单IP、@bulk 分流域名三张表结构相同：一个字符串键加一个
+** 可选的整型属性。它们共用下面这套链表操作，差别只在键的比较方式和日志里的
+** 名称上。tag 目前仅域名规则使用，存 ProxyType。
+**
+** @bulk 分流域名：命中的目标域名走独立的 SSH 会话，避免视频/下载流量把主
+** 会话的 TCP 连接灌满、阻塞新通道建立。 */
+typedef struct StrRule {
+    struct StrRule* next;
+    int             tag;
+    char            key[256];     // 裸域名 / IP 字面量
+} StrRule;
 
-typedef struct AllowIpRule {
-    char ip[64];
-    struct AllowIpRule* next;
-} AllowIpRule;
+typedef struct {
+    StrRule*    head;
+    int         count;
+    const char* what;             // 日志中的中文名
+    int         ci;               // 1 = 比较键时忽略大小写
+} StrList;
 
-/* 大流量分流域名（@bulk）：命中的目标域名走独立的 SSH 会话，
-** 避免视频/下载流量把主会话的 TCP 连接灌满、阻塞新通道建立。 */
-typedef struct BulkDomainRule {
-    char domain[256];             // 裸域名，后缀匹配（如 "googlevideo.com"）
-    struct BulkDomainRule* next;
-} BulkDomainRule;
+/* 链表内容的快照，用于加载失败时回滚（见 xpac_load_config）。 */
+typedef struct {
+    StrRule* head;
+    int      count;
+} StrListSave;
 
 // ===================== 全局变量 =====================
 static XpacConfig g_config = {
@@ -56,20 +64,13 @@ static XpacConfig g_config = {
     .admin_password = NULL        // 默认无需密码
 };
 
-static DomainRule* g_domain_list = NULL;  // 域名规则链表头
-static int g_domain_count = 0;            // 域名规则数量
-static AllowIpRule* g_allow_ip_list = NULL;
-static int g_allow_ip_count = 0;
-static BulkDomainRule* g_bulk_domain_list = NULL;
-static int g_bulk_domain_count = 0;
+static StrList g_domains   = { NULL, 0, "域名规则",  0 };
+static StrList g_allow_ips = { NULL, 0, "白名单IP",  0 };
+static StrList g_bulks     = { NULL, 0, "分流域名",  1 };
 static int g_initialized = 0;             // 是否已初始化
 
 // ===================== 内部工具函数声明 =====================
 static int is_valid_domain_pattern(const char* pattern);
-static DomainRule* find_domain_rule(const char* pattern);
-static AllowIpRule* find_allow_ip_rule(const char* ip);
-static void free_domain_list(void);
-static void free_allow_ip_list(void);
 static int parse_proxy_type(const char* type_str);
 static const char* proxy_type_to_str(ProxyType type);
 static int xpac_load_config(const char* filename);
@@ -81,16 +82,134 @@ static const char* get_pac_proxy_address(void);
 // ===================== 域名管理API =====================
 static int xpac_add_domain(const char* pattern, ProxyType proxy_type);
 static int xpac_remove_domain(const char* pattern);
-static void xpac_clear_domains(void);
 static int xpac_add_allow_ip(const char* ip);
 static int xpac_remove_allow_ip(const char* ip);
 static int xpac_add_bulk_domain(const char* domain);
-static void free_bulk_domain_list(void);
+
+// ===================== 规则链表操作 =====================
+static int rule_key_equal(const StrList* l, const char* a, const char* b) {
+    return l->ci ? (strcasecmp(a, b) == 0) : (strcmp(a, b) == 0);
+}
+
+static StrRule* rule_find(const StrList* l, const char* key) {
+    for (StrRule* r = l->head; r; r = r->next) {
+        if (rule_key_equal(l, r->key, key)) return r;
+    }
+    return NULL;
+}
+
+/* 插入或更新一条规则。键已存在时只更新 tag，并把 *existed 置 1。
+** 返回 0 成功，-1 内存分配失败。 */
+static int rule_add(StrList* l, const char* key, int tag, int* existed) {
+    StrRule* r = rule_find(l, key);
+    if (existed) *existed = (r != NULL);
+    if (r) {
+        r->tag = tag;
+        return 0;
+    }
+
+    r = (StrRule*)malloc(sizeof(StrRule));
+    if (!r) {
+        XLOGE("[PAC] 错误：%s内存分配失败", l->what);
+        return -1;
+    }
+
+    snprintf(r->key, sizeof(r->key), "%s", key);
+    r->tag  = tag;
+    r->next = l->head;
+    l->head = r;
+    l->count++;
+    return 0;
+}
+
+/* 删除一条规则，返回 0 成功、-1 未找到。 */
+static int rule_remove(StrList* l, const char* key) {
+    StrRule* prev = NULL;
+    for (StrRule* r = l->head; r; prev = r, r = r->next) {
+        if (!rule_key_equal(l, r->key, key)) continue;
+        if (prev) prev->next = r->next;
+        else      l->head    = r->next;
+        free(r);
+        l->count--;
+        return 0;
+    }
+    return -1;
+}
+
+static void rule_chain_free(StrRule* head) {
+    while (head) {
+        StrRule* next = head->next;
+        free(head);
+        head = next;
+    }
+}
+
+static void rule_free(StrList* l) {
+    rule_chain_free(l->head);
+    l->head  = NULL;
+    l->count = 0;
+}
+
+/* 摘走链表内容并清空原表；配合 list_restore / rule_chain_free 做加载回滚。 */
+static StrListSave list_detach(StrList* l) {
+    StrListSave s = { l->head, l->count };
+    l->head  = NULL;
+    l->count = 0;
+    return s;
+}
+
+static void list_restore(StrList* l, StrListSave s) {
+    rule_free(l);
+    l->head  = s.head;
+    l->count = s.count;
+}
+
+// ===================== 字符串拼接器 =====================
+/* 固定缓冲区上的追加式构造器，用于拼 PAC / JSON / HTML。
+** 相比裸 snprintf 游标：溢出时只截断并置 overflow 位，游标永远不会越过
+** 缓冲区末尾（snprintf 返回的是“本应写入”的长度，直接累加会越界）。 */
+typedef struct {
+    char*  buf;
+    size_t cap;
+    size_t len;
+    int    overflow;
+} sbuf;
+
+static void sbuf_init(sbuf* s, char* buf, size_t cap) {
+    s->buf = buf;
+    s->cap = cap;
+    s->len = 0;
+    s->overflow = 0;
+    if (cap > 0) buf[0] = '\0';
+}
+
+static void sbuf_addf(sbuf* s, const char* fmt, ...) {
+    if (s->overflow || s->cap == 0 || s->len + 1 >= s->cap) {
+        s->overflow = 1;
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(s->buf + s->len, s->cap - s->len, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        s->overflow = 1;
+        return;
+    }
+    if ((size_t)n >= s->cap - s->len) {
+        s->len = s->cap - 1;   /* vsnprintf 已截断并补 '\0' */
+        s->overflow = 1;
+        return;
+    }
+    s->len += (size_t)n;
+}
 
 // ===================== 初始化函数 =====================
 void xpac_init(const XpacConfig* config) {
     if (g_initialized) {
-        printf("[PAC] 警告：PAC服务器已初始化\n");
+        XLOGW("[PAC] 警告：PAC服务器已初始化");
         return;
     }
 
@@ -106,21 +225,21 @@ void xpac_init(const XpacConfig* config) {
         g_config.enable_proxy_whitelist = config->enable_proxy_whitelist;
     }
 
-    printf("[PAC] PAC服务器初始化完成\n");
-    printf("[PAC] HTTP代理端口: %d, SOCKS5代理端口: %d\n",
-           g_config.http_proxy_port, g_config.socks5_proxy_port);
-    printf("[PAC] Web管理界面: %s\n",
-           g_config.enable_web_admin ? "启用" : "禁用");
-    printf("[PAC] 代理白名单: %s\n",
-           g_config.enable_proxy_whitelist ? "启用" : "禁用");
+    XLOGI("[PAC] PAC服务器初始化完成");
+    XLOGI("[PAC] HTTP代理端口: %d, SOCKS5代理端口: %d",
+          g_config.http_proxy_port, g_config.socks5_proxy_port);
+    XLOGI("[PAC] Web管理界面: %s",
+          g_config.enable_web_admin ? "启用" : "禁用");
+    XLOGI("[PAC] 代理白名单: %s",
+          g_config.enable_proxy_whitelist ? "启用" : "禁用");
 
     // 尝试加载配置文件；失败时回退到 exe 内置的默认规则
     if (g_config.config_file) {
         if (xpac_load_config(g_config.config_file) == 0) {
-            printf("[PAC] 已从配置文件加载域名规则: %s\n", g_config.config_file);
+            XLOGI("[PAC] 已从配置文件加载域名规则: %s", g_config.config_file);
         } else {
-            printf("[PAC] 未找到配置文件或配置文件为空: %s，使用内置默认规则\n",
-                   g_config.config_file);
+            XLOGW("[PAC] 未找到配置文件或配置文件为空: %s，使用内置默认规则",
+                  g_config.config_file);
             xpac_load_builtin_config();
         }
     } else {
@@ -132,13 +251,10 @@ void xpac_init(const XpacConfig* config) {
 
 // 释放资源
 void xpac_uninit(void) {
-    xpac_clear_domains();
-    free_allow_ip_list();
-    g_allow_ip_list = NULL;
-    g_allow_ip_count = 0;
-    free_bulk_domain_list();
-    g_bulk_domain_list = NULL;
-    g_bulk_domain_count = 0;
+    rule_free(&g_domains);
+    rule_free(&g_allow_ips);
+    rule_free(&g_bulks);
+    XLOGI("[PAC] 已清空所有规则");
 }
 
 // ===================== 配置文件管理 =====================
@@ -167,9 +283,9 @@ static int parse_config_line(char* line, int line_num) {
         if (sscanf(trimmed + 6, "%63s", ip) == 1) {
             if (xpac_add_allow_ip(ip) == 0)
                 return 1;
-            printf("[PAC] 警告：第%d行白名单解析失败: %s\n", line_num, trimmed);
+            XLOGW("[PAC] 警告：第%d行白名单解析失败: %s", line_num, trimmed);
         } else {
-            printf("[PAC] 警告：第%d行白名单格式无效: %s\n", line_num, trimmed);
+            XLOGW("[PAC] 警告：第%d行白名单格式无效: %s", line_num, trimmed);
         }
         return 0;
     }
@@ -179,9 +295,9 @@ static int parse_config_line(char* line, int line_num) {
         if (sscanf(trimmed + 5, "%255s", domain) == 1) {
             if (xpac_add_bulk_domain(domain) == 0)
                 return 1;
-            printf("[PAC] 警告：第%d行分流域名解析失败: %s\n", line_num, trimmed);
+            XLOGW("[PAC] 警告：第%d行分流域名解析失败: %s", line_num, trimmed);
         } else {
-            printf("[PAC] 警告：第%d行分流域名格式无效: %s\n", line_num, trimmed);
+            XLOGW("[PAC] 警告：第%d行分流域名格式无效: %s", line_num, trimmed);
         }
         return 0;
     }
@@ -195,13 +311,13 @@ static int parse_config_line(char* line, int line_num) {
         ProxyType proxy_type = parse_proxy_type(type_str);
         if (xpac_add_domain(pattern, proxy_type) == 0)
             return 1;
-        printf("[PAC] 警告：第%d行解析失败: %s\n", line_num, trimmed);
+        XLOGW("[PAC] 警告：第%d行解析失败: %s", line_num, trimmed);
     } else if (parsed == 1) {
         // 只指定域名，使用默认代理类型
         if (xpac_add_domain(pattern, PROXY_TYPE_HTTP) == 0)
             return 1;
     } else {
-        printf("[PAC] 警告：第%d行格式无效: %s\n", line_num, trimmed);
+        XLOGW("[PAC] 警告：第%d行格式无效: %s", line_num, trimmed);
     }
     return 0;
 }
@@ -321,39 +437,28 @@ static int xpac_load_builtin_config(void) {
         p = nl ? nl + 1 : p + len;
     }
 
-    printf("[PAC] 已加载内置默认规则：%d 条规则，%d 个分流域名\n",
-           success_count, g_bulk_domain_count);
+    XLOGI("[PAC] 已加载内置默认规则：%d 条规则，%d 个分流域名",
+          success_count, g_bulks.count);
     return (success_count > 0) ? 0 : -1;
 }
 
 static int xpac_load_config(const char* filename) {
     if (!filename) {
-        printf("[PAC] 错误：配置文件路径为空\n");
+        XLOGE("[PAC] 错误：配置文件路径为空");
         return -1;
     }
 
-    printf("[PAC] 加载配置文件: %s\n", filename);
+    XLOGI("[PAC] 加载配置文件: %s", filename);
     FILE* fp = fopen(filename, "r");
     if (!fp) {
-        printf("[PAC] 无法打开配置文件: %s (错误: %s)\n", filename, strerror(errno));
+        XLOGW("[PAC] 无法打开配置文件: %s (错误: %s)", filename, strerror(errno));
         return -1;
     }
 
-    // 保存旧列表以便出错时恢复
-    DomainRule* old_list = g_domain_list;
-    int old_count = g_domain_count;
-    AllowIpRule* old_allow_list = g_allow_ip_list;
-    int old_allow_count = g_allow_ip_count;
-    BulkDomainRule* old_bulk_list = g_bulk_domain_list;
-    int old_bulk_count = g_bulk_domain_count;
-
-    // 清空当前列表
-    g_domain_list = NULL;
-    g_domain_count = 0;
-    g_allow_ip_list = NULL;
-    g_allow_ip_count = 0;
-    g_bulk_domain_list = NULL;
-    g_bulk_domain_count = 0;
+    // 摘走旧规则，解析到空表上；文件没有有效规则时再整体换回来
+    StrListSave old_domains = list_detach(&g_domains);
+    StrListSave old_allows  = list_detach(&g_allow_ips);
+    StrListSave old_bulks   = list_detach(&g_bulks);
 
     char line[512];
     int line_num = 0;
@@ -367,48 +472,25 @@ static int xpac_load_config(const char* filename) {
     fclose(fp);
 
     if (success_count == 0) {
-        // 恢复旧列表
-        free_domain_list();
-        g_domain_list = old_list;
-        g_domain_count = old_count;
-        free_allow_ip_list();
-        g_allow_ip_list = old_allow_list;
-        g_allow_ip_count = old_allow_count;
-        free_bulk_domain_list();
-        g_bulk_domain_list = old_bulk_list;
-        g_bulk_domain_count = old_bulk_count;
-        printf("[PAC] 配置文件未包含有效规则: %s\n", filename);
+        list_restore(&g_domains,   old_domains);
+        list_restore(&g_allow_ips, old_allows);
+        list_restore(&g_bulks,     old_bulks);
+        XLOGW("[PAC] 配置文件未包含有效规则: %s", filename);
         return -1;
-    } else {
-        // 释放旧列表
-        DomainRule* current = old_list;
-        while (current) {
-            DomainRule* next = current->next;
-            free(current);
-            current = next;
-        }
-        AllowIpRule* allow_current = old_allow_list;
-        while (allow_current) {
-            AllowIpRule* next = allow_current->next;
-            free(allow_current);
-            allow_current = next;
-        }
-        BulkDomainRule* bulk_current = old_bulk_list;
-        while (bulk_current) {
-            BulkDomainRule* next = bulk_current->next;
-            free(bulk_current);
-            bulk_current = next;
-        }
-        printf("[PAC] 成功从配置文件加载 %d 条规则，%d 个白名单IP，%d 个分流域名: %s\n",
-               success_count, g_allow_ip_count, g_bulk_domain_count, filename);
-        return 0;
     }
+
+    rule_chain_free(old_domains.head);
+    rule_chain_free(old_allows.head);
+    rule_chain_free(old_bulks.head);
+    XLOGI("[PAC] 成功从配置文件加载 %d 条规则，%d 个白名单IP，%d 个分流域名: %s",
+          success_count, g_allow_ips.count, g_bulks.count, filename);
+    return 0;
 }
 
 static int xpac_save_config(const char* filename) {
     if (!filename) {
         if (!g_config.config_file) {
-            printf("[PAC] 错误：未指定配置文件路径\n");
+            XLOGE("[PAC] 错误：未指定配置文件路径");
             return -1;
         }
         filename = g_config.config_file;
@@ -425,7 +507,7 @@ static int xpac_save_config(const char* filename) {
 
     FILE* fp = fopen(filename, "w");
     if (!fp) {
-        printf("[PAC] 无法创建配置文件: %s\n", filename);
+        XLOGE("[PAC] 无法创建配置文件: %s", filename);
         return -1;
     }
 
@@ -438,35 +520,20 @@ static int xpac_save_config(const char* filename) {
     fprintf(fp, "# 大流量分流：@bulk googlevideo.com（命中域名走独立SSH会话）\n");
     fprintf(fp, "\n");
 
-    AllowIpRule* allow = g_allow_ip_list;
-    while (allow) {
-        fprintf(fp, "@allow %s\n", allow->ip);
-        allow = allow->next;
-    }
-    if (g_allow_ip_count > 0) {
-        fprintf(fp, "\n");
-    }
+    for (StrRule* r = g_allow_ips.head; r; r = r->next)
+        fprintf(fp, "@allow %s\n", r->key);
+    if (g_allow_ips.count > 0) fprintf(fp, "\n");
 
-    BulkDomainRule* bulk = g_bulk_domain_list;
-    while (bulk) {
-        fprintf(fp, "@bulk %s\n", bulk->domain);
-        bulk = bulk->next;
-    }
-    if (g_bulk_domain_count > 0) {
-        fprintf(fp, "\n");
-    }
+    for (StrRule* r = g_bulks.head; r; r = r->next)
+        fprintf(fp, "@bulk %s\n", r->key);
+    if (g_bulks.count > 0) fprintf(fp, "\n");
 
-    DomainRule* current = g_domain_list;
-    while (current) {
-        fprintf(fp, "%s %s\n",
-                current->pattern,
-                proxy_type_to_str(current->proxy_type));
-        current = current->next;
-    }
+    for (StrRule* r = g_domains.head; r; r = r->next)
+        fprintf(fp, "%s %s\n", r->key, proxy_type_to_str((ProxyType)r->tag));
 
     fclose(fp);
-    printf("[PAC] 成功保存 %d 条规则，%d 个白名单IP，%d 个分流域名到配置文件: %s\n",
-           g_domain_count, g_allow_ip_count, g_bulk_domain_count, filename);
+    XLOGI("[PAC] 成功保存 %d 条规则，%d 个白名单IP，%d 个分流域名到配置文件: %s",
+          g_domains.count, g_allow_ips.count, g_bulks.count, filename);
     return 0;
 }
 
@@ -483,101 +550,64 @@ static void xpac_normalize_pattern(const char* pattern, char* out, size_t out_si
     snprintf(out, out_size, "%s", p);
 }
 
+/* 规则增删后按需落盘：初始化阶段的批量加载不写回文件。 */
+static void xpac_autosave(void) {
+    if (g_config.config_file && g_initialized)
+        xpac_save_config(g_config.config_file);
+}
+
 static int xpac_add_domain(const char* pattern, ProxyType proxy_type) {
     if (!pattern || !pattern[0]) {
-        printf("[PAC] 错误：域名模式为空\n");
+        XLOGE("[PAC] 错误：域名模式为空");
         return -1;
     }
 
-    char formatted_pattern[256] = {0};
-    xpac_normalize_pattern(pattern, formatted_pattern, sizeof(formatted_pattern));
-    if (strcmp(formatted_pattern, pattern) != 0) {
-        printf("[PAC] 格式化域名: %s -> %s\n", pattern, formatted_pattern);
-    }
+    char key[256];
+    xpac_normalize_pattern(pattern, key, sizeof(key));
+    if (strcmp(key, pattern) != 0)
+        XLOGD("[PAC] 格式化域名: %s -> %s", pattern, key);
 
-    // 验证格式化后的域名
-    if (!is_valid_domain_pattern(formatted_pattern)) {
-        printf("[PAC] 错误：格式化后的域名无效: %s\n", formatted_pattern);
+    if (!is_valid_domain_pattern(key)) {
+        XLOGE("[PAC] 错误：格式化后的域名无效: %s", key);
         return -1;
     }
 
-    // 检查是否已存在
-    DomainRule* existing = find_domain_rule(formatted_pattern);
-    if (existing) {
-        printf("[PAC] 域名规则已存在: %s -> %s\n",
-               pattern, proxy_type_to_str(existing->proxy_type));
-        existing->proxy_type = proxy_type; // 更新代理类型
+    int existed = 0;
+    if (rule_add(&g_domains, key, (int)proxy_type, &existed) != 0)
+        return -1;
+
+    /* 已存在时只在内存里更新代理类型，不触发落盘（沿用既有行为）。 */
+    if (existed) {
+        XLOGI("[PAC] 域名规则已存在，更新代理类型: %s -> %s",
+              key, proxy_type_to_str(proxy_type));
         return 0;
     }
 
-    // 创建新规则
-    DomainRule* new_rule = (DomainRule*)malloc(sizeof(DomainRule));
-    if (!new_rule) {
-        printf("[PAC] 错误：内存分配失败\n");
-        return -1;
-    }
-
-    strncpy(new_rule->pattern, formatted_pattern, sizeof(new_rule->pattern) - 1);
-    new_rule->pattern[sizeof(new_rule->pattern) - 1] = '\0';
-    new_rule->proxy_type = proxy_type;
-    new_rule->next = NULL;
-
-    // 添加到链表头部
-    new_rule->next = g_domain_list;
-    g_domain_list = new_rule;
-    g_domain_count++;
-
-    XLOGI("[PAC] 添加域名规则: %s -> %s\n",
-           pattern, proxy_type_to_str(proxy_type));
-
-    // 自动保存到配置文件（如果配置了）
-    if (g_config.config_file && g_initialized)
-        xpac_save_config(g_config.config_file);
-
+    XLOGI("[PAC] 添加域名规则: %s -> %s", key, proxy_type_to_str(proxy_type));
+    xpac_autosave();
     return 0;
 }
 
 static int xpac_remove_domain(const char* pattern) {
     if (!pattern || !pattern[0]) {
-        printf("[PAC] 错误：域名模式为空\n");
+        XLOGE("[PAC] 错误：域名模式为空");
         return -1;
     }
 
     /* 接受裸域名和旧的 "*." 格式，统一归一后再查找 */
-    char formatted_pattern[256] = {0};
-    xpac_normalize_pattern(pattern, formatted_pattern, sizeof(formatted_pattern));
+    char key[256];
+    xpac_normalize_pattern(pattern, key, sizeof(key));
 
-    DomainRule* prev = NULL;
-    DomainRule* current = g_domain_list;
-
-    while (current) {
-        if (strcmp(current->pattern, formatted_pattern) == 0) {
-            if (prev) {
-                prev->next = current->next;
-            } else {
-                g_domain_list = current->next;
-            }
-
-            printf("[PAC] 删除域名规则: %s -> %s\n",
-                   pattern, proxy_type_to_str(current->proxy_type));
-
-            free(current);
-            g_domain_count--;
-
-            // 自动保存到配置文件
-            if (g_config.config_file && g_initialized) {
-                xpac_save_config(g_config.config_file);
-            }
-
-            return 0;
-        }
-
-        prev = current;
-        current = current->next;
+    StrRule* r = rule_find(&g_domains, key);
+    if (!r) {
+        XLOGW("[PAC] 未找到域名规则: %s", pattern);
+        return -1;
     }
 
-    printf("[PAC] 未找到域名规则: %s\n", pattern);
-    return -1;
+    XLOGI("[PAC] 删除域名规则: %s -> %s", key, proxy_type_to_str((ProxyType)r->tag));
+    rule_remove(&g_domains, key);
+    xpac_autosave();
+    return 0;
 }
 
 static int is_valid_ipv4_address(const char* ip) {
@@ -587,181 +617,76 @@ static int is_valid_ipv4_address(const char* ip) {
 
 static int xpac_add_allow_ip(const char* ip) {
     if (!is_valid_ipv4_address(ip)) {
-        printf("[PAC] 错误：白名单IP无效: %s\n", ip ? ip : "");
+        XLOGE("[PAC] 错误：白名单IP无效: %s", ip ? ip : "");
         return -1;
     }
 
-    if (find_allow_ip_rule(ip)) {
-        printf("[PAC] 白名单IP已存在: %s\n", ip);
+    int existed = 0;
+    if (rule_add(&g_allow_ips, ip, 0, &existed) != 0)
+        return -1;
+    if (existed) {
+        XLOGI("[PAC] 白名单IP已存在: %s", ip);
         return 0;
     }
 
-    AllowIpRule* rule = (AllowIpRule*)malloc(sizeof(AllowIpRule));
-    if (!rule) {
-        printf("[PAC] 错误：白名单内存分配失败\n");
-        return -1;
-    }
-
-    strncpy(rule->ip, ip, sizeof(rule->ip) - 1);
-    rule->ip[sizeof(rule->ip) - 1] = '\0';
-    rule->next = g_allow_ip_list;
-    g_allow_ip_list = rule;
-    g_allow_ip_count++;
-
     XLOGI("[PAC] 添加代理白名单IP: %s", ip);
-    if (g_config.config_file && g_initialized)
-        xpac_save_config(g_config.config_file);
-
+    xpac_autosave();
     return 0;
 }
 
 static int xpac_remove_allow_ip(const char* ip) {
     if (!ip || !ip[0]) {
-        printf("[PAC] 错误：白名单IP为空\n");
+        XLOGE("[PAC] 错误：白名单IP为空");
         return -1;
     }
 
-    AllowIpRule* prev = NULL;
-    AllowIpRule* current = g_allow_ip_list;
-    while (current) {
-        if (strcmp(current->ip, ip) == 0) {
-            if (prev) {
-                prev->next = current->next;
-            } else {
-                g_allow_ip_list = current->next;
-            }
-            free(current);
-            g_allow_ip_count--;
-            XLOGI("[PAC] 删除代理白名单IP: %s", ip);
-            if (g_config.config_file && g_initialized)
-                xpac_save_config(g_config.config_file);
-            return 0;
-        }
-        prev = current;
-        current = current->next;
+    if (rule_remove(&g_allow_ips, ip) != 0) {
+        XLOGW("[PAC] 未找到白名单IP: %s", ip);
+        return -1;
     }
 
-    printf("[PAC] 未找到白名单IP: %s\n", ip);
-    return -1;
-}
-
-static BulkDomainRule* find_bulk_domain_rule(const char* domain) {
-    BulkDomainRule* current = g_bulk_domain_list;
-    while (current) {
-        if (strcasecmp(current->domain, domain) == 0)
-            return current;
-        current = current->next;
-    }
-    return NULL;
+    XLOGI("[PAC] 删除代理白名单IP: %s", ip);
+    xpac_autosave();
+    return 0;
 }
 
 static int xpac_add_bulk_domain(const char* domain) {
     if (!domain || !domain[0]) {
-        printf("[PAC] 错误：分流域名为空\n");
+        XLOGE("[PAC] 错误：分流域名为空");
         return -1;
     }
 
-    char normalized[256] = {0};
-    xpac_normalize_pattern(domain, normalized, sizeof(normalized));
-    if (!is_valid_domain_pattern(normalized) || strcmp(normalized, "*") == 0) {
-        printf("[PAC] 错误：分流域名无效: %s\n", domain);
+    char key[256];
+    xpac_normalize_pattern(domain, key, sizeof(key));
+    if (!is_valid_domain_pattern(key) || strcmp(key, "*") == 0) {
+        XLOGE("[PAC] 错误：分流域名无效: %s", domain);
         return -1;
     }
 
-    if (find_bulk_domain_rule(normalized)) {
-        printf("[PAC] 分流域名已存在: %s\n", normalized);
-        return 0;
-    }
-
-    BulkDomainRule* rule = (BulkDomainRule*)malloc(sizeof(BulkDomainRule));
-    if (!rule) {
-        printf("[PAC] 错误：分流域名内存分配失败\n");
+    int existed = 0;
+    if (rule_add(&g_bulks, key, 0, &existed) != 0)
         return -1;
-    }
 
-    strncpy(rule->domain, normalized, sizeof(rule->domain) - 1);
-    rule->domain[sizeof(rule->domain) - 1] = '\0';
-    rule->next = g_bulk_domain_list;
-    g_bulk_domain_list = rule;
-    g_bulk_domain_count++;
-
-    XLOGI("[PAC] 添加大流量分流域名: %s", normalized);
+    /* @bulk 目前只来自配置加载，没有管理接口，因此不触发落盘。 */
+    if (existed) XLOGI("[PAC] 分流域名已存在: %s", key);
+    else         XLOGI("[PAC] 添加大流量分流域名: %s", key);
     return 0;
-}
-
-static void free_bulk_domain_list(void) {
-    BulkDomainRule* current = g_bulk_domain_list;
-    while (current) {
-        BulkDomainRule* next = current->next;
-        free(current);
-        current = next;
-    }
 }
 
 /* host 是否命中 @bulk 分流域名：等于该域名，或以 ".域名" 结尾。 */
 int xpac_is_bulk_domain(const char* host) {
     if (!host || !host[0]) return 0;
+
     size_t hlen = strlen(host);
-    BulkDomainRule* rule = g_bulk_domain_list;
-    while (rule) {
-        size_t dlen = strlen(rule->domain);
-        if (dlen > 0 && dlen <= hlen) {
-            const char* tail = host + (hlen - dlen);
-            if (strcasecmp(tail, rule->domain) == 0 &&
-                (hlen == dlen || tail[-1] == '.')) {
-                return 1;
-            }
-        }
-        rule = rule->next;
+    for (StrRule* r = g_bulks.head; r; r = r->next) {
+        size_t dlen = strlen(r->key);
+        if (dlen == 0 || dlen > hlen) continue;
+
+        const char* tail = host + (hlen - dlen);
+        if (strcasecmp(tail, r->key) == 0 && (hlen == dlen || tail[-1] == '.'))
+            return 1;
     }
     return 0;
-}
-
-static void xpac_clear_domains(void) {
-    free_domain_list();
-    g_domain_list = NULL;
-    g_domain_count = 0;
-    printf("[PAC] 已清空所有域名规则\n");
-}
-
-// ===================== 工具函数 =====================
-static DomainRule* find_domain_rule(const char* pattern) {
-    DomainRule* current = g_domain_list;
-    while (current) {
-        if (strcmp(current->pattern, pattern) == 0) {
-            return current;
-        }
-        current = current->next;
-    }
-    return NULL;
-}
-
-static AllowIpRule* find_allow_ip_rule(const char* ip) {
-    AllowIpRule* current = g_allow_ip_list;
-    while (current) {
-        if (strcmp(current->ip, ip) == 0)
-            return current;
-        current = current->next;
-    }
-    return NULL;
-}
-
-static void free_domain_list(void) {
-    DomainRule* current = g_domain_list;
-    while (current) {
-        DomainRule* next = current->next;
-        free(current);
-        current = next;
-    }
-}
-
-static void free_allow_ip_list(void) {
-    AllowIpRule* current = g_allow_ip_list;
-    while (current) {
-        AllowIpRule* next = current->next;
-        free(current);
-        current = next;
-    }
 }
 
 int xpac_proxy_client_allowed(const char* client_ip) {
@@ -769,8 +694,10 @@ int xpac_proxy_client_allowed(const char* client_ip) {
     if (!client_ip || !client_ip[0]) return 0;
     if (strcmp(client_ip, "127.0.0.1") == 0 || strcmp(client_ip, "localhost") == 0)
         return 1;
-    return find_allow_ip_rule(client_ip) != NULL;
+    return rule_find(&g_allow_ips, client_ip) != NULL;
 }
+
+// ===================== 工具函数 =====================
 
 static int is_valid_domain_pattern(const char* pattern) {
     if (!pattern || strlen(pattern) > 255) {
@@ -870,27 +797,53 @@ static const char* get_pac_proxy_address(void) {
     return address;
 }
 
+/*
+ * 把一条规则的代理类型渲染成 PAC 的返回值。
+ *
+ * 回落链最后一律补 DIRECT：浏览器只在“连不上代理本身”时才走下一项，所以代理
+ * 正常时语义不变，xproxy 没起来时才退化为直连。
+ *
+ * socks5 规则第二跳补本机 HTTP 代理，而不是 SOCKS(=SOCKS4)：socks5_server 只接受
+ * 版本字节 0x05，SOCKS4 握手必被拒，且 SOCKS4 只能本地解析 DNS；HTTP 代理这一跳
+ * 内部仍然转发到 SOCKS5，语义一致。这一跳同时兜住 WinINET —— 它会丢弃 PAC 返回的
+ * SOCKS5 结果，正好退到后面的 PROXY 项，所以 proxy.pac 仍然能直接给系统代理用。
+ */
+static void pac_rule_result(char* buf, size_t size, ProxyType type, const char* ip) {
+    switch (type) {
+        case PROXY_TYPE_SOCKS5:
+            snprintf(buf, size, "SOCKS5 %s:%d; PROXY %s:%d; DIRECT",
+                     ip, g_config.socks5_proxy_port, ip, g_config.http_proxy_port);
+            break;
+        case PROXY_TYPE_AUTO:
+            // auto：优先本机HTTP代理，连不上再试SOCKS5
+            snprintf(buf, size, "PROXY %s:%d; SOCKS5 %s:%d; DIRECT",
+                     ip, g_config.http_proxy_port, ip, g_config.socks5_proxy_port);
+            break;
+        case PROXY_TYPE_HTTP:
+        default:
+            snprintf(buf, size, "PROXY %s:%d; DIRECT", ip, g_config.http_proxy_port);
+            break;
+    }
+}
+
 // 生成PAC文件内容（根据类型）
 // 注意：返回的字符串需要调用者释放
 static char* xpac_generate_pac_content(int pac_type) {
-    // 计算需要的缓冲区大小
-    int buffer_size = 2048; // 基础大小
-    DomainRule* current = g_domain_list;
-
-    // 为域名规则预留空间（每条规则展开为4个shExpMatch条件）
-    while (current) {
-        buffer_size += 256 + 4 * (int)strlen(current->pattern);
-        current = current->next;
-    }
+    // 计算需要的缓冲区大小（每条规则展开为4个shExpMatch条件 + 一条回落链）
+    size_t buffer_size = 2048;
+    for (StrRule* r = g_domains.head; r; r = r->next)
+        buffer_size += 320 + 4 * strlen(r->key);
 
     char* pac_content = (char*)malloc(buffer_size);
     if (!pac_content) return NULL;
 
+    sbuf out;
+    sbuf_init(&out, pac_content, buffer_size);
+
     const char* ip = get_pac_proxy_address();
-    int pos = 0;
 
     // PAC文件头部
-    pos += snprintf(pac_content + pos, buffer_size - pos,
+    sbuf_addf(&out,
         "function FindProxyForURL(url, host) {\n"
         "    // 自动生成的PAC文件\n"
         "    // 本地地址直连\n"
@@ -902,71 +855,60 @@ static char* xpac_generate_pac_content(int pac_type) {
         "    }\n");
 
     // 添加域名规则
-    current = g_domain_list;
-    if (current && pac_type==1) {
-        pos += snprintf(pac_content + pos, buffer_size - pos,
-            "\n    // 自定义域名规则\n");
+    if (g_domains.head && pac_type == 1) {
+        sbuf_addf(&out, "\n    // 自定义域名规则\n");
 
-        /*
-         * 规则只在 proxy.pac 里生成（见上面的 pac_type==1），而 proxy.pac 同时
-         * 要给 Windows 系统代理用：WinINET 会丢弃 PAC 返回的 SOCKS5 结果，所以
-         * 无论规则本身标的是 socks5/http/auto，一律返回 PROXY:http_proxy_port，
-         * 由 HTTP 代理内部再转发到 SOCKS5。
-         */
-        const char* proxy_str = "PROXY";
-        int port = g_config.http_proxy_port;
+        // 每条规则按自己标的类型（http/socks5/auto）生成返回值，见 pac_rule_result()
+        for (StrRule* r = g_domains.head; r; r = r->next) {
+            char result[192];
+            pac_rule_result(result, sizeof(result), (ProxyType)r->tag, ip);
 
-        while (current) {
             // 生成域名匹配条件：规则存裸域名 X，这里派生全部匹配形态——
             // 子域名、X 本身、以及带额外后缀的形态（如 google.com.hk /
             // www.google.com.hk）。"*"（全匹配）和 IP 字面量按原样精确匹配。
-            if (strcmp(current->pattern, "*") != 0 && !is_ipv4_literal(current->pattern)) {
-                const char* bare = current->pattern;
-                pos += snprintf(pac_content + pos, buffer_size - pos,
+            if (strcmp(r->key, "*") != 0 && !is_ipv4_literal(r->key)) {
+                const char* bare = r->key;
+                sbuf_addf(&out,
                     "    if (shExpMatch(host, \"*.%s\") ||\n"
                     "        shExpMatch(host, \"%s\") ||\n"
                     "        shExpMatch(host, \"%s.*\") ||\n"
                     "        shExpMatch(host, \"*.%s.*\")) {\n"
-                    "        return \"%s %s:%d\";\n"
+                    "        return \"%s\";\n"
                     "    }\n",
-                    bare, bare, bare, bare, proxy_str, ip, port);
+                    bare, bare, bare, bare, result);
             } else {
-                pos += snprintf(pac_content + pos, buffer_size - pos,
+                sbuf_addf(&out,
                     "    if (shExpMatch(host, \"%s\")) {\n"
-                    "        return \"%s %s:%d\";\n"
+                    "        return \"%s\";\n"
                     "    }\n",
-                    current->pattern, proxy_str, ip, port);
+                    r->key, result);
             }
-            current = current->next;
         }
     }
 
-    // PAC文件尾部
-    if (pac_type == 3) { // proxy.http.pac，强制所有流量走代理
-        pos += snprintf(pac_content + pos, buffer_size - pos,
-            "\n    // 所有流量走HTTP代理\n"
-            "    return \"PROXY %s:%d\";\n",
-            ip, g_config.http_proxy_port);
+    // PAC文件尾部：兜底走哪条链同样由 pac_rule_result() 渲染，与规则保持一致
+    if (pac_type == 3) { // proxy.http.pac，所有流量走HTTP代理
+        char result[192];
+        pac_rule_result(result, sizeof(result), PROXY_TYPE_HTTP, ip);
+        sbuf_addf(&out,
+            "\n    // 所有流量走HTTP代理，代理不可用时直连\n"
+            "    return \"%s\";\n", result);
     } else if (pac_type == 2) { // proxy.socks5.pac，默认SOCKS5
-        /*
-         * 回落用本机HTTP代理，不用SOCKS(=SOCKS4)：socks5_server 只接受
-         * 版本字节 0x05，SOCKS4 握手必被拒，且 SOCKS4 只能本地解析DNS。
-         * HTTP代理这一跳内部仍然转发到 SOCKS5，语义一致。
-         */
-        pos += snprintf(pac_content + pos, buffer_size - pos,
-            "\n    // 所有流量走SOCKS5代理，SOCKS5不可用时回落到本机HTTP代理\n"
-            "    return \"SOCKS5 %s:%d; PROXY %s:%d\";\n",
-            ip, g_config.socks5_proxy_port, ip, g_config.http_proxy_port);
-    } else { // proxy.pac，默认HTTP代理
-        pos += snprintf(pac_content + pos, buffer_size - pos,
-                    "\n    // 所有其他不走代理直接访问\n"
-                    "    return \"DIRECT\";\n");
+        char result[192];
+        pac_rule_result(result, sizeof(result), PROXY_TYPE_SOCKS5, ip);
+        sbuf_addf(&out,
+            "\n    // SOCKS5 -> 本机HTTP代理 -> 直连\n"
+            "    return \"%s\";\n", result);
+    } else { // proxy.pac，默认直连（未命中规则的流量不走代理）
+        sbuf_addf(&out,
+            "\n    // 所有其他不走代理直接访问\n"
+            "    return \"DIRECT\";\n");
     }
 
-    pos += snprintf(pac_content + pos, buffer_size - pos, "}\n");
+    sbuf_addf(&out, "}\n");
 
-    // 确保字符串正确终止
-    pac_content[pos] = '\0';
+    if (out.overflow)
+        XLOGW("[PAC] PAC内容被截断，缓冲区 %zu 字节不足", buffer_size);
 
     return pac_content;
 }
@@ -1075,24 +1017,33 @@ static int is_admin_request(const char* req_buf, int req_len) {
 }
 
 // ===================== HTTP响应函数 =====================
-static void send_http_response(SOCKET_T client_sock, const char* content_type,
-                              const char* body, int body_len) {
+/* 所有响应的唯一出口。extra_headers 已含各自的 CRLF，可为 NULL。 */
+static void send_http_status(SOCKET_T client_sock, int code, const char* reason,
+                             const char* content_type, const char* extra_headers,
+                             const char* body, int body_len) {
     char header[512];
     snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n"
         "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Pragma: no-cache\r\n"
         "Expires: 0\r\n"
+        "%s"
         "\r\n",
-        content_type, body_len);
+        code, reason, content_type, body_len,
+        extra_headers ? extra_headers : "");
 
     send(client_sock, header, strlen(header), 0);
     if (body && body_len > 0) {
         send(client_sock, body, body_len, 0);
     }
+}
+
+static void send_http_response(SOCKET_T client_sock, const char* content_type,
+                              const char* body, int body_len) {
+    send_http_status(client_sock, 200, "OK", content_type, NULL, body, body_len);
 }
 
 static void send_json_response(SOCKET_T client_sock, const char* json) {
@@ -1115,34 +1066,16 @@ static void send_error_response(SOCKET_T client_sock, int code, const char* mess
         "<body><h1>Error %d</h1><p>%s</p></body></html>",
         code, code, message);
 
-    char header[512];
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        code, message, (int)strlen(body));
-
-    send(client_sock, header, strlen(header), 0);
-    send(client_sock, body, strlen(body), 0);
+    send_http_status(client_sock, code, message, "text/html; charset=utf-8",
+                     NULL, body, (int)strlen(body));
 }
 
 static void send_auth_required_response(SOCKET_T client_sock) {
-    const char* body = "<html><body><h1>401 Unauthorized</h1></body></html>";
-    char header[512];
+    static const char body[] = "<html><body><h1>401 Unauthorized</h1></body></html>";
 
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 401 Unauthorized\r\n"
-        "WWW-Authenticate: Basic realm=\"xproxy admin\"\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        (int)strlen(body));
-
-    send(client_sock, header, strlen(header), 0);
-    send(client_sock, body, strlen(body), 0);
+    send_http_status(client_sock, 401, "Unauthorized", "text/html; charset=utf-8",
+                     "WWW-Authenticate: Basic realm=\"xproxy admin\"\r\n",
+                     body, (int)(sizeof(body) - 1));
 }
 
 static int base64_value(char ch) {
@@ -1262,76 +1195,14 @@ static const char* get_query_param(const char* query_str, const char* key,
     return buffer;
 }
 
-// 生成管理界面HTML
-static const char* generate_admin_html(void) {
-    static char html[42000];
-
-    // 调试输出
-    printf("[PAC-DEBUG] generate_admin_html: http_port=%d, socks5_port=%d, domain_count=%d\n",
-           g_config.http_proxy_port, g_config.socks5_proxy_port, g_domain_count);
-    printf("[PAC-DEBUG] domain_list=%p, domain_rows will be generated\n", (void*)g_domain_list);
-
-    // 生成域名规则表格行
-    static char domain_rows[20480] = {0};
-    DomainRule* current = g_domain_list;
-    int pos = 0;
-    int row_count = 0;
-
-    while (current && pos < sizeof(domain_rows) - 100) {
-        pos += snprintf(domain_rows + pos, sizeof(domain_rows) - pos,
-            "<tr>\n"
-            "  <td><code>%s</code></td>\n"
-            "  <td>%s</td>\n"
-            "  <td>\n"
-            "    <button onclick=\"removeDomain('%s')\" class=\"btn-delete\">删除</button>\n"
-            "  </td>\n"
-            "</tr>\n",
-            current->pattern,
-            proxy_type_to_str(current->proxy_type),
-            current->pattern);
-        current = current->next;
-        row_count++;
-    }
-
-    printf("[PAC-DEBUG] Generated %d domain rows, buffer used: %d bytes\n", row_count, pos);
-
-    if (pos == 0) {
-        strcpy(domain_rows,
-            "<tr><td colspan=\"3\" style=\"text-align: center;\">暂无域名规则</td></tr>\n");
-        printf("[PAC-DEBUG] No domain rules found\n");
-    }
-
-    static char whitelist_rows[8192] = {0};
-    AllowIpRule* allow_current = g_allow_ip_list;
-    int allow_pos = 0;
-    int allow_row_count = 0;
-    while (allow_current && allow_pos < sizeof(whitelist_rows) - 100) {
-        allow_pos += snprintf(whitelist_rows + allow_pos,
-            sizeof(whitelist_rows) - allow_pos,
-            "<tr>\n"
-            "  <td><code>%s</code></td>\n"
-            "  <td>\n"
-            "    <button onclick=\"removeAllowIp('%s')\" class=\"btn-delete\">删除</button>\n"
-            "  </td>\n"
-            "</tr>\n",
-            allow_current->ip,
-            allow_current->ip);
-        allow_current = allow_current->next;
-        allow_row_count++;
-    }
-    if (allow_pos == 0) {
-        strcpy(whitelist_rows,
-            "<tr><td colspan=\"2\" style=\"text-align: center;\">暂无白名单IP，启用后仅允许本机内部转发</td></tr>\n");
-    }
-
-    // 完整的HTML页面
-    // 注意：模板中有5个数值占位符：
-    // 1. HTTP代理端口（统计框）
-    // 2. SOCKS5代理端口（统计框）
-    // 3. 域名规则数（统计框）← 这里应该是 g_domain_count
-    // 4. HTTP代理端口（下拉框）
-    // 5. SOCKS5代理端口（下拉框）
-    snprintf(html, sizeof(html),
+// ===================== 管理界面 =====================
+/* 管理页 HTML 模板。占位符顺序必须与 generate_admin_html 的实参严格一致：
+**   %d HTTP代理端口（统计框）    %d SOCKS5代理端口（统计框）  %d 域名规则数
+**   %s 白名单启用状态            %s 白名单表格行
+**   %d HTTP代理端口（下拉框）    %d SOCKS5代理端口（下拉框）
+**   %s 域名规则表格行            %s 配置文件路径
+** 注意：内嵌 CSS 里的百分号要写成 %% 。 */
+static const char ADMIN_HTML_FMT[] =
         "<!DOCTYPE html>\n"
         "<html lang=\"zh-CN\">\n"
         "<head>\n"
@@ -1631,52 +1502,89 @@ static const char* generate_admin_html(void) {
         "        });\n"
         "    </script>\n"
         "</body>\n"
-        "</html>",
-        g_config.http_proxy_port,      // 第一个占位符：HTTP代理端口（统计框）
-        g_config.socks5_proxy_port,    // 第二个占位符：SOCKS5代理端口（统计框）
-        g_domain_count,                // 第三个占位符：域名规则数（统计框）← 修复这里！
-        g_config.enable_proxy_whitelist ? "启用" : "禁用",
-        whitelist_rows,                // 白名单IP表格
-        g_config.http_proxy_port,      // 第四个占位符：HTTP代理端口（下拉框）
-        g_config.socks5_proxy_port,    // 第五个占位符：SOCKS5代理端口（下拉框）
-        domain_rows,                   // 域名规则表格
-        g_config.config_file ? g_config.config_file : "未配置" // 配置文件路径
-    );
+        "</html>";
 
-    printf("[PAC-DEBUG] HTML generated successfully, domain_count=%d, allow_ip_count=%d\n",
-           g_domain_count, allow_row_count);
+static const char* generate_admin_html(void) {
+    static char html[42000];
+    static char domain_rows[20480];
+    static char whitelist_rows[8192];
+
+    sbuf drows;
+    sbuf_init(&drows, domain_rows, sizeof(domain_rows));
+    for (StrRule* r = g_domains.head; r; r = r->next) {
+        sbuf_addf(&drows,
+            "<tr>\n"
+            "  <td><code>%s</code></td>\n"
+            "  <td>%s</td>\n"
+            "  <td>\n"
+            "    <button onclick=\"removeDomain('%s')\" class=\"btn-delete\">删除</button>\n"
+            "  </td>\n"
+            "</tr>\n",
+            r->key, proxy_type_to_str((ProxyType)r->tag), r->key);
+    }
+    if (drows.len == 0) {
+        sbuf_addf(&drows,
+            "<tr><td colspan=\"3\" style=\"text-align: center;\">暂无域名规则</td></tr>\n");
+    }
+
+    sbuf wrows;
+    sbuf_init(&wrows, whitelist_rows, sizeof(whitelist_rows));
+    for (StrRule* r = g_allow_ips.head; r; r = r->next) {
+        sbuf_addf(&wrows,
+            "<tr>\n"
+            "  <td><code>%s</code></td>\n"
+            "  <td>\n"
+            "    <button onclick=\"removeAllowIp('%s')\" class=\"btn-delete\">删除</button>\n"
+            "  </td>\n"
+            "</tr>\n",
+            r->key, r->key);
+    }
+    if (wrows.len == 0) {
+        sbuf_addf(&wrows,
+            "<tr><td colspan=\"2\" style=\"text-align: center;\">暂无白名单IP，启用后仅允许本机内部转发</td></tr>\n");
+    }
+
+    if (drows.overflow || wrows.overflow) {
+        XLOGW("[PAC] 管理页表格被截断：域名规则 %d 条，白名单 %d 条",
+              g_domains.count, g_allow_ips.count);
+    }
+
+    snprintf(html, sizeof(html), ADMIN_HTML_FMT,
+        g_config.http_proxy_port,
+        g_config.socks5_proxy_port,
+        g_domains.count,
+        g_config.enable_proxy_whitelist ? "启用" : "禁用",
+        whitelist_rows,
+        g_config.http_proxy_port,
+        g_config.socks5_proxy_port,
+        domain_rows,
+        g_config.config_file ? g_config.config_file : "未配置");
+
     return html;
 }
+
+#define JSON_BUFFER_ERROR "{\"success\":false,\"error\":\"缓冲区不足\"}"
 
 // 生成状态信息JSON
 static const char* generate_status_json(void) {
     static char json[1024];
 
-    // 调试输出：打印实际值
-    printf("[DEBUG] generate_status_json: http_port=%d, socks5_port=%d, domain_count=%d\n",
-           g_config.http_proxy_port, g_config.socks5_proxy_port, g_domain_count);
-
-    // 合理性检查
+    // 合理性检查：配置来自命令行，异常值不应把管理页整块打挂
     int http_port = g_config.http_proxy_port;
     int socks5_port = g_config.socks5_proxy_port;
-    int domain_count = g_domain_count;
 
     if (http_port <= 0 || http_port > 65535) {
-        printf("[WARN] 无效的HTTP代理端口: %d，使用默认值7890\n", http_port);
+        XLOGW("[PAC] 无效的HTTP代理端口: %d，使用默认值7890", http_port);
         http_port = 7890;
     }
-
     if (socks5_port <= 0 || socks5_port > 65535) {
-        printf("[WARN] 无效的SOCKS5代理端口: %d，使用默认值1081\n", socks5_port);
+        XLOGW("[PAC] 无效的SOCKS5代理端口: %d，使用默认值1081", socks5_port);
         socks5_port = 1081;
     }
 
-    if (domain_count < 0) {
-        printf("[WARN] 无效的域名规则数: %d，重置为0\n", domain_count);
-        domain_count = 0;
-    }
-
-    snprintf(json, sizeof(json),
+    sbuf out;
+    sbuf_init(&out, json, sizeof(json));
+    sbuf_addf(&out,
         "{\"success\":true,\"status\":{\n"
         "  \"http_proxy_port\":%d,\n"
         "  \"socks5_proxy_port\":%d,\n"
@@ -1689,94 +1597,47 @@ static const char* generate_status_json(void) {
         "}}",
         http_port,
         socks5_port,
-        domain_count,
+        g_domains.count,
         g_config.enable_web_admin ? "true" : "false",
         g_config.enable_proxy_whitelist ? "true" : "false",
-        g_allow_ip_count,
+        g_allow_ips.count,
         g_config.config_file ? g_config.config_file : "",
         g_initialized ? "true" : "false");
 
-    return json;
+    return out.overflow ? JSON_BUFFER_ERROR : json;
 }
 
 // 生成域名列表JSON
 static const char* generate_domains_json(void) {
     static char json[8192];
-    int pos = 0;
-    int remaining = sizeof(json);
 
-    // 初始化JSON对象
-    int written = snprintf(json + pos, remaining, "{\"success\":true,\"domains\":[");
-    if (written < 0 || written >= remaining) {
-        // 缓冲区不足，返回错误JSON（使用静态错误消息）
-        static const char* error_json = "{\"success\":false,\"error\":\"缓冲区不足\"}";
-        return error_json;
-    }
-    pos += written;
-    remaining -= written;
+    sbuf out;
+    sbuf_init(&out, json, sizeof(json));
+    sbuf_addf(&out, "{\"success\":true,\"domains\":[");
 
-    DomainRule* current = g_domain_list;
-    int first = 1;
-    while (current && remaining > 100) { // 保留100字节用于结束部分
-        if (!first) {
-            written = snprintf(json + pos, remaining, ",");
-            if (written < 0 || written >= remaining) break;
-            pos += written;
-            remaining -= written;
-        }
-        first = 0;
-
-        const char* proxy_type_str = proxy_type_to_str(current->proxy_type);
-        written = snprintf(json + pos, remaining,
-            "{\"pattern\":\"%s\",\"proxy_type\":\"%s\"}",
-            current->pattern, proxy_type_str);
-        if (written < 0 || written >= remaining) break;
-        pos += written;
-        remaining -= written;
-
-        current = current->next;
+    for (StrRule* r = g_domains.head; r; r = r->next) {
+        sbuf_addf(&out, "%s{\"pattern\":\"%s\",\"proxy_type\":\"%s\"}",
+                  r == g_domains.head ? "" : ",",
+                  r->key, proxy_type_to_str((ProxyType)r->tag));
     }
 
-    // 结束JSON
-    written = snprintf(json + pos, remaining, "],\"count\":%d}", g_domain_count);
-    if (written < 0 || written >= remaining) {
-        // 即使截断，也确保字符串以空字符结尾
-        json[sizeof(json) - 1] = '\0';
-    } else {
-        pos += written; // 不需要使用pos，但保持一致性
-    }
-
-    return json;
+    sbuf_addf(&out, "],\"count\":%d}", g_domains.count);
+    return out.overflow ? JSON_BUFFER_ERROR : json;
 }
 
 static const char* generate_whitelist_json(void) {
     static char json[4096];
-    int pos = 0;
-    int remaining = sizeof(json);
 
-    int written = snprintf(json + pos, remaining,
-        "{\"success\":true,\"enabled\":%s,\"ips\":[",
-        g_config.enable_proxy_whitelist ? "true" : "false");
-    if (written < 0 || written >= remaining)
-        return "{\"success\":false,\"error\":\"缓冲区不足\"}";
-    pos += written;
-    remaining -= written;
+    sbuf out;
+    sbuf_init(&out, json, sizeof(json));
+    sbuf_addf(&out, "{\"success\":true,\"enabled\":%s,\"ips\":[",
+              g_config.enable_proxy_whitelist ? "true" : "false");
 
-    AllowIpRule* current = g_allow_ip_list;
-    int first = 1;
-    while (current && remaining > 80) {
-        written = snprintf(json + pos, remaining, "%s\"%s\"",
-                           first ? "" : ",", current->ip);
-        if (written < 0 || written >= remaining) break;
-        pos += written;
-        remaining -= written;
-        first = 0;
-        current = current->next;
-    }
+    for (StrRule* r = g_allow_ips.head; r; r = r->next)
+        sbuf_addf(&out, "%s\"%s\"", r == g_allow_ips.head ? "" : ",", r->key);
 
-    snprintf(json + pos, remaining, "],\"count\":%d}", g_allow_ip_count);
-    json[sizeof(json) - 1] = '\0';
-    return json;
+    sbuf_addf(&out, "],\"count\":%d}", g_allow_ips.count);
+    return out.overflow ? JSON_BUFFER_ERROR : json;
 }
 
 // ===================== 提取URL查询字符串 =====================
@@ -1821,7 +1682,6 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
     }
 
     const char* query_str = extract_query_string(req_buf, req_len);
-    printf("Handling admin request:%s...\n", req_buf);
     switch (admin_type) {
         case 1: // GET /admin - 管理界面
             send_html_response(client_sock, generate_admin_html());
@@ -1830,10 +1690,8 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
         case 2: // GET /admin/api/domains - 获取域名列表
             send_json_response(client_sock, generate_domains_json());
             break;
-
         case 3: // GET /admin/api/add - 添加域名
         {
-            printf("Adding domain start\n");
             if (!query_str) {
                 send_json_response(client_sock, "{\"success\":false,\"error\":\"缺少查询参数\"}");
                 break;
@@ -1844,7 +1702,6 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
 
             get_query_param(query_str, "domain", domain, sizeof(domain));
             get_query_param(query_str, "type", type_str, sizeof(type_str));
-            printf("Adding domain added:%s...\n", domain);
 
             if (domain[0] == '\0') {
                 send_json_response(client_sock, "{\"success\":false,\"error\":\"缺少域名参数\"}");
@@ -1861,7 +1718,6 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
             }
             break;
         }
-
         case 4: // GET /admin/api/remove - 删除域名
         {
             if (!query_str) {
@@ -1886,15 +1742,12 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
             }
             break;
         }
-
         case 5: // GET /admin/api/status - 服务器状态
             send_json_response(client_sock, generate_status_json());
             break;
-
         case 6: // GET /admin/api/whitelist - 获取白名单
             send_json_response(client_sock, generate_whitelist_json());
             break;
-
         case 7: // GET /admin/api/allow-add - 添加白名单IP
         {
             if (!query_str) {
@@ -1917,7 +1770,6 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
             }
             break;
         }
-
         case 8: // GET /admin/api/allow-remove - 删除白名单IP
         {
             if (!query_str) {
@@ -1940,27 +1792,26 @@ static int handle_admin_request(SOCKET_T client_sock, const char* req_buf, int r
             }
             break;
         }
-
         default:
             send_error_response(client_sock, 404, "API端点不存在");
             return -1;
     }
 
-    printf("[PAC] 处理管理请求完成 (类型: %d)\n", admin_type);
+    XLOGD("[PAC] 处理管理请求完成 (类型: %d)", admin_type);
     return 1;
 }
 
 // ===================== 主处理函数 =====================
 int xpac_handle_request(SOCKET_T client_sock, const char* req_buf, int req_len) {
     if (!g_initialized) {
-        printf("[PAC] 警告：PAC服务器未初始化，使用默认配置\n");
+        XLOGW("[PAC] 警告：PAC服务器未初始化，使用默认配置");
         xpac_init(NULL);
     }
 
     // 检查是否为PAC请求
     int pac_type = is_pac_request(req_buf, req_len);
     if (pac_type > 0) {
-        printf("[PAC] 检测到PAC文件请求 (类型: %d)\n", pac_type);
+        XLOGI("[PAC] 检测到PAC文件请求 (类型: %d)", pac_type);
 
         // 生成动态PAC内容
         char* pac_content = xpac_generate_pac_content(pac_type);
@@ -1972,19 +1823,17 @@ int xpac_handle_request(SOCKET_T client_sock, const char* req_buf, int req_len) 
         send_pac_response(client_sock, pac_content);
         free(pac_content);
 
-        printf("[PAC] 已发送PAC文件响应\n");
+        XLOGD("[PAC] 已发送PAC文件响应");
         return 1;
     }
 
     // 检查是否为管理请求
     int admin_type = is_admin_request(req_buf, req_len);
     if (admin_type > 0) {
-        printf("[PAC] 检测到管理请求 (类型: %d)\n", admin_type);
+        XLOGI("[PAC] 检测到管理请求 (类型: %d)", admin_type);
         return handle_admin_request(client_sock, req_buf, req_len, admin_type);
-    } else {
-        printf("[PAC] 未检测到pac请求\n");
     }
-
+    
     // 非法请求
     send_json_response(client_sock, "{\"success\":false,\"error\":\"[PAC] 未检测到合法请求\"}");
     return 0;
