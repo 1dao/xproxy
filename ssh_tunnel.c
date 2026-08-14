@@ -456,6 +456,16 @@ int wolfSSH_session_has_pending_output(WOLFSSH* ssh) {
     return ssh->outputBuffer.length > ssh->outputBuffer.idx;
 }
 
+/* Data received on the channel that nobody has read yet. wolfSSH_channel_read()
+ * returns 0 both when the channel really is drained and when the read was only
+ * temporarily refused (WS_REKEYING is the reachable case -- ChannelRead bails
+ * out while ssh->isKeying), so callers cannot use a 0-read alone to conclude
+ * there is nothing left. */
+int wolfSSH_channel_has_buffered_input(WOLFSSH_CHANNEL* channel) {
+    if (!channel) return 0;
+    return channel->inputBuffer.length > channel->inputBuffer.idx;
+}
+
 int wolfSSH_process_events(WOLFSSH* ssh, word32* channelId) {
     if (!ssh)
         return -1;

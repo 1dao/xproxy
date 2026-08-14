@@ -52,6 +52,9 @@ int wolfSSH_session_keepalive(WOLFSSH* session);
 /* 检查channel是否EOF */
 int wolfSSH_channel_eof(WOLFSSH_CHANNEL *channel);
 
+/* channel上是否还有收到但未被读走的数据 */
+int wolfSSH_channel_has_buffered_input(WOLFSSH_CHANNEL* channel);
+
 /* 获取错误信息 */
 int wolfSSH_get_error_code(WOLFSSH* session);
 

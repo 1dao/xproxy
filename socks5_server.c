@@ -859,12 +859,14 @@ static void socks5_pump_client_read(Socks5Client *client) {
         return;
     }
 
-    if (client->ssh_session && client->ssh_channel) {
-        if (wolfSSH_channel_eof(client->ssh_channel) != 0) {
-            socks5_client_remote_eof(client, "ssh_channel_eof");
-            return;
-        }
-    }
+    /* Do NOT act on wolfSSH_channel_eof() here. It only reports eofRxd -- the
+     * peer sent CHANNEL_EOF -- and says nothing about data still sitting in
+     * channel->inputBuffer. ssh_process_session_events() drains up to
+     * SSH_EVENT_DRAIN_LIMIT packets before we ever get here, so a response and
+     * the close that follows it routinely land in the same pass; tearing the
+     * client down on the flag would discard the whole response body. Drain the
+     * channel first -- the EOF check after the loop then closes with the data
+     * already queued on io_ch. */
 
     char ssh_rbuf[8192];
     for (;;) {
@@ -910,8 +912,14 @@ static void socks5_pump_client_read(Socks5Client *client) {
         break;
     }
 
-    if (client->ssh_channel && wolfSSH_channel_eof(client->ssh_channel)!=0) {
-        XLOGE("Channel closed by remote fd=%d", (int)client->client_sock);
+    /* Channel drained. This is now the normal remote-close path, and
+     * socks5_client_remote_eof() already logs it with host and reason.
+     * has_buffered_input() guards the case where the loop above broke on a
+     * 0-read that meant "not readable right now" (rekey) rather than "empty":
+     * closing then would drop the bytes still sitting on the channel. The next
+     * readable event pumps us again once the rekey completes. */
+    if (client->ssh_channel && wolfSSH_channel_eof(client->ssh_channel)!=0 &&
+        !wolfSSH_channel_has_buffered_input(client->ssh_channel)) {
         socks5_client_remote_eof(client, "ssh_channel_closed");
         return;
     }
@@ -1021,9 +1029,11 @@ static int socks5_drain_ssh_wbuf(Socks5Client* client,
         return 0;
     }
 
-    if (client->ssh_session && wolfSSH_channel_eof(client->ssh_channel) != 0) {
-        return 0;
-    }
+    /* No eof gate here: eofRxd means the peer will send us nothing more, not
+     * that it stopped reading. A half-closed channel still accepts our upload,
+     * and bailing out dropped whatever the client had queued in wbuf. When the
+     * channel is really gone, ssh_channel_close_callback() has already NULLed
+     * client->ssh_channel and the guard above catches it. */
 
     size_t bytes_this_client = 0;
     int iterations = 0;
