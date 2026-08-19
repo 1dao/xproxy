@@ -16,6 +16,14 @@
 #define XLOG_RECORD_MAX_BYTES (1024u * 1024u)
 #endif
 
+/* Per-file size cap. Once the active log file reaches this many bytes the next
+** sequence number is opened ("<base>_001.log" -> "<base>_002.log" -> ...).
+** Default 2 GiB. Override at build time, or at runtime with
+** xlog_set_max_file_bytes() (the runner maps LOG_MAX_FILE_MB onto it). */
+#ifndef XLOG_MAX_FILE_BYTES
+#define XLOG_MAX_FILE_BYTES (2ull * 1024ull * 1024ull * 1024ull)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -63,9 +71,15 @@ int  xlog_is_enabled(int level);
 void xlog_printf(int level, const char* level_name, const char* console_tag, const char* fmt, ...);
 void xlog_set_thread(int id, const char* name, const char* thread_label);
 void xlog_clear_thread(void);
-size_t xlog_format(int level, const char* level_name, const char* msg, size_t len, int append_newline, char* buf, size_t cap);
+/* Give the calling thread its own log file. Threads that never call this write
+** to the shared process log instead, so a worker that only ever emits a couple
+** of framework lines no longer leaves an almost-empty file behind. Opening is
+** still lazy: the file appears on the first record actually written. */
+void xlog_enable_thread_file(void);
+/* Roll-over threshold for every log file. 0 restores XLOG_MAX_FILE_BYTES. */
+void xlog_set_max_file_bytes(unsigned long long bytes);
+unsigned long long xlog_get_max_file_bytes(void);
 void xlog_write(int level, const char* level_name, const char* console_tag, const char* msg, size_t len, int append_newline);
-void xlog_write_raw(const char* msg, size_t len);
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -77,54 +91,18 @@ void xlog_write_raw(const char* msg, size_t len);
 
 extern void native_log_to_java(int level, const char* tag, const char* msg);
 
-#define xlogv(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_VERBOSE)) { \
-        __android_log_print(ANDROID_LOG_VERBOSE, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_VERBOSE, LOG_TAG, _buf); \
-    } \
-} while(0)
+/* Single-format helper: vsnprintf once, then dispatch to logcat + JNI bridge.
+** Replaces the prior macros, which expanded __VA_ARGS__ twice (double-evaluating
+** any argument with side effects, e.g. `xlogi("%d", counter++)`). */
+void xlog_android_emit(int level, int android_prio, const char* fmt, ...);
 
-#define xlogd(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_DEBUG)) { \
-        __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_DEBUG, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogi(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_INFO)) { \
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_INFO, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogs(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_SYSM)) { \
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_SYSM, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogw(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_WARN)) { \
-        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_WARN, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xloge(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_ERROR)) { \
-        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_ERROR, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogf(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_FATAL)) { \
-        __android_log_print(ANDROID_LOG_FATAL, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_FATAL, LOG_TAG, _buf); \
-    } \
-} while(0)
+#define xlogv(...) do { if (xlog_is_enabled(XLOG_LEVEL_VERBOSE)) xlog_android_emit(XLOG_LEVEL_VERBOSE, ANDROID_LOG_VERBOSE, __VA_ARGS__); } while(0)
+#define xlogd(...) do { if (xlog_is_enabled(XLOG_LEVEL_DEBUG))   xlog_android_emit(XLOG_LEVEL_DEBUG,   ANDROID_LOG_DEBUG,   __VA_ARGS__); } while(0)
+#define xlogi(...) do { if (xlog_is_enabled(XLOG_LEVEL_INFO))    xlog_android_emit(XLOG_LEVEL_INFO,    ANDROID_LOG_INFO,    __VA_ARGS__); } while(0)
+#define xlogs(...) do { if (xlog_is_enabled(XLOG_LEVEL_SYSM))    xlog_android_emit(XLOG_LEVEL_SYSM,    ANDROID_LOG_INFO,    __VA_ARGS__); } while(0)
+#define xlogw(...) do { if (xlog_is_enabled(XLOG_LEVEL_WARN))    xlog_android_emit(XLOG_LEVEL_WARN,    ANDROID_LOG_WARN,    __VA_ARGS__); } while(0)
+#define xloge(...) do { if (xlog_is_enabled(XLOG_LEVEL_ERROR))   xlog_android_emit(XLOG_LEVEL_ERROR,   ANDROID_LOG_ERROR,   __VA_ARGS__); } while(0)
+#define xlogf(...) do { if (xlog_is_enabled(XLOG_LEVEL_FATAL))   xlog_android_emit(XLOG_LEVEL_FATAL,   ANDROID_LOG_FATAL,   __VA_ARGS__); } while(0)
 
 #else
 
@@ -138,7 +116,8 @@ extern void native_log_to_java(int level, const char* tag, const char* msg);
 
 #endif
 
-/* Backward compatibility for legacy call sites. */
+/* Backward compatibility for legacy call sites (../xproxy shares this header
+** and still calls the upper-case forms). */
 #ifndef XLOGV
 #define XLOGV(...) xlogv(__VA_ARGS__)
 #endif

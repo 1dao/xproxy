@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #endif
 
+/* Guarded so this file drops straight into a tree without xmacro.h (../xproxy). */
 #if defined(__has_include)
 #  if __has_include("xmacro.h")
 #    include "xmacro.h" /* malloc/free -> rpmalloc when available */
@@ -40,15 +41,28 @@
 /* Cached seconds-resolution timestamp ("YYYY-MM-DD HH:MM:SS" = 19 chars + NUL). */
 #define XLOG_TS_CACHE_LEN 24u
 
+/* One log file plus the bookkeeping its roll-over needs. A thread owns a sink
+** only after xlog_enable_thread_file(); everyone else shares g_shared. */
+typedef struct {
+    FILE* file;
+    /* Running size of the active file; drives the size roll-over. A per-thread
+    ** sink is owned by that thread alone, so the hot path is a single add +
+    ** compare, no lock. */
+    unsigned long long bytes;
+    unsigned int seq;           /* the _NNN suffix currently open */
+    int open_attempted;
+    char base[384];             /* "<dir>/<proc>_<thread>", without _NNN.log */
+    char path[512];
+} xLogSink;
+
 typedef struct {
     int id;
-    int file_open_attempted;
+    int own_file;               /* xlog_enable_thread_file() was called here */
     int tls_cleanup_registered;
     char name[64];
-    char file_name[64];
+    char file_name[64];         /* file-name component derived from name/id */
     char tag[96];
-    char path[512];
-    FILE* file;
+    xLogSink sink;
     /* Per-thread localtime cache: skips libc tz-conversion lock for repeat seconds. */
     time_t ts_cached_sec;
     char ts_cached_str[XLOG_TS_CACHE_LEN];
@@ -57,6 +71,11 @@ typedef struct {
 static char g_log_dir[256] = "logs";
 static char g_process_name[64] = "xnet";
 static volatile int g_configured = 0;
+/* The process log. Every thread that never asked for its own file writes here,
+** the main thread included, so a worker emitting two framework lines no longer
+** leaves an almost-empty file of its own behind. */
+static xLogSink g_shared;
+static unsigned long long g_max_file_bytes = XLOG_MAX_FILE_BYTES;
 /* Reads of aligned int are atomic on all targets we ship to; volatile blocks
 ** compiler reordering / caching across reads. Writes are infrequent. */
 static volatile int g_min_level = XLOG_LEVEL_VERBOSE;
@@ -73,10 +92,10 @@ static INIT_ONCE g_fls_once = INIT_ONCE_STATIC_INIT;
 static VOID NTAPI xlog_fls_callback(PVOID p) {
     xLogThreadState* st = (xLogThreadState*)p;
     if (!st) return;
-    if (st->file) {
-        fflush(st->file);
-        fclose(st->file);
-        st->file = NULL;
+    if (st->sink.file) {
+        fflush(st->sink.file);
+        fclose(st->sink.file);
+        st->sink.file = NULL;
     }
 }
 
@@ -110,10 +129,10 @@ static int g_tls_key_ok = 0;
 static void xlog_tls_destructor(void* p) {
     xLogThreadState* st = (xLogThreadState*)p;
     if (!st) return;
-    if (st->file) {
-        fflush(st->file);
-        fclose(st->file);
-        st->file = NULL;
+    if (st->sink.file) {
+        fflush(st->sink.file);
+        fclose(st->sink.file);
+        st->sink.file = NULL;
     }
 }
 
@@ -145,10 +164,16 @@ static void xlog_unregister_tls_cleanup(xLogThreadState* st) {
 static SRWLOCK g_console_lock = SRWLOCK_INIT;
 static void xlog_console_lock(void)   { AcquireSRWLockExclusive(&g_console_lock); }
 static void xlog_console_unlock(void) { ReleaseSRWLockExclusive(&g_console_lock); }
+static SRWLOCK g_shared_lock = SRWLOCK_INIT;
+static void xlog_shared_lock(void)    { AcquireSRWLockExclusive(&g_shared_lock); }
+static void xlog_shared_unlock(void)  { ReleaseSRWLockExclusive(&g_shared_lock); }
 #else
 static pthread_mutex_t g_console_lock = PTHREAD_MUTEX_INITIALIZER;
 static void xlog_console_lock(void)   { pthread_mutex_lock(&g_console_lock); }
 static void xlog_console_unlock(void) { pthread_mutex_unlock(&g_console_lock); }
+static pthread_mutex_t g_shared_lock = PTHREAD_MUTEX_INITIALIZER;
+static void xlog_shared_lock(void)    { pthread_mutex_lock(&g_shared_lock); }
+static void xlog_shared_unlock(void)  { pthread_mutex_unlock(&g_shared_lock); }
 #endif
 
 /* ---------- Small utilities ---------- */
@@ -169,18 +194,47 @@ static void xlog_copy(char* dst, size_t cap, const char* src, const char* fallba
     snprintf(dst, cap, "%.*s", (int)(cap - 1), s);
 }
 
-static void xlog_sanitize(char* s) {
-    if (!s) return;
-    for (; *s; ++s) {
-        unsigned char c = (unsigned char)*s;
-        if ((c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' || c == '_') {
-            continue;
-        }
-        *s = '_';
+static int xlog_is_word_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+static int xlog_token_is_worker(const char* tok, size_t len) {
+    static const char kWorker[] = "worker";
+    size_t i;
+    if (len != sizeof(kWorker) - 1u) return 0;
+    for (i = 0; i < len; ++i) {
+        char c = tok[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != kWorker[i]) return 0;
     }
+    return 1;
+}
+
+/* Fold `src` into a log-file name component: alphanumeric runs become tokens
+** joined by '_', so '-' and every other separator end up as one underscore
+** ("xagent-viz-01" -> "xagent_viz_01"). With `drop_worker` the meaningless
+** "worker" token is dropped too, which is what turns the framework's
+** "xmysql-worker" into "xmysql" and "gate-worker-06" into "gate_06".
+** Writes an empty string when nothing usable survives (e.g. a CJK-only name),
+** leaving the caller to fall back to the numeric thread form. */
+static void xlog_name_component(char* dst, size_t cap, const char* src, int drop_worker) {
+    size_t out = 0;
+    if (!dst || cap == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+    while (*src && out + 1u < cap) {
+        const char* tok;
+        size_t tok_len = 0;
+        size_t i;
+        while (*src && !xlog_is_word_char((unsigned char)*src)) ++src;
+        tok = src;
+        while (xlog_is_word_char((unsigned char)*src)) { ++src; ++tok_len; }
+        if (tok_len == 0) break;
+        if (drop_worker && xlog_token_is_worker(tok, tok_len)) continue;
+        if (out > 0 && out + 1u < cap) dst[out++] = '_';
+        for (i = 0; i < tok_len && out + 1u < cap; ++i) dst[out++] = tok[i];
+    }
+    dst[out] = '\0';
 }
 
 #ifdef _WIN32
@@ -422,15 +476,16 @@ static void xlog_format_body(const char* fmt, va_list ap,
 ** Both file and console sinks share the same `body` bytes — we never re-run
 ** vsnprintf for the second sink, only re-render the small prefix. */
 
-static void xlog_emit_to_file(FILE* out, const xLogRecordContext* ctx,
-                              const char* body, size_t body_len,
-                              int append_newline, int do_flush) {
+static size_t xlog_emit_to_file(FILE* out, const xLogRecordContext* ctx,
+                                const char* body, size_t body_len,
+                                int append_newline, int do_flush) {
     char prefix[256];
     size_t plen = xlog_build_prefix(ctx, 0, prefix, sizeof(prefix));
     if (plen) fwrite(prefix, 1, plen, out);
     if (body_len) fwrite(body, 1, body_len, out);
     if (append_newline) fputc('\n', out);
     if (do_flush) fflush(out);
+    return plen + body_len + (append_newline ? 1u : 0u);
 }
 
 static void xlog_emit_to_console(FILE* out, const xLogRecordContext* ctx,
@@ -447,22 +502,202 @@ static void xlog_emit_to_console(FILE* out, const xLogRecordContext* ctx,
     xlog_console_unlock();
 }
 
+/* ---------- Log files: "<dir>/<proc>_<thread>_<seq>.log" ----------
+**
+** <proc>   SERVER_NAME when the runner was given one, else "xnet".
+** <thread> the registered thread name (minus the noise "worker" token), or
+**          "tNNN" for a thread that was never named.
+** <seq>    001 upward: when a file reaches the size cap the next number is
+**          opened rather than the old file being renamed aside, so history
+**          reads in order and live tails never follow a rename.
+*/
+
+/* Current size of an already-open file. With "ab" mode writes always land at
+** EOF regardless of the read cursor, so this is only consulted once at open to
+** seed sink->bytes (a freshly appended-to file may already hold prior data). */
+static unsigned long long xlog_stream_size(FILE* f) {
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        __int64 p = _ftelli64(f);
+        if (p > 0) return (unsigned long long)p;
+    }
+#else
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t p = ftello(f);
+        if (p > 0) return (unsigned long long)p;
+    }
+#endif
+    return 0;
+}
+
+/* Existence + size probe for a path we have not opened. Returns 0 when absent. */
+static int xlog_path_size(const char* path, unsigned long long* size) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    if (size) *size = xlog_stream_size(f);
+    fclose(f);
+    return 1;
+}
+
+static void xlog_sink_make_base(char* dst, size_t cap, const char* file_name) {
+    char proc[64];
+    xlog_name_component(proc, sizeof(proc), g_process_name, 0);
+    if (!proc[0]) xlog_copy(proc, sizeof(proc), "xnet", "xnet");
+    snprintf(dst, cap, "%s/%s_%s", g_log_dir, proc, (file_name && file_name[0]) ? file_name : "thread");
+}
+
+static void xlog_sink_path(const xLogSink* s, unsigned seq, char* out, size_t cap) {
+    snprintf(out, cap, "%s_%03u.log", s->base, seq);
+}
+
+/* Highest sequence number already on disk (0 when none). Doubling probe plus a
+** bisect, so a directory holding N files costs ~2*log2(N) opens once, not N. */
+static unsigned xlog_sink_last_seq(const xLogSink* s) {
+    char path[sizeof(s->path)];
+    unsigned lo = 0, hi = 1;
+    for (;;) {
+        xlog_sink_path(s, hi, path, sizeof(path));
+        if (!xlog_path_size(path, NULL)) break;
+        lo = hi;
+        if (hi >= (1u << 20)) break;   /* a million files is not a deployment */
+        hi <<= 1;
+    }
+    while (hi - lo > 1u) {
+        unsigned mid = lo + (hi - lo) / 2u;
+        xlog_sink_path(s, mid, path, sizeof(path));
+        if (xlog_path_size(path, NULL)) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+static void xlog_sink_close(xLogSink* s) {
+    if (!s->file) return;
+    fflush(s->file);
+    fclose(s->file);
+    s->file = NULL;
+}
+
+/* Resume the newest file that still has room, else start the next number.
+** open_attempted keeps a failing path (bad dir, no permission) from re-trying
+** fopen on every single record. */
+static void xlog_sink_open(xLogSink* s) {
+    unsigned long long size = 0;
+    unsigned seq;
+    if (s->file || s->open_attempted) return;
+    s->open_attempted = 1;
+    if (!s->base[0]) return;
+
+    seq = xlog_sink_last_seq(s);
+    if (seq == 0) {
+        seq = 1;
+    } else {
+        xlog_sink_path(s, seq, s->path, sizeof(s->path));
+        if (!xlog_path_size(s->path, &size) || size >= g_max_file_bytes) ++seq;
+    }
+    s->seq = seq;
+    xlog_sink_path(s, seq, s->path, sizeof(s->path));
+    s->file = fopen(s->path, "ab");
+    if (!s->file) return;
+    /* Seed the roll-over counter from any pre-existing content so an already
+    ** large file rolls promptly instead of growing past the cap. */
+    s->bytes = xlog_stream_size(s->file);
+}
+
+/* The filled file keeps its name; logging simply moves on to the next number. */
+static void xlog_sink_roll(xLogSink* s) {
+    xlog_sink_close(s);
+    ++s->seq;
+    xlog_sink_path(s, s->seq, s->path, sizeof(s->path));
+    s->file = fopen(s->path, "ab");
+    if (!s->file) {
+        /* Allow a later write to retry from a clean slate instead of silently
+        ** dropping this sink forever. */
+        s->open_attempted = 0;
+        s->bytes = 0;
+        return;
+    }
+    s->bytes = xlog_stream_size(s->file);
+}
+
+/* Hot-path accountant: add the bytes just written and roll if over cap. */
+static void xlog_sink_account(xLogSink* s, size_t bytes) {
+    s->bytes += bytes;
+    if (s->bytes >= g_max_file_bytes) xlog_sink_roll(s);
+}
+
+/* Pick the sink this record belongs to, opening it on first use. The shared
+** sink is returned locked -- xlog_sink_release() must follow every non-NULL
+** return, and the caller writes inside that window. */
+static xLogSink* xlog_sink_acquire(void) {
+    xLogThreadState* st = &g_thread_log;
+    if (!g_configured) xlog_init(NULL, NULL, 1);
+    if (st->own_file) {
+        xlog_sink_open(&st->sink);
+        if (!st->sink.file) return NULL;
+        /* Register thread-exit cleanup so a thread that never calls
+        ** xlog_clear_thread() (e.g. raw pthread_exit, std::thread join) won't
+        ** leak the FD. */
+        xlog_register_tls_cleanup(st);
+        return &st->sink;
+    }
+    xlog_shared_lock();
+    xlog_sink_open(&g_shared);
+    if (!g_shared.file) {
+        xlog_shared_unlock();
+        return NULL;
+    }
+    return &g_shared;
+}
+
+static void xlog_sink_release(xLogSink* s) {
+    if (s == &g_shared) xlog_shared_unlock();
+}
+
 /* ---------- Public API ---------- */
 
 void xlog_init(const char* log_dir, const char* process_name, int enable_console) {
+    char base[sizeof(g_shared.base)];
     xlog_copy(g_log_dir, sizeof(g_log_dir), log_dir, "logs");
     xlog_copy(g_process_name, sizeof(g_process_name), process_name, "xnet");
-    xlog_sanitize(g_process_name);
     xlog_mkdir(g_log_dir);
     g_console_enabled = enable_console ? 1 : 0;
     if (g_console_enabled) xlog_enable_vt100();
     g_configured = 1;
-    xlog_set_thread(1, "main", "T1:MAIN");
+
+    /* The process log doubles as the main thread's file: main writes here, and
+    ** so does every thread that never claimed one of its own. */
+    xlog_sink_make_base(base, sizeof(base), "main");
+    xlog_shared_lock();
+    if (strcmp(base, g_shared.base) != 0) {
+        xlog_sink_close(&g_shared);
+        memset(&g_shared, 0, sizeof(g_shared));
+        xlog_copy(g_shared.base, sizeof(g_shared.base), base, "");
+    }
+    xlog_shared_unlock();
+
+    /* Only claim the caller as the main thread when it has no identity yet: a
+    ** worker that reached the lazy-init path must keep the name xthread gave
+    ** it instead of being relabelled T1:MAIN. */
+    if (g_thread_log.id == 0 && g_thread_log.tag[0] == '\0') {
+        xlog_set_thread(1, "main", "T1:MAIN");
+    }
 }
 
 void xlog_uninit(void) {
     xlog_clear_thread();
+    xlog_shared_lock();
+    xlog_sink_close(&g_shared);
+    memset(&g_shared, 0, sizeof(g_shared));
+    xlog_shared_unlock();
     g_configured = 0;
+}
+
+/* File-name component for a thread: its registered name when it has one,
+** otherwise the numeric "tNNN" form. */
+static void xlog_thread_file_name(char* dst, size_t cap, int id, const char* name) {
+    xlog_name_component(dst, cap, name, 1);
+    if (dst[0]) return;
+    snprintf(dst, cap, "t%03d", id > 0 ? id : 0);
 }
 
 void xlog_set_thread(int id, const char* name, const char* thread_label) {
@@ -471,17 +706,16 @@ void xlog_set_thread(int id, const char* name, const char* thread_label) {
     char file_name[64];
     char thread_tag[96];
     xlog_copy(display_name, sizeof(display_name), name, id == 1 ? "main" : "thread");
-    xlog_copy(file_name, sizeof(file_name), display_name, id == 1 ? "main" : "thread");
     xlog_make_thread_tag(thread_tag, sizeof(thread_tag), id, display_name, thread_label);
-    xlog_sanitize(file_name);
+    xlog_thread_file_name(file_name, sizeof(file_name), id, name);
 
-    if ((st->file || st->file_open_attempted) &&
-        st->id == id &&
+    if (st->id == id &&
         strcmp(st->name, display_name) == 0 &&
         strcmp(st->file_name, file_name) == 0 &&
         strcmp(st->tag, thread_tag) == 0) {
         return;
     }
+    /* Identity really changed: drop any file opened under the old name. */
     xlog_clear_thread();
     st->id = id;
     xlog_copy(st->name, sizeof(st->name), display_name, id == 1 ? "main" : "thread");
@@ -489,14 +723,34 @@ void xlog_set_thread(int id, const char* name, const char* thread_label) {
     xlog_copy(st->tag, sizeof(st->tag), thread_tag, "[T0:unknown]");
 }
 
+void xlog_enable_thread_file(void) {
+    xLogThreadState* st = &g_thread_log;
+    char base[sizeof(st->sink.base)];
+    if (!g_configured) xlog_init(NULL, NULL, 1);
+    xlog_sink_make_base(base, sizeof(base), st->file_name);
+    /* The main thread's file IS the process log; keep it on the shared sink so
+    ** the same path is never opened through two handles. */
+    if (strcmp(base, g_shared.base) == 0) return;
+    if (st->own_file && strcmp(base, st->sink.base) == 0) return;
+    xlog_sink_close(&st->sink);
+    memset(&st->sink, 0, sizeof(st->sink));
+    xlog_copy(st->sink.base, sizeof(st->sink.base), base, "");
+    st->own_file = 1;
+}
+
 void xlog_clear_thread(void) {
     xLogThreadState* st = &g_thread_log;
-    if (st->file) {
-        fflush(st->file);
-        fclose(st->file);
-    }
+    xlog_sink_close(&st->sink);
     xlog_unregister_tls_cleanup(st);
     memset(st, 0, sizeof(*st));
+}
+
+void xlog_set_max_file_bytes(unsigned long long bytes) {
+    g_max_file_bytes = bytes ? bytes : (unsigned long long)XLOG_MAX_FILE_BYTES;
+}
+
+unsigned long long xlog_get_max_file_bytes(void) {
+    return g_max_file_bytes;
 }
 
 void xlog_set_level(int min_level) {
@@ -513,89 +767,8 @@ int xlog_is_enabled(int level) {
     return level >= g_min_level;
 }
 
-size_t xlog_format(int level, const char* level_name, const char* msg, size_t len, int append_newline, char* buf, size_t cap) {
-    (void)level;
-    xLogRecordContext ctx;
-    char prefix[256];
-    size_t plen;
-    size_t need_newline;
-    size_t total;
-    size_t data_cap;
-    size_t pos = 0;
-
-    if (!msg) {
-        msg = "";
-        len = 0;
-    }
-
-    xlog_record_context(level_name, NULL, &ctx);
-    plen = xlog_build_prefix(&ctx, 0, prefix, sizeof(prefix));
-    need_newline = (append_newline && (len == 0 || msg[len - 1] != '\n')) ? 1u : 0u;
-    total = plen + len + need_newline;
-
-    if (!buf || cap == 0) return total;
-
-    data_cap = cap - 1u;
-
-    /* Copy prefix. */
-    {
-        size_t n = plen < data_cap - pos ? plen : data_cap - pos;
-        if (n) memcpy(buf + pos, prefix, n);
-        pos += n;
-    }
-    /* Copy body. */
-    {
-        size_t room = data_cap > pos ? data_cap - pos : 0;
-        size_t n = len < room ? len : room;
-        if (n) memcpy(buf + pos, msg, n);
-        pos += n;
-    }
-    /* Append newline if requested. */
-    if (need_newline && pos < data_cap) {
-        buf[pos++] = '\n';
-    }
-    buf[pos] = '\0';
-    return total;
-}
-
-static FILE* xlog_open_thread_file(void) {
-    xLogThreadState* st = &g_thread_log;
-    if (st->file) return st->file;
-    if (st->file_open_attempted) return NULL;
-    if (!g_configured) xlog_init(NULL, NULL, 1);
-    if (st->id == 0) {
-        st->id = 0;
-        xlog_copy(st->name, sizeof(st->name), "unknown", "unknown");
-        xlog_copy(st->file_name, sizeof(st->file_name), "unknown", "unknown");
-        xlog_copy(st->tag, sizeof(st->tag), "[T0:unknown]", "[T0:unknown]");
-    }
-
-    char proc[64];
-    char name[64];
-    xlog_copy(proc, sizeof(proc), g_process_name, "xnet");
-    xlog_copy(name, sizeof(name), st->file_name, st->id == 1 ? "main" : "thread");
-    xlog_sanitize(proc);
-    xlog_sanitize(name);
-
-    snprintf(st->path, sizeof(st->path), "%s/%s-t%03d-%s.log",
-             g_log_dir, proc, st->id, name);
-    st->file_open_attempted = 1;
-    st->file = fopen(st->path, "ab");
-    if (st->file) {
-        /* Register thread-exit cleanup so a thread that never calls
-        ** xlog_clear_thread() (e.g. raw pthread_exit, std::thread join) won't
-        ** leak the FD. */
-        xlog_register_tls_cleanup(st);
-    }
-    return st->file;
-}
-
 void xlog_write(int level, const char* level_name, const char* console_tag, const char* msg, size_t len, int append_newline) {
     if (!xlog_is_enabled(level)) return;
-
-    FILE* file = xlog_open_thread_file();
-    int console_enabled = g_console_enabled;
-    if (!file && !console_enabled) return;
 
     xLogRecordContext ctx;
     xlog_record_context(level_name, console_tag, &ctx);
@@ -606,24 +779,16 @@ void xlog_write(int level, const char* level_name, const char* console_tag, cons
     }
     int need_newline = append_newline && (len == 0 || msg[len - 1] != '\n');
 
-    if (file) {
-        xlog_emit_to_file(file, &ctx, msg, len, need_newline, xlog_should_flush(level));
+    xLogSink* sink = xlog_sink_acquire();
+    if (sink) {
+        size_t n = xlog_emit_to_file(sink->file, &ctx, msg, len, need_newline,
+                                     xlog_should_flush(level));
+        xlog_sink_account(sink, n);
+        xlog_sink_release(sink);
     }
-    if (console_enabled) {
+    if (g_console_enabled) {
         FILE* console = xlog_console_stream(level, ctx.level_name);
         xlog_emit_to_console(console, &ctx, msg, len, need_newline);
-    }
-}
-
-void xlog_write_raw(const char* msg, size_t len) {
-    if (!msg || len == 0) return;
-
-    FILE* file = xlog_open_thread_file();
-    if (file) {
-        fwrite(msg, 1, len, file);
-        /* Raw writes are caller-driven; preserve the immediate-durability
-        ** contract callers relied on (e.g. heartbeat / state dumps). */
-        fflush(file);
     }
 }
 
@@ -631,15 +796,12 @@ void xlog_printf(int level, const char* level_name, const char* console_tag, con
     if (!xlog_is_enabled(level)) return;
     if (!fmt) fmt = "";
 
-    FILE* file = xlog_open_thread_file();
-    int console_enabled = g_console_enabled;
-    if (!file && !console_enabled) return;
-
     xLogRecordContext ctx;
     xlog_record_context(level_name, console_tag, &ctx);
     int append_newline = xlog_format_needs_newline(fmt);
 
-    /* Single-format path: render the body once, reuse for both sinks. */
+    /* Single-format path: render the body once, reuse for both sinks. Done
+    ** before the sink is acquired so the shared lock never covers a vsnprintf. */
     char inline_buf[XLOG_RECORD_STACK_BYTES + 1u];
     xLogBody body;
     va_list ap;
@@ -647,11 +809,14 @@ void xlog_printf(int level, const char* level_name, const char* console_tag, con
     xlog_format_body(fmt, ap, inline_buf, sizeof(inline_buf), &body);
     va_end(ap);
 
-    if (file) {
-        xlog_emit_to_file(file, &ctx, body.data, body.len, append_newline,
-                          xlog_should_flush(level));
+    xLogSink* sink = xlog_sink_acquire();
+    if (sink) {
+        size_t n = xlog_emit_to_file(sink->file, &ctx, body.data, body.len,
+                                     append_newline, xlog_should_flush(level));
+        xlog_sink_account(sink, n);
+        xlog_sink_release(sink);
     }
-    if (console_enabled) {
+    if (g_console_enabled) {
         FILE* console = xlog_console_stream(level, ctx.level_name);
         xlog_emit_to_console(console, &ctx, body.data, body.len, append_newline);
     }
@@ -675,6 +840,9 @@ void xlog_init(const char* log_dir, const char* process_name, int enable_console
 void xlog_uninit(void) {}
 void xlog_set_thread(int id, const char* name, const char* thread_label) { (void)id; (void)name; (void)thread_label; }
 void xlog_clear_thread(void) {}
+void xlog_enable_thread_file(void) {}
+void xlog_set_max_file_bytes(unsigned long long bytes) { (void)bytes; }
+unsigned long long xlog_get_max_file_bytes(void) { return 0; }
 void xlog_set_level(int min_level) {
     if (min_level < XLOG_LEVEL_VERBOSE) min_level = XLOG_LEVEL_VERBOSE;
     if (min_level > XLOG_LEVEL_FATAL) min_level = XLOG_LEVEL_FATAL;
@@ -700,34 +868,12 @@ static int xlog_android_level(int level, const char* level_name) {
     }
 }
 
-size_t xlog_format(int level, const char* level_name, const char* msg, size_t len, int append_newline, char* buf, size_t cap) {
-    (void)level;
-    (void)level_name;
-    if (!msg) {
-        msg = "";
-        len = 0;
-    }
-    size_t need = len + ((append_newline && (len == 0 || msg[len - 1] != '\n')) ? 1 : 0);
-    if (buf && cap > 0) {
-        size_t n = len < cap - 1 ? len : cap - 1;
-        if (n > 0) memcpy(buf, msg, n);
-        if (n < cap - 1 && need > len) buf[n++] = '\n';
-        buf[n] = '\0';
-    }
-    return need;
-}
-
 void xlog_write(int level, const char* level_name, const char* console_tag, const char* msg, size_t len, int append_newline) {
     if (!xlog_is_enabled(level)) return;
     (void)console_tag;
     (void)append_newline;
     if (!msg) msg = "";
     __android_log_print(xlog_android_level(level, level_name), LOG_TAG, "%.*s", (int)len, msg);
-}
-
-void xlog_write_raw(const char* msg, size_t len) {
-    if (!msg) msg = "";
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%.*s", (int)len, msg);
 }
 
 void xlog_printf(int level, const char* level_name, const char* console_tag, const char* fmt, ...) {
