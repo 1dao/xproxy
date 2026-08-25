@@ -31,6 +31,31 @@
  * to tell callers "the client is now in a terminal state — stop further work". */
 #define SOCKS5_SEND_CLOSED (-3)
 
+/* 事件循环里的日志点冷却。POLLOUT 是水平触发的，一次拥塞就能让同一条日志每秒
+ * 打几万遍（实测 29958 条/秒、约 3 MB/s，一次会话就写出 16 MB 日志）。同一个
+ * 调用点最多 interval_ms 打一条，期间压掉的条数在下一条尾部带出来 —— 不然节流
+ * 之后就看不出真实频率，而频率本身正是这里要诊断的东西。
+ * 每个展开点各有一份 static 状态，所以互不影响。 */
+#define XLOG_CD(interval_ms, logfn, fmt, ...)                          \
+    do {                                                               \
+        static long64 _cd_next = 0;                                    \
+        static unsigned long _cd_dropped = 0;                          \
+        long64 _cd_now = time_get_ms();                                \
+        if (_cd_now >= _cd_next) {                                     \
+            unsigned long _cd_n = _cd_dropped;                         \
+            _cd_next = _cd_now + (interval_ms);                        \
+            _cd_dropped = 0;                                           \
+            if (_cd_n)                                                 \
+                logfn(fmt " [+%lu suppressed]", ##__VA_ARGS__, _cd_n); \
+            else                                                       \
+                logfn(fmt, ##__VA_ARGS__);                             \
+        } else {                                                       \
+            _cd_dropped++;                                             \
+        }                                                              \
+    } while (0)
+/* 上面这些点统一用 1 秒的冷却。 */
+#define SOCKS5_LOG_CD_MS 1000
+
 /* ---- SOCKS5 wire protocol (RFC 1928) -------------------------------------
  * These were public in socks5_server.h, but no caller of the public API ever
  * referenced them — they're an internal protocol detail. */
@@ -163,8 +188,11 @@ static int socks5_arm_ssh_writable(SOCKET_T ssh_socket, xhash* hash_table,
         return -1;
     }
 
-    XLOGD("Armed SSH writable fd=%d reason=%s",
-          (int)ssh_socket, reason ? reason : "pending_output");
+    /* xpoll_add_event() 在 mask 没变时是空操作（xpoll.c 里直接 return 0），
+     * 但这条日志原来无条件打，而 socks5_server_update() 每轮循环都会调一次
+     * arm ——刷屏的头号来源就是它。 */
+    XLOG_CD(SOCKS5_LOG_CD_MS, XLOGD, "Armed SSH writable fd=%d reason=%s",
+            (int)ssh_socket, reason ? reason : "pending_output");
     return 1;
 }
 
@@ -812,12 +840,21 @@ static int ssh_process_session_events(SOCKET_T fd, void *clientData, const char 
             }
         }
 
-        if (!wolfSSH_session_has_buffered_input(session)) {
+        /* 半个包留在 inputBuffer 里时 length > idx 同样成立，所以
+         * has_buffered_input() 单独用不能判定"还有整包要处理"。这个判据是
+         * 阻塞时代写的 —— 那时缓冲区非空就意味着有整包；socket 改成非阻塞之后
+         * GetInputData() 会在整包到齐前带着 WS_WANT_READ 返回，DoReceive 推不动
+         * 半包，于是每个不完整的包都把 SSH_EVENT_DRAIN_LIMIT 圈白转完（每圈一次
+         * recv），最后再打一条 WARN。加上 WS_WANT_READ 判断后，撞上半包只多花
+         * 一圈就退出，剩下的字节等下次可读事件。 */
+        if (!wolfSSH_session_has_buffered_input(session) ||
+            wolfSSH_get_error_code(session) == WS_WANT_READ) {
             return 0;
         }
     }
 
-    XLOGW("wolfSSH_process_events %s drain limit reached", where);
+    XLOG_CD(SOCKS5_LOG_CD_MS, XLOGW,
+            "wolfSSH_process_events %s drain limit reached", where);
     return 0;
 }
 
@@ -932,6 +969,72 @@ static bool ssh_read_each_client(xhashKey k, void* value, void* ud) {
     return true;  // Continue to next client
 }
 
+/* need_write 的来源。以前是个 0/1 标志，现在按位记谁置的 —— 这样才能区分
+ * "在等 socket 可写"和"在等对端的控制包"，前者该挂 EPOLLOUT，后者挂了就是空转。
+ * 见下面的 SSH_WNEED_POLLOUT。 */
+enum {
+    SSH_WNEED_WINDOW_FULL  = 1 << 0,  /* channel 窗口满，等对端 WINDOW_ADJUST */
+    SSH_WNEED_CHANNEL_BUSY = 1 << 1,  /* channel_write 返回 0，但不是窗口满 */
+    SSH_WNEED_BACKLOG      = 1 << 2,  /* 预算用尽，wbuf 还有剩 */
+    SSH_WNEED_OPENING      = 1 << 3,  /* 通道还没开好 */
+    SSH_WNEED_EOF          = 1 << 4,  /* 等着把 CHANNEL_EOF 发出去 */
+    SSH_WNEED_SOCKET       = 1 << 5,  /* socket 发送缓冲满 */
+};
+
+/* outputBuffer 空着还该留 EPOLLOUT 的唯一理由：预算用尽，而通道还写得动、
+ * socket 也吃得下 —— 下一次可写事件能真推进。
+ *
+ * 其余几位刻意不在这里：
+ *   SOCKET / CHANNEL_BUSY / EOF 的可达来源是 WS_WANT_WRITE，那时 outputBuffer
+ *     必然非空（wolfSSH_SendPacket 是在 while (length > idx) 循环体内部 return
+ *     的），摘除处的 has_pending_output 已经把 EPOLLOUT 留住了，再列一遍是冗余。
+ *     CHANNEL_BUSY 还能是 WS_REKEYING —— 那时 outputBuffer 可能是空的，而重协商
+ *     靠读方向完成，留着 EPOLLOUT 就是空转；wolfSSH 每约 1GB rekey 一次，大流量
+ *     下会反复踩。
+ *   WINDOW_FULL / OPENING 等的是对端的 WINDOW_ADJUST / CHANNEL_OPEN_CONFIRM，
+ *     从读方向到达，socket 早就可写。上行重排由 ssh_read_cb 末尾的写泵负责，
+ *     OPENING 的重试由 100ms 的 socks5_server_update 负责。
+ *
+ * 这几位仍然记账，只是不参与决策 —— 诊断日志要靠它们说清在等谁。 */
+#define SSH_WNEED_POLLOUT SSH_WNEED_BACKLOG
+
+/* 位掩码转可读串，只给诊断日志用。 */
+static const char* ssh_wneed_names(int mask, char* buf, size_t cap) {
+    static const struct { int bit; const char* name; } kNames[] = {
+        { SSH_WNEED_WINDOW_FULL,  "window_full"  },
+        { SSH_WNEED_CHANNEL_BUSY, "channel_busy" },
+        { SSH_WNEED_BACKLOG,      "backlog"      },
+        { SSH_WNEED_OPENING,      "opening"      },
+        { SSH_WNEED_EOF,          "eof"          },
+        { SSH_WNEED_SOCKET,       "socket"       },
+    };
+    size_t off = 0;
+
+    if (!buf || cap == 0) return "";
+    buf[0] = '\0';
+    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++) {
+        if (!(mask & kNames[i].bit)) continue;
+        int n = snprintf(buf + off, cap - off, "%s%s",
+                         off ? "|" : "", kNames[i].name);
+        if (n < 0 || (size_t)n >= cap - off) break;
+        off += (size_t)n;
+    }
+    if (off == 0) snprintf(buf, cap, "none");
+    return buf;
+}
+
+/* xhash_foreach() 的回调只能带一个 void*（xhash.h 的 xhashForeachCb），而每轮
+ * 迭代要带两个值出来，所以才有这个结构体 —— 不是设计上想要，是容器逼的。
+ * 它同时也是 socks5_drain_ssh_wbuf() / socks5_maybe_send_ssh_eof() 的出参载体，
+ * 那两个函数在 foreach 之外还有三个直接调用点。 */
+typedef struct {
+    int    need_write;     /* SSH_WNEED_* 位掩码，0 表示不需要再等可写 */
+    size_t bytes_written;  /* 本轮写出去的字节；>0 即等价于"有推进" */
+} SshWritePumpCtx;
+
+/* ssh_read_cb 末尾要跑一趟写泵，实现在下面。 */
+static bool ssh_write_each_client(xhashKey k, void* value, void* ctx);
+
 static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *submit_arg) {
     (void)submit_arg;
     xhash *hash_table = (xhash*)clientData;
@@ -945,18 +1048,19 @@ static void ssh_read_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *s
 
     xhash_foreach(hash_table, ssh_read_each_client, NULL);
 
+    /* 上行被通道窗口卡住的 client 只能在这里重排：窗口重开是靠对端的
+     * WINDOW_ADJUST，它从读方向进来，不产生任何可写事件。少了这一步，
+     * wbuf 到高水位后 io_recv 被暂停、客户端也不再送数据，上传就彻底锁死。 */
+    SshWritePumpCtx pump = { 0, 0 };
+    xhash_foreach(hash_table, ssh_write_each_client, &pump);
+
     /* Channel reads can queue SSH control packets such as WINDOW_ADJUST.
      * Arm writable now so pending SSH output drains on the next poll. */
-    socks5_arm_ssh_writable(fd, hash_table, 0, "ssh_read_pending_output");
+    socks5_arm_ssh_writable(fd, hash_table,
+                            (pump.need_write & SSH_WNEED_POLLOUT),
+                            "ssh_read_pending_output");
 }
 
-typedef struct {
-    SOCKET_T ssh_socket;
-    xhash* hash_table;
-    int need_write;
-    int made_progress;
-    size_t bytes_written;
-} SshWritePumpCtx;
 
 static int socks5_update_backpressure(Socks5Client* client) {
     if (!client || !client->io_ch || xchannel_is_closed(client->io_ch)) {
@@ -995,11 +1099,11 @@ static int socks5_maybe_send_ssh_eof(Socks5Client* client,
     }
     if (!client->ssh_channel || !client->ssh_session ||
         client->state == SOCKS5_STATE_OPENING) {
-        if (ctx) ctx->need_write = 1;
+        if (ctx) ctx->need_write |= SSH_WNEED_OPENING;
         return 0;
     }
     if (client->wlen > 0 || wolfSSH_session_has_pending_output(client->ssh_session)) {
-        if (ctx) ctx->need_write = 1;
+        if (ctx) ctx->need_write |= SSH_WNEED_EOF;
         return 0;
     }
 
@@ -1009,12 +1113,12 @@ static int socks5_maybe_send_ssh_eof(Socks5Client* client,
         XLOGD("Forwarded client EOF to SSH channel fd=%d host=%s",
               (int)client->client_sock, client->target_host);
         if (ctx && wolfSSH_session_has_pending_output(client->ssh_session)) {
-            ctx->need_write = 1;
+            ctx->need_write |= SSH_WNEED_SOCKET;
         }
         return 0;
     }
     if (rc == 0) {
-        if (ctx) ctx->need_write = 1;
+        if (ctx) ctx->need_write |= SSH_WNEED_EOF;
         return 0;
     }
 
@@ -1037,6 +1141,7 @@ static int socks5_drain_ssh_wbuf(Socks5Client* client,
 
     size_t bytes_this_client = 0;
     int iterations = 0;
+    int stalled = 0;   /* 循环是被 channel_write 顶回来的，不是预算用尽 */
     while (client->wlen > 0 &&
            bytes_this_client < SOCKS5_WRITE_PUMP_BYTE_BUDGET &&
            iterations < SOCKS5_WRITE_PUMP_ITER_BUDGET) {
@@ -1052,7 +1157,16 @@ static int socks5_drain_ssh_wbuf(Socks5Client* client,
             return -1;
         }
         if (written == 0) {
-            if (ctx) ctx->need_write = 1;
+            /* wolfSSH_channel_write() 把 WS_WINDOW_FULL 和 WS_WANT_WRITE 都折叠成
+             * 返回 0（见 ssh_tunnel.c 的 is_temporary_state 分支）。窗口满等的是
+             * 对端 WINDOW_ADJUST，跟 socket 可写无关；这里先把两者分开记账，
+             * 确认问题真的发生了再动 EPOLLOUT 的行为。 */
+            stalled = 1;
+            if (ctx) {
+                ctx->need_write |=
+                    (wolfSSH_get_error_code(client->ssh_session) == WS_WINDOW_FULL)
+                        ? SSH_WNEED_WINDOW_FULL : SSH_WNEED_CHANNEL_BUSY;
+            }
             break;
         }
 
@@ -1060,19 +1174,20 @@ static int socks5_drain_ssh_wbuf(Socks5Client* client,
         bytes_this_client += (size_t)written;
         iterations++;
         client->retry_error_count = 0;
-        if (ctx) {
-            ctx->made_progress = 1;
-            ctx->bytes_written += (size_t)written;
-        }
+        if (ctx) ctx->bytes_written += (size_t)written;
     }
 
     if (bytes_this_client > 0) {
-        XLOGD("Drained SSH wbuf: fd=%d wrote=%zu remaining=%zu",
-              (int)client->client_sock, bytes_this_client, client->wlen);
+        XLOG_CD(SOCKS5_LOG_CD_MS, XLOGD,
+                "Drained SSH wbuf: fd=%d wrote=%zu remaining=%zu",
+                (int)client->client_sock, bytes_this_client, client->wlen);
     }
 
-    if (client->wlen > 0 && ctx) {
-        ctx->need_write = 1;
+    /* 只有"预算用尽但通道还写得动"才算 backlog —— 那是我们主动让出 CPU，下一轮
+     * 确实能继续写。被窗口顶回来时 wlen 同样 > 0，但那不是 backlog，上面已经按
+     * WINDOW_FULL 记过账了，再叠一个 BACKLOG 会把 EPOLLOUT 又勾回来。 */
+    if (client->wlen > 0 && !stalled && ctx) {
+        ctx->need_write |= SSH_WNEED_BACKLOG;
     }
 
     if (socks5_update_backpressure(client) != 0) {
@@ -1089,7 +1204,7 @@ static bool ssh_write_each_client(xhashKey k, void* value, void * ctx) {
     if (!client) return true;
 
     if (client->state == SOCKS5_STATE_OPENING) {
-        if (pump) pump->need_write = 1;
+        if (pump) pump->need_write |= SSH_WNEED_OPENING;
         return true;  // Continue to next client
     }
 
@@ -1122,11 +1237,26 @@ static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *
     size_t total_bytes_written = 0;
     int last_need_write = 0;
     for (int round = 0; round < 8; round++) {
-        SshWritePumpCtx pump = { fd, hash_table, 0, 0, 0 };
+        SshWritePumpCtx pump = { 0, 0 };
         xhash_foreach(hash_table, ssh_write_each_client, &pump);
 
         if (wolfSSH_session_has_pending_output(session)) {
-            pump.need_write = 1;
+            /* 这里以前只调 process_events，指望它把 outputBuffer 冲出去，但
+             * wolfSSH_worker() 在 DoReceive 返回 WS_FATAL_ERROR 时会跳过 flush，
+             * 而 socket 无数据可读时 GetInputData() 正是返回 WS_FATAL_ERROR
+             * （error=WS_WANT_READ）—— 纯 POLLOUT 唤醒必然命中这条路。结果待发
+             * 字节没人发，has_pending_output 恒真，下面的 xpoll_del_event 永远
+             * 执行不到，水平触发的 POLLOUT 让主循环空转（实测 46500 次/秒，
+             * 期间 can_open_channel 也一直为假，新连接被推迟）。 */
+            int flushed = wolfSSH_session_flush_output(session);
+            if (flushed < 0) {
+                ssh_error_cb(fd, XPOLL_ERROR, clientData, NULL);
+                return;  /* session 已被销毁重建，不能再碰 */
+            }
+            if (flushed == 0)
+                pump.need_write |= SSH_WNEED_SOCKET;
+
+            /* 冲完再收一次：可能带回 WINDOW_ADJUST，让下一轮还能继续写。 */
             if (ssh_process_session_events(fd, clientData, "write-pump") != 0)
                 return;
         }
@@ -1134,18 +1264,51 @@ static void ssh_write_cb(SOCKET_T fd, int mask, void *clientData, xPollRequest *
         last_need_write = pump.need_write;
         total_bytes_written += pump.bytes_written;
 
-        if (!pump.made_progress || !pump.need_write) {
+        if (!pump.bytes_written || !pump.need_write) {
             break;
         }
     }
 
     if (total_bytes_written > 0) {
-        XLOGD("SSH write pump fd=%d wrote=%zu need_write=%d",
-              (int)fd, total_bytes_written, last_need_write);
+        char reasons[96];
+        XLOG_CD(SOCKS5_LOG_CD_MS, XLOGD,
+                "SSH write pump fd=%d wrote=%zu need_write=%s",
+                (int)fd, total_bytes_written,
+                ssh_wneed_names(last_need_write, reasons, sizeof(reasons)));
     }
 
-    if (!wolfSSH_session_has_pending_output(session) && last_need_write == 0)
-        xpoll_del_event(fd, XPOLL_WRITABLE);
+    if (!wolfSSH_session_has_pending_output(session)) {
+        char reasons[96];
+
+        if ((last_need_write & SSH_WNEED_POLLOUT) == 0) {
+            xpoll_del_event(fd, XPOLL_WRITABLE);
+
+            if (last_need_write != 0) {
+                /* 正常路径：摘掉了，但确实还有没做完的事（等窗口 / 等开通道）。
+                 * 重排交给 ssh_read_cb 末尾的写泵 —— 对端的 WINDOW_ADJUST /
+                 * CHANNEL_OPEN_CONFIRM 从读方向到达。留一条节流日志：日后又见
+                 * 上传卡死，先来查是不是摘早了。 */
+                XLOG_CD(SOCKS5_LOG_CD_MS, XLOGD,
+                        "EPOLLOUT dropped, waiting on peer fd=%d need_write=%s",
+                        (int)fd, ssh_wneed_names(last_need_write,
+                                                 reasons, sizeof(reasons)));
+            }
+        } else if (total_bytes_written == 0) {
+            /* 回归哨兵，盯的是空转的定义本身：outputBuffer 已空、这一次回调一个
+             * 字节都没写出去，却还把 EPOLLOUT 留着 —— 下一轮 poll 必然立刻再触发
+             * 一次同样什么都干不了的回调，就是当初 46500 次/秒的形状。
+             *
+             * 正常走不到：能留住 EPOLLOUT 的只有 BACKLOG，而它按定义是"刚写成功
+             * 过、只是预算用尽"，必然伴随 bytes_written > 0。所以这条不依赖具体
+             * 是哪一位，日后往 SSH_WNEED_POLLOUT 里加位加错了也照样报。
+             *
+             * 出现了就照着 need_write= 的取值查：那一位等的到底是不是 socket 可写。 */
+            XLOG_CD(SOCKS5_LOG_CD_MS, XLOGW,
+                    "EPOLLOUT held with empty outputBuffer fd=%d need_write=%s",
+                    (int)fd, ssh_wneed_names(last_need_write,
+                                             reasons, sizeof(reasons)));
+        }
+    }
 }
 
 static bool client_on_closed(xhashKey k, void* value, void *ctx) {
@@ -1182,7 +1345,7 @@ static bool client_channel_confirm(xhashKey k, void* value, void* channel_ptr) {
         if ((client->wlen > 0 || client->client_read_eof) && client->ssh_session) {
             SOCKET_T ssh_socket = wolfSSH_session_get_socket(client->ssh_session);
             xhash* hash_table = (xhash*)xpoll_get_client_data(ssh_socket);
-            SshWritePumpCtx pump = { ssh_socket, hash_table, 0, 0, 0 };
+            SshWritePumpCtx pump = { 0, 0 };
             if (client->wlen == 0 && client->client_read_eof) {
                 if (socks5_maybe_send_ssh_eof(client, &pump) != 0) {
                     return false;
@@ -1312,13 +1475,13 @@ static int socks5_forward_client_data_to_ssh(Socks5Client* client,
         return -1;
     }
 
-    SshWritePumpCtx pump = { ssh_socket, hash_table, 0, 0, 0 };
+    SshWritePumpCtx pump = { 0, 0 };
     if (socks5_drain_ssh_wbuf(client, &pump) != 0) {
         return -1;
     }
 
     socks5_arm_ssh_writable(ssh_socket, hash_table,
-                            (client->wlen > 0 || pump.need_write),
+                            (pump.need_write & SSH_WNEED_POLLOUT),
                             "client_data_to_ssh");
 
     return 0;
@@ -1438,28 +1601,24 @@ static void client_channel_eof_cb(xChannel* ch, const char* reason, void* ud) {
         return;
     }
 
-    SshWritePumpCtx pump = {
-        client->ssh_session ? wolfSSH_session_get_socket(client->ssh_session)
-                            : INVALID_SOCKET,
-        NULL,
-        0,
-        0,
-        0
-    };
-    if (pump.ssh_socket != INVALID_SOCKET) {
-        pump.hash_table = (xhash*)xpoll_get_client_data(pump.ssh_socket);
-    }
+    SOCKET_T ssh_socket = client->ssh_session
+                              ? wolfSSH_session_get_socket(client->ssh_session)
+                              : INVALID_SOCKET;
+    xhash* hash_table = (ssh_socket != INVALID_SOCKET)
+                            ? (xhash*)xpoll_get_client_data(ssh_socket)
+                            : NULL;
+    SshWritePumpCtx pump = { 0, 0 };
 
     if (client->state == SOCKS5_STATE_CONNECTED) {
         if (socks5_drain_ssh_wbuf(client, &pump) != 0) {
             return;
         }
     } else if (client->state == SOCKS5_STATE_OPENING) {
-        pump.need_write = 1;
+        pump.need_write |= SSH_WNEED_OPENING;
     }
 
-    socks5_arm_ssh_writable(pump.ssh_socket, pump.hash_table,
-                            pump.need_write, "client_eof");
+    socks5_arm_ssh_writable(ssh_socket, hash_table,
+                            (pump.need_write & SSH_WNEED_POLLOUT), "client_eof");
 }
 
 static void client_channel_close_cb(xChannel* ch, const char* reason, void* ud) {

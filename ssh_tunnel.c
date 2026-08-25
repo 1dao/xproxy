@@ -466,6 +466,33 @@ int wolfSSH_channel_has_buffered_input(WOLFSSH_CHANNEL* channel) {
     return channel->inputBuffer.length > channel->inputBuffer.idx;
 }
 
+/* 直接把 outputBuffer 冲到 socket 上。
+ *
+ * wolfSSH_worker() 只在 DoReceive() 返回 WS_SUCCESS / WS_WANT_READ /
+ * WS_CHAN_RXD 时才调 wolfSSH_SendPacket()（3rd/wolfssh/src/ssh.c 的 flush 分支），
+ * 可 GetInputData() 在 socket 没数据可读时把 ssh->error 置成 WS_WANT_READ 却
+ * 返回 WS_FATAL_ERROR（3rd/wolfssh/src/internal.c），于是纯 POLLOUT 唤醒那一轮
+ * 根本走不到 flush —— 待发字节一直卡在 outputBuffer 里，只能等某个 channel 恰好
+ * 写数据、借 wolfSSH_ChannelSend() 内部的 SendPacket 顺手带出去。期间
+ * has_pending_output() 恒真，调用方摘不掉 EPOLLOUT，事件循环空转。
+ *
+ * 返回 1 = 已冲干净，0 = 还有剩（socket 发送缓冲满，等下次可写），-1 = 致命错误。 */
+int wolfSSH_session_flush_output(WOLFSSH* ssh) {
+    if (!ssh) return -1;
+    if (ssh->outputBuffer.length <= ssh->outputBuffer.idx)
+        return 1;
+
+    int ret = wolfSSH_SendPacket(ssh);
+    if (ret == WS_SUCCESS)
+        return 1;
+
+    if (is_temporary_state(ret) && is_temporary_state(wolfSSH_get_error(ssh)))
+        return 0;
+
+    XLOGE("wolfSSH_SendPacket failed: %d:%s", ret, wolfSSH_ErrorToName(ret));
+    return -1;
+}
+
 int wolfSSH_process_events(WOLFSSH* ssh, word32* channelId) {
     if (!ssh)
         return -1;

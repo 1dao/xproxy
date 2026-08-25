@@ -43,6 +43,10 @@ SOCKET_T wolfSSH_session_get_socket(WOLFSSH* session);
 int wolfSSH_session_has_buffered_input(WOLFSSH* session);
 int wolfSSH_session_has_pending_output(WOLFSSH* session);
 
+/* 把 outputBuffer 冲到 socket 上：1=冲干净，0=socket 缓冲满还有剩，-1=致命错误。
+ * wolfSSH_process_events() 在这一轮没收到数据时不会 flush，详见实现处说明。 */
+int wolfSSH_session_flush_output(WOLFSSH* session);
+
 /* 处理SSH事件（轮询模式下调用） */
 int wolfSSH_process_events(WOLFSSH* session, word32* channelId);
 
