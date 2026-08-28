@@ -546,7 +546,8 @@ static int arm_writable(xChannel* ch, bool while_connecting) {
 #if defined(XCHANNEL_WITH_IO_URING)
 static int xchannel_uring_arm_read(xChannel* ch) {
     if (!ch || ch->closed || !ch->attached ||
-        ch->fd == INVALID_SOCKET_VAL || ch->read_pending || ch->read_closed) {
+        ch->fd == INVALID_SOCKET_VAL || ch->read_pending || ch->read_closed ||
+        ch->read_paused) {
         return 0;
     }
     if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max)
@@ -865,7 +866,8 @@ static void xchannel_read_event(SOCKET_T fd, int mask,
     int n = process_input(ch);
     if (n==0 && over_before)
         xchannel_close(ch, "over_consume_error"); 
-    if (over_before && !ch->closed && xbuf_size(&ch->in) <= ch->in.max) {
+    if (over_before && !ch->closed && !ch->read_paused &&
+        xbuf_size(&ch->in) <= ch->in.max) {
 #if defined(XCHANNEL_WITH_IO_URING)
         if (xchannel_uring_arm_read(ch) != 0) {
             xchannel_close(ch, "poll_error");
@@ -946,20 +948,32 @@ static void xchannel_uring_read_done(SOCKET_T fd, int mask,
             ch->in.len += (size_t)nread;
             ch->bytes_recv += (size_t)nread;
 
-            bool over_before = ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max;
-            int n = process_input(ch);
-            if (n == 0 && over_before)
-                xchannel_close(ch, "over_consume_error");
+            /* Bytes that land after a pause are kept, not delivered:
+            ** xchannel_resume_read() flushes them. */
+            if (!ch->read_paused) {
+                bool over_before = ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max;
+                int n = process_input(ch);
+                if (n == 0 && over_before)
+                    xchannel_close(ch, "over_consume_error");
+            }
         } else if (nread == 0) {
-            xchannel_read_eof(ch, "eof");
+            /* Leave EOF unreported while paused: read_closed would make
+            ** xchannel_resume_read() skip the flush of buffered input, and the
+            ** recv armed on resume sees the EOF again anyway. */
+            if (!ch->read_paused) xchannel_read_eof(ch, "eof");
         } else if (nread == -EAGAIN || nread == -EWOULDBLOCK ||
-                   nread == -EINTR || nread == -EINPROGRESS) {
-            /* Retry below. */
-        } else {
+                   nread == -EINTR || nread == -EINPROGRESS ||
+                   nread == -ECANCELED) {
+            /* Nothing was written to ch->in. -ECANCELED is the completion of
+            ** the recv xchannel_pause_read() cancelled; if the pause has since
+            ** been lifted, flush what it left buffered before re-arming. */
+            if (!ch->read_paused && xbuf_size(&ch->in) > 0)
+                process_input(ch);
+        } else if (!ch->read_paused) {
             xchannel_error_event(ch->fd, XPOLL_ERROR, ch, NULL);
         }
 
-        if (!ch->closed && ch->attached && !ch->read_closed &&
+        if (!ch->closed && ch->attached && !ch->read_closed && !ch->read_paused &&
             (ch->in.max == 0 || xbuf_size(&ch->in) <= ch->in.max)) {
             xchannel_uring_arm_read(ch);
         }
@@ -1197,11 +1211,12 @@ void xchannel_pause_read(xChannel* ch) {
     if (!ch || ch->closed || ch->read_paused) return;
     ch->read_paused = true;
 #if defined(XCHANNEL_WITH_IO_URING)
-    if (ch->read_req) {
-        xpoll_cancel_request(ch->read_req);
-        ch->read_req = NULL;
-    }
-    ch->read_pending = false;
+    /* The cancel is asynchronous: the recv still delivers a completion, and
+    ** until it does the kernel owns a pointer into ch->in. Keep read_req and
+    ** read_pending set so that completion is recognised as ours -- bytes that
+    ** already landed are kept instead of dropped, and nothing submits a second
+    ** recv into the same buffer meanwhile. */
+    if (ch->read_req) xpoll_cancel_request(ch->read_req);
 #else
     if (ch->fd != INVALID_SOCKET_VAL) {
         xpoll_del_event(ch->fd, XPOLL_READABLE);
@@ -1214,6 +1229,15 @@ int xchannel_resume_read(xChannel* ch) {
     if (!ch->read_paused) return 0;
     ch->read_paused = false;
     if (ch->read_closed) return 0;
+
+#if defined(XCHANNEL_WITH_IO_URING)
+    /* A recv cancelled by xchannel_pause_read() may still be in flight, with
+    ** the kernel holding a pointer into ch->in; process_input() below would
+    ** compact or realloc that buffer underneath it. Leave both alone --
+    ** xchannel_uring_read_done() flushes and re-arms when the completion
+    ** lands, which the cancel makes imminent. */
+    if (ch->read_pending) return 0;
+#endif
 
     int rc = 0;
     xchannel_retain(ch);
