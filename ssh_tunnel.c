@@ -19,11 +19,15 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <poll.h>
+#ifdef __linux__
+#include <netinet/tcp.h>
+#endif
 #endif
 
 static int wolf_ssh_initialized = 0;
 static int g_ssh_session_count = 0;   /* 存活会话数，共享 g_ssh_ctx 的引用计数 */
 static WOLFSSH_CTX* g_ssh_ctx = NULL;
+#include <errno.h>
 inline static int is_temporary_state(int error_code);
 
 /* Route wolfssh's internal logs through xlog. wolfssh's logLevel global is
@@ -67,6 +71,36 @@ static int wsPublicKeyCheck(const byte* pubKey, word32 pubKeySz, void* ctx)
     (void)pubKeySz;
     (void)ctx;
     return 0;
+}
+
+/* Keep bulk uploads from filling a large kernel queue ahead of CHANNEL_OPEN.
+ * This changes socket backpressure, not the per-channel scheduling budget.
+ * It is an optional tuning: unsupported kernels retain their original behavior. */
+static void ssh_set_notsent_lowat(SOCKET_T sock)
+{
+#if defined(__linux__) && defined(TCP_NOTSENT_LOWAT)
+    int saved_errno = errno;
+    unsigned int requested = 64U * 1024U;
+    unsigned int actual = 0;
+    socklen_t actual_len = sizeof(actual);
+    if (setsockopt(sock, IPPROTO_TCP, TCP_NOTSENT_LOWAT,
+                   &requested, sizeof(requested)) != 0) {
+        int error = errno;
+        XLOGW("[ssh-socket] fd=%d option=TCP_NOTSENT_LOWAT requested=%u enabled=0 errno=%d",
+              (int)sock, requested, error);
+    } else if (getsockopt(sock, IPPROTO_TCP, TCP_NOTSENT_LOWAT,
+                          &actual, &actual_len) != 0) {
+        int error = errno;
+        XLOGW("[ssh-socket] fd=%d option=TCP_NOTSENT_LOWAT requested=%u enabled=1 readback_errno=%d",
+              (int)sock, requested, error);
+    } else {
+        XLOGI("[ssh-socket] fd=%d option=TCP_NOTSENT_LOWAT requested=%u actual=%u enabled=1",
+              (int)sock, requested, actual);
+    }
+    errno = saved_errno;
+#else
+    (void)sock;
+#endif
 }
 
 WOLFSSH* wolfSSH_session_open(const char *host, int port,
@@ -198,6 +232,8 @@ WOLFSSH* wolfSSH_session_open(const char *host, int port,
         int one = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
     }
+
+    ssh_set_notsent_lowat(sock);
 
     g_ssh_session_count++;
     return ssh;
